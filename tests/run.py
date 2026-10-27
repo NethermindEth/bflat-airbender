@@ -1,5 +1,6 @@
 """Checks the accelerators against pure-Python references. Usage: run.py <harness-command...>"""
 import hashlib
+import os
 import random
 import subprocess
 import sys
@@ -158,6 +159,12 @@ for ml in (128, 256, 512):
     b, e, m = rng.randbytes(ml), rng.randbytes(8), rng.randbytes(ml)
     exp = pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), int.from_bytes(m, "big")).to_bytes(ml, "big").hex()
     cases.append((f"modexp {b.hex()} {e.hex()} {m.hex()}", exp))
+
+# BN254, BLS12-381 and KZG: precompile vectors and py_ecc cases built by gen_vectors.py.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors", "ec.txt")) as f:
+    for line in f:
+        *args, want = line.split()
+        cases.append((" ".join(args), want))
 
 cases = [c for c in cases if c[1] is not None]
 out = subprocess.run(sys.argv[1:], input="\n".join(c[0] for c in cases) + "\n", capture_output=True, text=True).stdout.split("\n")

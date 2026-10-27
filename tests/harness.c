@@ -13,8 +13,19 @@ zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64
 zkvm_status zkvm_secp256r1_verify(const uint8_t msg[32], const uint8_t sig[64], const uint8_t pk[64], bool *ok);
 zkvm_status zkvm_modexp(const uint8_t *b, size_t bl, const uint8_t *e, size_t el, const uint8_t *m, size_t ml,
                         uint8_t *out);
+zkvm_status zkvm_bn254_g1_add(const uint8_t *p1, const uint8_t *p2, uint8_t *out);
+zkvm_status zkvm_bn254_g1_mul(const uint8_t *p, const uint8_t *k, uint8_t *out);
+zkvm_status zkvm_bn254_pairing(const uint8_t *pairs, size_t n, bool *ok);
+zkvm_status zkvm_kzg_point_eval(const uint8_t *c, const uint8_t *z, const uint8_t *y, const uint8_t *proof, bool *ok);
+zkvm_status zkvm_bls12_g1_add(const uint8_t *p1, const uint8_t *p2, uint8_t *out);
+zkvm_status zkvm_bls12_g1_msm(const uint8_t *pairs, size_t n, uint8_t *out);
+zkvm_status zkvm_bls12_g2_add(const uint8_t *p1, const uint8_t *p2, uint8_t *out);
+zkvm_status zkvm_bls12_g2_msm(const uint8_t *pairs, size_t n, uint8_t *out);
+zkvm_status zkvm_bls12_pairing(const uint8_t *pairs, size_t n, bool *ok);
+zkvm_status zkvm_bls12_map_fp_to_g1(const uint8_t *fe, uint8_t *out);
+zkvm_status zkvm_bls12_map_fp2_to_g2(const uint8_t *fe, uint8_t *out);
 
-static uint8_t Args[4][4096];
+static uint8_t Args[4][65536];
 static size_t ArgLen[4];
 
 static size_t unhex(uint8_t *out, const char *s)
@@ -39,7 +50,7 @@ static void print_hex(const uint8_t *p, size_t n)
 
 int main(void)
 {
-    static char line[40000];
+    static char line[300000];
     while (fgets(line, sizeof(line), stdin))
     {
         char *op = strtok(line, " \n");
@@ -97,6 +108,47 @@ int main(void)
             if (ArgLen[2] == 0)
                 printf("-");
             print_hex(out, ArgLen[2]);
+        }
+        else if (!strcmp(op, "bnadd") || !strcmp(op, "bnmul") || !strcmp(op, "blsg1add") || !strcmp(op, "blsg2add") ||
+                 !strcmp(op, "blsg1msm") || !strcmp(op, "blsg2msm") || !strcmp(op, "blsmapg1") ||
+                 !strcmp(op, "blsmapg2"))
+        {
+            /* One operand holding the whole input, split here as the precompile does. */
+            size_t n = 64;
+            if (!strcmp(op, "bnadd"))
+                st = zkvm_bn254_g1_add(Args[0], Args[0] + 64, out);
+            else if (!strcmp(op, "bnmul"))
+                st = zkvm_bn254_g1_mul(Args[0], Args[0] + 64, out);
+            else if ((n = 96, !strcmp(op, "blsg1add")))
+                st = zkvm_bls12_g1_add(Args[0], Args[0] + 96, out);
+            else if (!strcmp(op, "blsg1msm"))
+                st = zkvm_bls12_g1_msm(Args[0], ArgLen[0] / 128, out);
+            else if (!strcmp(op, "blsmapg1"))
+                st = zkvm_bls12_map_fp_to_g1(Args[0], out);
+            else if ((n = 192, !strcmp(op, "blsg2add")))
+                st = zkvm_bls12_g2_add(Args[0], Args[0] + 192, out);
+            else if (!strcmp(op, "blsg2msm"))
+                st = zkvm_bls12_g2_msm(Args[0], ArgLen[0] / 224, out);
+            else
+                st = zkvm_bls12_map_fp2_to_g2(Args[0], out);
+            if (st == ZKVM_EOK)
+                print_hex(out, n);
+            else
+                printf("fail");
+        }
+        else if (!strcmp(op, "bnpair") || !strcmp(op, "blspair") || !strcmp(op, "kzg"))
+        {
+            bool ok = false;
+            if (!strcmp(op, "bnpair"))
+                st = zkvm_bn254_pairing(Args[0], ArgLen[0] / 192, &ok);
+            else if (!strcmp(op, "blspair"))
+                st = zkvm_bls12_pairing(Args[0], ArgLen[0] / 288, &ok);
+            else
+                st = zkvm_kzg_point_eval(Args[0], Args[1], Args[2], Args[3], &ok);
+            if (st == ZKVM_EOK)
+                printf("%d", ok);
+            else
+                printf("fail");
         }
         else
         {
