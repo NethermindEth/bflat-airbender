@@ -771,31 +771,40 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     *r = acc;
 }
 
-zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64], uint8_t recid,
-                                     uint8_t output[64])
+/* One signature through recover_all: R, then Q = r^-1 (s R - e G), then Q with its z inverted. */
+typedef struct
 {
-    const curve *cv = get_curve(&CurveK1, &CurveK1Ready, &K1);
+    jpoint p;
+    u256d rm, sm, e; /* r, s and the message scalar mod n, in Montgomery form; rm becomes r^-1 */
+    u256d pre;       /* a prefix product of batch_invert */
+    int valid;
+} recovery;
+
+/* Parses the signature and finds R from r and the recovery id; y^2 = x^3 + 7, and p = 3 mod 4, so a root is
+   alpha^((p+1)/4). Clears `valid` for a signature that yields no key. */
+static void recover_r(recovery *it, const uint8_t msg[32], const uint8_t sig[64], uint8_t recid, const curve *cv)
+{
     const mont_ctx *f = &cv->p;
     const mont_ctx *n = &cv->n;
+    it->valid = 0;
 
     u256d r, s;
     from_be(&r, sig);
     from_be(&s, sig + 32);
     if (recid > 3 || !in_scalar_range(&r, cv) || !in_scalar_range(&s, cv))
-        return ZKVM_EFAIL;
+        return;
 
     u256d x = r;
     if (recid & 2)
     {
         u256d nn = n->n;
         if (u256_op(&x, &nn, U256_ADD))
-            return ZKVM_EFAIL;
+            return;
     }
     if (!less(&x, &f->n))
-        return ZKVM_EFAIL;
+        return;
 
-    /* y^2 = x^3 + 7; p = 3 mod 4, so a root is alpha^((p+1)/4). */
-    u256d xm, alpha, beta, check, e;
+    u256d xm, alpha, beta, check;
     mont_to(&xm, &x, f);
     MUL(&alpha, &xm, &xm);
     MUL(&alpha, &alpha, &xm);
@@ -803,7 +812,7 @@ zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64
     field_sqrt(&beta, &alpha, f);
     MUL(&check, &beta, &beta);
     if (!equal(&check, &alpha))
-        return ZKVM_EFAIL;
+        return;
     u256d plain;
     mont_from(&plain, &beta, f);
     if ((plain.w[0] & 1) != (recid & 1))
@@ -812,39 +821,135 @@ zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64
         SUB(&beta, &zero, &beta);
     }
 
-    jpoint rp;
-    rp.x = xm;
-    rp.y = beta;
-    rp.z = f->one;
+    it->p.x = xm;
+    it->p.y = beta;
+    it->p.z = f->one;
+    hash_to_scalar(&it->e, msg, cv);
+    mont_to(&it->rm, &r, n);
+    mont_to(&it->sm, &s, n);
+    it->valid = 1;
+}
 
-    /* Q = r^-1 (s R - e G) */
-    u256d rm, sm, rinv, u1, u2, zero = {{0}};
-    hash_to_scalar(&e, msg, cv);
-    mont_to(&rm, &r, n);
-    mont_to(&sm, &s, n);
-    inverse(&rinv, &rm, n);
-    mont_sub(&u1, &zero, &e, n);
-    mont_mul(&u1, &u1, &rinv, n);
-    mont_mul(&u2, &sm, &rinv, n);
+/* Inverts the word at `offset` in every valid item, by Montgomery's trick: one inverse and three products each.
+   A lone valid item is inverted directly. */
+static void batch_invert(recovery *items, uint32_t count, size_t offset, const mont_ctx *m, int field)
+{
+    uint32_t valid = 0, last = 0;
+    u256d acc = m->one, inv, t;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (!items[i].valid)
+            continue;
+        u256d *v = (u256d *)((uint8_t *)&items[i] + offset);
+        items[i].pre = acc;
+        mont_mul(&acc, &acc, v, m);
+        valid++;
+        last = i;
+    }
+    if (valid == 0)
+        return;
+    if (valid == 1)
+        acc = *(u256d *)((uint8_t *)&items[last] + offset);
+    if (field)
+        field_inverse(&inv, &acc, m);
+    else
+        inverse(&inv, &acc, m);
+    if (valid == 1)
+    {
+        *(u256d *)((uint8_t *)&items[last] + offset) = inv;
+        return;
+    }
+    for (uint32_t i = count; i-- > 0;)
+    {
+        if (!items[i].valid)
+            continue;
+        u256d *v = (u256d *)((uint8_t *)&items[i] + offset);
+        mont_mul(&t, &inv, &items[i].pre, m);
+        mont_mul(&inv, &inv, v, m);
+        *v = t;
+    }
+}
+
+/* Q = r^-1 (s R - e G) = u1 G + u2 R with u1 = -e/r and u2 = s/r, rm holding r^-1. */
+static void recover_q(recovery *it, const curve *cv)
+{
+    const mont_ctx *n = &cv->n;
+    u256d u1, u2, zero = {{0}};
+    mont_sub(&u1, &zero, &it->e, n);
+    mont_mul(&u1, &u1, &it->rm, n);
+    mont_mul(&u2, &it->sm, &it->rm, n);
     mont_from(&u1, &u1, n);
     mont_from(&u2, &u2, n);
 
     jpoint q;
-    glv_double_mul(&q, &u1, &u2, &rp, cv);
+    glv_double_mul(&q, &u1, &u2, &it->p, cv);
     if (is_zero(&q.z))
-        return ZKVM_EFAIL;
+    {
+        it->valid = 0;
+        return;
+    }
+    it->p = q;
+}
 
-    u256d qx, qy, zinv, zinv2, zinv3;
-    field_inverse(&zinv, &q.z, f);
-    MUL(&zinv2, &zinv, &zinv);
-    MUL(&zinv3, &zinv2, &zinv);
-    MUL(&qx, &q.x, &zinv2);
-    MUL(&qy, &q.y, &zinv3);
+/* Q's affine coordinates, big-endian, z holding 1/z. */
+static void recover_output(const recovery *it, uint8_t output[64], const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    u256d qx, qy, zinv2, zinv3;
+    MUL(&zinv2, &it->p.z, &it->p.z);
+    MUL(&zinv3, &zinv2, &it->p.z);
+    MUL(&qx, &it->p.x, &zinv2);
+    MUL(&qy, &it->p.y, &zinv3);
     mont_from(&qx, &qx, f);
     mont_from(&qy, &qy, f);
     to_be(output, &qx);
     to_be(output + 32, &qy);
-    return ZKVM_EOK;
+}
+
+/* Recovers count keys with the r and z inverses of all of them taken together. */
+static void recover_all(recovery *items, const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                        uint8_t *outputs, uint8_t *ok, uint32_t count)
+{
+    const curve *cv = get_curve(&CurveK1, &CurveK1Ready, &K1);
+    for (uint32_t i = 0; i < count; i++)
+        recover_r(&items[i], msgs + 32 * i, sigs + 64 * i, recids[i], cv);
+    batch_invert(items, count, __builtin_offsetof(recovery, rm), &cv->n, 0);
+    for (uint32_t i = 0; i < count; i++)
+        if (items[i].valid)
+            recover_q(&items[i], cv);
+    batch_invert(items, count, __builtin_offsetof(recovery, p) + __builtin_offsetof(jpoint, z), &cv->p, 1);
+    for (uint32_t i = 0; i < count; i++)
+    {
+        ok[i] = (uint8_t)items[i].valid;
+        if (items[i].valid)
+            recover_output(&items[i], outputs + 64 * i, cv);
+    }
+}
+
+zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64], uint8_t recid,
+                                     uint8_t output[64])
+{
+    static recovery one;
+    uint8_t ok;
+    recover_all(&one, msg, sig, &recid, output, &ok, 1);
+    return ok ? ZKVM_EOK : ZKVM_EFAIL;
+}
+
+enum
+{
+    RecoveryBatch = 512
+};
+
+void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                                         uint8_t *outputs, uint8_t *ok, uint32_t count)
+{
+    /* In .bss, which costs the image nothing and the run only the words it touches. */
+    static recovery items[RecoveryBatch];
+    for (uint32_t done = 0; done < count; done += RecoveryBatch)
+    {
+        uint32_t now = count - done < RecoveryBatch ? count - done : RecoveryBatch;
+        recover_all(items, msgs + 32 * done, sigs + 64 * done, recids + done, outputs + 64 * done, ok + done, now);
+    }
 }
 
 zkvm_status zkvm_secp256r1_verify(const uint8_t msg[32], const uint8_t sig[64], const uint8_t pubkey[64],

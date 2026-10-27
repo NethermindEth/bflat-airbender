@@ -31,4 +31,11 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32]);
 #endif
 void keccak_f1600_soft(uint64_t state[25]);
 
+/* Recovers the uncompressed public keys (x || y, big-endian) of count signatures: msgs holds 32-byte hashes,
+   sigs 64-byte r || s, recids one byte each. ok[i] is 1 when outputs[i] holds signature i's key, as
+   zkvm_secp256k1_ecrecover would give it, and 0 when that call would fail. The inverses of every r and of every
+   recovered z are taken together, an exponentiation each for the whole batch rather than per signature. */
+void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                                         uint8_t *outputs, uint8_t *ok, uint32_t count);
+
 #endif

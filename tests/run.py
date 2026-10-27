@@ -140,6 +140,30 @@ cases.append((f"ecrecover {h32(1)} {h32(1)}{h32(1)} 04", "fail"))
 cases.append((f"ecrecover {h32(1)} {h32(5)}{h32(1)} 00",
               "fail" if pow(132, (K1.p - 1) // 2, K1.p) != 1 else None))
 
+
+# The same recoveries in batches, the failing signatures among them: each item gives what its own call gives.
+# 600 items cross the native side's 512-signature chunk.
+def ecrecover_batch(items):
+    msgs = "".join(m for m, _, _, _ in items)
+    sigs = "".join(sg for _, sg, _, _ in items)
+    recids = "".join(rc for _, _, rc, _ in items)
+    return (f"ecrecoverbatch {msgs} {sigs} {recids}", ",".join(e for _, _, _, e in items))
+
+
+k1_items = [tuple(line.split()[1:4]) + (expected,) for line, expected in cases if line.startswith("ecrecover ") and expected]
+bad = [item for item in k1_items if item[3] == "fail"]
+good = [item for item in k1_items if item[3] != "fail"]
+cases.append(ecrecover_batch(good[:1]))
+cases.append(ecrecover_batch(bad[:1] + good[:1]))
+cases.append(ecrecover_batch(bad[:2]))
+mixed = []
+for i, item in enumerate(good):
+    mixed.append(item)
+    if i % 50 == 7:
+        mixed.append(bad[i % len(bad)])
+cases.append(ecrecover_batch(mixed))
+cases.append(ecrecover_batch((mixed * 2)[:600]))
+
 for _ in range(6):
     d = rng.randrange(1, R1.n)
     h = rng.randrange(0, 2**256)
