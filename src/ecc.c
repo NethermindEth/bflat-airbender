@@ -389,7 +389,8 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
         u256_op(&HalfP1, &Bit255, U256_MUL_HIGH);
         HalfP1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
     }
-    u256d s, l;
+    /* Static: 32-byte aligned locals would make the function realign its stack and keep a frame pointer. */
+    static u256d s, l;
     MUL(&r->z, &r->z, &r->y);
     MUL(&s, &r->y, &r->y);
 
@@ -419,7 +420,8 @@ static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d
 {
     if (r != p)
         *r = *p;
-    u256d z12, h, rr, h2, h3, az;
+    /* Static: 32-byte aligned locals would make the function realign its stack and keep a frame pointer. */
+    static u256d z12, h, rr, h2, h3, az;
     const u256d *z = &r->z;
     if (zinv)
     {
