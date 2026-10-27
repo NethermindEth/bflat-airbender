@@ -320,6 +320,417 @@ static int on_curve(const u256d *x, const u256d *y, const curve *cv)
     return equal(&lhs, &rhs);
 }
 
+/* ---- secp256k1: GLV, wNAF and mixed additions ---------------------------------------------- */
+/*
+ * Recovery computes u1*G + u2*R. With the endomorphism lambda*(x, y) = (beta*x, y), each scalar
+ * splits into two of about 128 bits (libsecp256k1's split_lambda), so one doubling chain of ~129
+ * steps serves four terms. Their wNAF digits add odd multiples from tables: window 8 against G and
+ * lambda*G, built once and kept affine so each addition is a mixed one; window 5 against R and
+ * lambda*R, built per call. The square root and the field inverse use libsecp256k1's addition
+ * chains. Every operand the delegation reads lives in RAM, so the constants are copied there.
+ */
+
+typedef struct
+{
+    u256d x, y; /* Montgomery form */
+} apoint;
+
+enum
+{
+    WindowG = 8,
+    EntriesG = 1 << (WindowG - 2),
+    WindowR = 5,
+    EntriesR = 1 << (WindowR - 2),
+    MaxDigits = 131 /* the parts are below 2^129; one more position takes the last carry */
+};
+
+static const uint32_t GlvG1[8] = {0x45dbb031, 0xe893209a, 0x71e8ca7f, 0x3daa8a14, 0x9284eb15, 0xe86c90e4, 0xa7d46bcd, 0x3086d221};
+static const uint32_t GlvG2[8] = {0x8ac47f71, 0x1571b4ae, 0x9df506c6, 0x221208ac, 0x0abfe4c4, 0x6f547fa9, 0x010e8828, 0xe4437ed6};
+static const uint32_t MinusB1[8] = {0x0abfe4c3, 0x6f547fa9, 0x010e8828, 0xe4437ed6, 0, 0, 0, 0};
+static const uint32_t MinusB2[8] = {0x3db1562c, 0xd765cda8, 0x0774346d, 0x8a280ac5, 0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff};
+static const uint32_t MinusLambda[8] = {0xb51283cf, 0xe0cfc810, 0x8ec739c2, 0xa880b9fc, 0x77ed9ba4, 0x5ad9e3fd, 0x3fa3cf1f, 0xac9c52b3};
+static const uint32_t Beta[8] = {0x719501ee, 0xc1396c28, 0x12f58995, 0x9cf04975, 0xac3434e9, 0x6e64479e, 0x657c0710, 0x7ae96a2b};
+static const uint32_t HalfN[8] = {0x681b20a0, 0xdfe92f46, 0x57a4501d, 0x5d576e73, 0xffffffff, 0xffffffff, 0xffffffff, 0x7fffffff};
+
+static struct
+{
+    int ready;
+    u256d g1, g2, half_n;                       /* plain */
+    u256d minus_b1, minus_b2, minus_lambda;     /* Montgomery form mod n */
+    u256d beta;                                 /* Montgomery form mod p */
+    apoint g[EntriesG], lambda_g[EntriesG];     /* odd multiples of G and lambda*G */
+} Glv;
+
+static void load_words(u256d *r, const uint32_t w[8])
+{
+    for (int i = 0; i < 8; i++)
+        r->w[i] = w[i];
+}
+
+/* r = 2p for a = 0 (dbl-2009-l): 2M + 5S. r may be p. */
+static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
+{
+    if (is_zero(&p->z) || is_zero(&p->y))
+    {
+        r->z = (u256d){{0}};
+        return;
+    }
+    u256d a, b, c, d, e, t, x3;
+    MUL(&a, &p->x, &p->x);
+    MUL(&b, &p->y, &p->y);
+    MUL(&c, &b, &b);
+    ADD(&d, &p->x, &b);
+    MUL(&d, &d, &d);
+    SUB(&d, &d, &a);
+    SUB(&d, &d, &c);
+    ADD(&d, &d, &d);
+    ADD(&e, &a, &a);
+    ADD(&e, &e, &a);
+    MUL(&t, &e, &e);
+    SUB(&x3, &t, &d);
+    SUB(&x3, &x3, &d);
+    MUL(&r->z, &p->y, &p->z);
+    ADD(&r->z, &r->z, &r->z);
+    SUB(&t, &d, &x3);
+    MUL(&t, &e, &t);
+    ADD(&c, &c, &c);
+    ADD(&c, &c, &c);
+    ADD(&c, &c, &c);
+    SUB(&r->y, &t, &c);
+    r->x = x3;
+}
+
+/* r = p + q for p not at infinity and q affine (madd-2007-bl): 7M + 4S. r may be p. */
+static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const mont_ctx *f)
+{
+    u256d z1z1, u2, s2, h, hh, i, j, rr, v, x3;
+    MUL(&z1z1, &p->z, &p->z);
+    MUL(&u2, &q->x, &z1z1);
+    MUL(&s2, &q->y, &p->z);
+    MUL(&s2, &s2, &z1z1);
+    SUB(&h, &u2, &p->x);
+    SUB(&rr, &s2, &p->y);
+    if (is_zero(&h))
+    {
+        if (is_zero(&rr))
+            jdouble0(r, p, f);
+        else
+            r->z = (u256d){{0}};
+        return;
+    }
+    MUL(&hh, &h, &h);
+    ADD(&i, &hh, &hh);
+    ADD(&i, &i, &i);
+    MUL(&j, &h, &i);
+    ADD(&rr, &rr, &rr);
+    MUL(&v, &p->x, &i);
+    MUL(&x3, &rr, &rr);
+    SUB(&x3, &x3, &j);
+    SUB(&x3, &x3, &v);
+    SUB(&x3, &x3, &v);
+    ADD(&u2, &p->z, &h);
+    MUL(&u2, &u2, &u2);
+    SUB(&u2, &u2, &z1z1);
+    SUB(&u2, &u2, &hh);
+    SUB(&v, &v, &x3);
+    MUL(&v, &rr, &v);
+    MUL(&s2, &p->y, &j);
+    ADD(&s2, &s2, &s2);
+    SUB(&r->y, &v, &s2);
+    r->x = x3;
+    r->z = u2;
+}
+
+/* r = a^(2^k). */
+static void sqr_n(u256d *r, const u256d *a, int k, const mont_ctx *f)
+{
+    if (r != a)
+        *r = *a;
+    while (k-- > 0)
+        MUL(r, r, r);
+}
+
+/* x223 = a^(2^223 - 1), x22 and x2 alongside: the common prefix of libsecp256k1's field chains. */
+static void chain_x223(u256d *x223, u256d *x22, u256d *x2, const u256d *a, const mont_ctx *f)
+{
+    u256d x3, x6, x9, x11, x44, x88, x176, x220;
+    MUL(x2, a, a);
+    MUL(x2, x2, a);
+    MUL(&x3, x2, x2);
+    MUL(&x3, &x3, a);
+    sqr_n(&x6, &x3, 3, f);
+    MUL(&x6, &x6, &x3);
+    sqr_n(&x9, &x6, 3, f);
+    MUL(&x9, &x9, &x3);
+    sqr_n(&x11, &x9, 2, f);
+    MUL(&x11, &x11, x2);
+    sqr_n(x22, &x11, 11, f);
+    MUL(x22, x22, &x11);
+    sqr_n(&x44, x22, 22, f);
+    MUL(&x44, &x44, x22);
+    sqr_n(&x88, &x44, 44, f);
+    MUL(&x88, &x88, &x44);
+    sqr_n(&x176, &x88, 88, f);
+    MUL(&x176, &x176, &x88);
+    sqr_n(&x220, &x176, 44, f);
+    MUL(&x220, &x220, &x44);
+    sqr_n(x223, &x220, 3, f);
+    MUL(x223, x223, &x3);
+}
+
+/* r = a^((p+1)/4), a square root of a when one exists. */
+static void field_sqrt(u256d *r, const u256d *a, const mont_ctx *f)
+{
+    u256d x223, x22, x2;
+    chain_x223(&x223, &x22, &x2, a, f);
+    sqr_n(r, &x223, 23, f);
+    MUL(r, r, &x22);
+    sqr_n(r, r, 6, f);
+    MUL(r, r, &x2);
+    sqr_n(r, r, 2, f);
+}
+
+/* r = a^(p-2) = a^-1. */
+static void field_inverse(u256d *r, const u256d *a, const mont_ctx *f)
+{
+    u256d x223, x22, x2;
+    chain_x223(&x223, &x22, &x2, a, f);
+    sqr_n(r, &x223, 23, f);
+    MUL(r, r, &x22);
+    sqr_n(r, r, 5, f);
+    MUL(r, r, a);
+    sqr_n(r, r, 3, f);
+    MUL(r, r, &x2);
+    sqr_n(r, r, 2, f);
+    MUL(r, r, a);
+}
+
+/* The odd multiples of G (1G, 3G, ..., (2 EntriesG - 1)G) in affine form, by one inversion. */
+static void glv_init(const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    const mont_ctx *n = &cv->n;
+    static jpoint pts[EntriesG];
+    static u256d prefix[EntriesG];
+    u256d u, inv, zinv, zinv2, zinv3;
+    jpoint twice;
+
+    load_words(&Glv.g1, GlvG1);
+    load_words(&Glv.g2, GlvG2);
+    load_words(&Glv.half_n, HalfN);
+    load_words(&u, MinusB1);
+    mont_to(&Glv.minus_b1, &u, n);
+    load_words(&u, MinusB2);
+    mont_to(&Glv.minus_b2, &u, n);
+    load_words(&u, MinusLambda);
+    mont_to(&Glv.minus_lambda, &u, n);
+    load_words(&u, Beta);
+    mont_to(&Glv.beta, &u, f);
+
+    pts[0].x = cv->gx;
+    pts[0].y = cv->gy;
+    pts[0].z = f->one;
+    jdouble0(&twice, &pts[0], f);
+    for (int i = 1; i < EntriesG; i++)
+        jadd(&pts[i], &pts[i - 1], &twice, cv);
+
+    prefix[0] = pts[0].z;
+    for (int i = 1; i < EntriesG; i++)
+        MUL(&prefix[i], &prefix[i - 1], &pts[i].z);
+    field_inverse(&inv, &prefix[EntriesG - 1], f);
+    for (int i = EntriesG - 1; i >= 0; i--)
+    {
+        if (i > 0)
+        {
+            MUL(&zinv, &inv, &prefix[i - 1]);
+            MUL(&inv, &inv, &pts[i].z);
+        }
+        else
+            zinv = inv;
+        MUL(&zinv2, &zinv, &zinv);
+        MUL(&zinv3, &zinv2, &zinv);
+        MUL(&Glv.g[i].x, &pts[i].x, &zinv2);
+        MUL(&Glv.g[i].y, &pts[i].y, &zinv3);
+        MUL(&Glv.lambda_g[i].x, &Glv.g[i].x, &Glv.beta);
+        Glv.lambda_g[i].y = Glv.g[i].y;
+    }
+    Glv.ready = 1;
+}
+
+/* r = round(a * b / 2^384), the GLV rounding step. */
+static void mul_shift_384(u256d *r, const u256d *a, const u256d *b)
+{
+    static u256d hi;
+    u256_op(&hi, a, U256_MEMCOPY);
+    u256_op(&hi, b, U256_MUL_HIGH);
+    uint64_t carry = hi.w[3] >> 31;
+    for (int i = 0; i < 8; i++)
+    {
+        carry += i < 4 ? hi.w[i + 4] : 0;
+        r->w[i] = (uint32_t)carry;
+        carry >>= 32;
+    }
+}
+
+/* k = k1 + k2 * lambda (mod n), each part returned as a magnitude below 2^129 and a sign. */
+static void split_lambda(u256d *k1, int *neg1, u256d *k2, int *neg2, const u256d *k, const mont_ctx *n)
+{
+    u256d c1, c2, t;
+    mul_shift_384(&c1, k, &Glv.g1);
+    mul_shift_384(&c2, k, &Glv.g2);
+    mont_mul(&c1, &c1, &Glv.minus_b1, n);
+    mont_mul(&c2, &c2, &Glv.minus_b2, n);
+    mont_add(k2, &c1, &c2, n);
+    mont_mul(k1, k2, &Glv.minus_lambda, n);
+    mont_add(k1, k1, k, n);
+
+    *neg1 = less(&Glv.half_n, k1);
+    if (*neg1)
+    {
+        t = n->n;
+        u256_op(&t, k1, U256_SUB);
+        *k1 = t;
+    }
+    *neg2 = less(&Glv.half_n, k2);
+    if (*neg2)
+    {
+        t = n->n;
+        u256_op(&t, k2, U256_SUB);
+        *k2 = t;
+    }
+}
+
+/* The width-w NAF of s: odd digits in (-2^(w-1), 2^(w-1)), at least w - 1 zeros between two. */
+static void wnaf(int8_t digits[MaxDigits], const u256d *s, int w)
+{
+    memset(digits, 0, MaxDigits);
+    int bit = 0;
+    uint32_t carry = 0;
+    while (bit < MaxDigits)
+    {
+        if (((s->w[bit >> 5] >> (bit & 31)) & 1) == carry)
+        {
+            bit++;
+            continue;
+        }
+        int now = MaxDigits - bit < w ? MaxDigits - bit : w;
+        int limb = bit >> 5;
+        int offset = bit & 31;
+        uint32_t bits = s->w[limb] >> offset;
+        if (offset + now > 32)
+            bits |= s->w[limb + 1] << (32 - offset);
+        int32_t word = (int32_t)(bits & ((1u << now) - 1)) + (int32_t)carry;
+        carry = ((uint32_t)word >> (w - 1)) & 1;
+        word -= (int32_t)(carry << w);
+        digits[bit] = (int8_t)word;
+        bit += now;
+    }
+}
+
+/* acc += the table entry of digit (negated when the signs disagree); *inf tracks acc at infinity. */
+static void add_affine_term(jpoint *acc, int *inf, const apoint *table, int digit, int negate, const mont_ctx *f)
+{
+    if (digit < 0)
+    {
+        digit = -digit;
+        negate = !negate;
+    }
+    apoint q = table[digit >> 1];
+    if (negate)
+    {
+        u256d zero = {{0}};
+        SUB(&q.y, &zero, &q.y);
+    }
+    if (*inf)
+    {
+        acc->x = q.x;
+        acc->y = q.y;
+        acc->z = f->one;
+        *inf = 0;
+        return;
+    }
+    jadd_affine(acc, acc, &q, f);
+    *inf = is_zero(&acc->z);
+}
+
+static void add_jacobian_term(jpoint *acc, int *inf, const jpoint *table, int digit, int negate, const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    if (digit < 0)
+    {
+        digit = -digit;
+        negate = !negate;
+    }
+    jpoint q = table[digit >> 1];
+    if (negate)
+    {
+        u256d zero = {{0}};
+        SUB(&q.y, &zero, &q.y);
+    }
+    if (*inf)
+    {
+        *acc = q;
+        *inf = is_zero(&acc->z);
+        return;
+    }
+    jadd(acc, acc, &q, cv);
+    *inf = is_zero(&acc->z);
+}
+
+/* u1*G + u2*R for plain scalars below n and R affine (z = 1). */
+static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jpoint *rp, const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    if (!Glv.ready)
+        glv_init(cv);
+
+    u256d a1, a2, b1, b2;
+    int na1, na2, nb1, nb2;
+    split_lambda(&a1, &na1, &a2, &na2, u1, &cv->n);
+    split_lambda(&b1, &nb1, &b2, &nb2, u2, &cv->n);
+    int8_t d[4][MaxDigits];
+    wnaf(d[0], &a1, WindowG);
+    wnaf(d[1], &a2, WindowG);
+    wnaf(d[2], &b1, WindowR);
+    wnaf(d[3], &b2, WindowR);
+
+    jpoint tr[EntriesR], tlr[EntriesR], twice;
+    tr[0] = *rp;
+    jdouble0(&twice, rp, f);
+    for (int i = 1; i < EntriesR; i++)
+        jadd(&tr[i], &tr[i - 1], &twice, cv);
+    for (int i = 0; i < EntriesR; i++)
+    {
+        tlr[i] = tr[i];
+        MUL(&tlr[i].x, &tr[i].x, &Glv.beta);
+    }
+
+    int top = MaxDigits - 1;
+    while (top >= 0 && !d[0][top] && !d[1][top] && !d[2][top] && !d[3][top])
+        top--;
+    jpoint acc;
+    int inf = 1;
+    for (int i = top; i >= 0; i--)
+    {
+        if (!inf)
+        {
+            jdouble0(&acc, &acc, f);
+            inf = is_zero(&acc.z);
+        }
+        if (d[0][i])
+            add_affine_term(&acc, &inf, Glv.g, d[0][i], na1, f);
+        if (d[1][i])
+            add_affine_term(&acc, &inf, Glv.lambda_g, d[1][i], na2, f);
+        if (d[2][i])
+            add_jacobian_term(&acc, &inf, tr, d[2][i], nb1, cv);
+        if (d[3][i])
+            add_jacobian_term(&acc, &inf, tlr, d[3][i], nb2, cv);
+    }
+    if (inf)
+        acc.z = (u256d){{0}};
+    *r = acc;
+}
+
 zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64], uint8_t recid,
                                      uint8_t output[64])
 {
@@ -344,16 +755,12 @@ zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64
         return ZKVM_EFAIL;
 
     /* y^2 = x^3 + 7; p = 3 mod 4, so a root is alpha^((p+1)/4). */
-    u256d xm, alpha, beta, check, e, one = {{1}};
+    u256d xm, alpha, beta, check, e;
     mont_to(&xm, &x, f);
     MUL(&alpha, &xm, &xm);
     MUL(&alpha, &alpha, &xm);
     ADD(&alpha, &alpha, &cv->b);
-    e = f->n;
-    u256_op(&e, &one, U256_ADD);
-    for (int i = 0; i < 8; i++)
-        e.w[i] = (e.w[i] >> 2) | (i < 7 ? e.w[i + 1] << 30 : 0);
-    mont_pow(&beta, &alpha, &e, f);
+    field_sqrt(&beta, &alpha, f);
     MUL(&check, &beta, &beta);
     if (!equal(&check, &alpha))
         return ZKVM_EFAIL;
@@ -383,12 +790,18 @@ zkvm_status zkvm_secp256k1_ecrecover(const uint8_t msg[32], const uint8_t sig[64
     mont_from(&u2, &u2, n);
 
     jpoint q;
-    double_mul(&q, &u1, &u2, &rp, cv);
+    glv_double_mul(&q, &u1, &u2, &rp, cv);
     if (is_zero(&q.z))
         return ZKVM_EFAIL;
 
-    u256d qx, qy;
-    to_affine(&qx, &qy, &q, cv);
+    u256d qx, qy, zinv, zinv2, zinv3;
+    field_inverse(&zinv, &q.z, f);
+    MUL(&zinv2, &zinv, &zinv);
+    MUL(&zinv3, &zinv2, &zinv);
+    MUL(&qx, &q.x, &zinv2);
+    MUL(&qy, &q.y, &zinv3);
+    mont_from(&qx, &qx, f);
+    mont_from(&qy, &qy, f);
     to_be(output, &qx);
     to_be(output + 32, &qy);
     return ZKVM_EOK;

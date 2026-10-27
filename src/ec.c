@@ -4,6 +4,7 @@
  */
 
 #include "ec.h"
+#include "u256.h"
 
 /* Composite operations stay out of line: inlined, the arithmetic would double the code. */
 #define NOINLINE __attribute__((noinline))
@@ -63,39 +64,109 @@ void fp_sub(fp *r, const fp *a, const fp *b)
     }
 }
 
-/* Montgomery product a*b/R mod p, coarsely integrated operand scanning. */
+/* Montgomery multiplication on the u256 delegation. An element is split into 256-bit digits, a
+ * low one and, for BLS12-381, a high one below 2^128; the product accumulates in T, four digits.
+ * The reduction adds multiples of p that clear T from the bottom: one 256-bit step, which is the
+ * whole of it for BN254 (R = 2^256), and for BLS12-381 (R = 2^384) a second step that clears only
+ * 128 bits. The delegation takes its operands from RAM, 32-byte aligned and distinct, so they all
+ * live in these statics. */
+static u256d A0, A1, B0, B1, M, X, T[4], Zero, Pinv, P0, P1;
+static const curve *Prepared;
+
+/* Pinv = -p^-1 mod 2^256 and p as digits, once per curve. */
+static void prepare(void)
+{
+    static u256d x, t, two;
+    for (int i = 0; i < 8; i++)
+    {
+        P0.w[i] = C->p.l[i];
+        P1.w[i] = i + 8 < (int)C->n ? C->p.l[i + 8] : 0;
+    }
+    /* p^-1 mod 2^256 by Newton: p is its own inverse mod 8, and each step doubles the bits. */
+    x = P0;
+    for (int step = 0; step < 7; step++)
+    {
+        u256_op(&t, &P0, U256_MEMCOPY);
+        u256_op(&t, &x, U256_MUL_LOW);
+        two = (u256d){{2}};
+        u256_op(&two, &t, U256_SUB);
+        u256_op(&x, &two, U256_MUL_LOW);
+    }
+    Pinv = (u256d){{0}};
+    u256_op(&Pinv, &x, U256_SUB);
+    Prepared = C;
+}
+
+/* T[k..] += *v. */
+static void accumulate(int k, const u256d *v)
+{
+    uint32_t carry = u256_op(&T[k], v, U256_ADD);
+    for (int i = k + 1; carry && i < 4; i++)
+        carry = u256_op(&T[i], &Zero, U256_ADD | U256_CARRY);
+}
+
+/* T += a * b * 2^(256 k); the high half only when the product can reach it. */
+static void accumulate_product(int k, const u256d *a, const u256d *b, bool high)
+{
+    u256_op(&X, a, U256_MEMCOPY);
+    u256_op(&X, b, U256_MUL_LOW);
+    accumulate(k, &X);
+    if (high)
+    {
+        u256_op(&X, a, U256_MEMCOPY);
+        u256_op(&X, b, U256_MUL_HIGH);
+        accumulate(k + 1, &X);
+    }
+}
+
+/* Montgomery product a*b/R mod p. */
 void fp_mul(fp *r, const fp *a, const fp *b)
 {
     uint32_t n = C->n;
-    uint32_t t[FpMaxLimbs + 2] = {0};
-    for (uint32_t i = 0; i < n; i++)
+    if (Prepared != C)
+        prepare();
+    for (int i = 0; i < 8; i++)
     {
-        uint64_t c = 0;
-        for (uint32_t j = 0; j < n; j++)
-        {
-            c += (uint64_t)a->l[j] * b->l[i] + t[j];
-            t[j] = (uint32_t)c;
-            c >>= 32;
-        }
-        c += t[n];
-        t[n] = (uint32_t)c;
-        t[n + 1] = (uint32_t)(c >> 32);
-
-        uint32_t m = t[0] * C->inv;
-        c = ((uint64_t)m * C->p.l[0] + t[0]) >> 32;
-        for (uint32_t j = 1; j < n; j++)
-        {
-            c += (uint64_t)m * C->p.l[j] + t[j];
-            t[j - 1] = (uint32_t)c;
-            c >>= 32;
-        }
-        c += t[n];
-        t[n - 1] = (uint32_t)c;
-        t[n] = t[n + 1] + (uint32_t)(c >> 32);
+        A0.w[i] = a->l[i];
+        B0.w[i] = b->l[i];
+        A1.w[i] = i + 8 < (int)n ? a->l[i + 8] : 0;
+        B1.w[i] = i + 8 < (int)n ? b->l[i + 8] : 0;
     }
+    for (int i = 0; i < 4; i++)
+        u256_op(&T[i], &Zero, U256_MEMCOPY);
+
     fp res = {{0}};
-    memcpy(res.l, t, n * sizeof(uint32_t));
-    if (t[n] || limbs_cmp(res.l, C->p.l, n) >= 0)
+    if (n == 8)
+    {
+        accumulate_product(0, &A0, &B0, true);
+        u256_op(&M, &T[0], U256_MEMCOPY);
+        u256_op(&M, &Pinv, U256_MUL_LOW);
+        accumulate_product(0, &M, &P0, true);
+        memcpy(res.l, T[1].w, 8 * sizeof(uint32_t));
+    }
+    else
+    {
+        accumulate_product(0, &A0, &B0, true);
+        accumulate_product(1, &A0, &B1, true);
+        accumulate_product(1, &A1, &B0, true);
+        accumulate_product(2, &A1, &B1, false);
+
+        u256_op(&M, &T[0], U256_MEMCOPY);
+        u256_op(&M, &Pinv, U256_MUL_LOW);
+        accumulate_product(0, &M, &P0, true);
+        accumulate_product(1, &M, &P1, true);
+
+        u256_op(&M, &T[1], U256_MEMCOPY);
+        u256_op(&M, &Pinv, U256_MUL_LOW);
+        for (int i = 4; i < 8; i++)
+            M.w[i] = 0;
+        accumulate_product(1, &M, &P0, true);
+        accumulate_product(2, &M, &P1, false);
+
+        memcpy(res.l, T[1].w + 4, 4 * sizeof(uint32_t));
+        memcpy(res.l + 4, T[2].w, 8 * sizeof(uint32_t));
+    }
+    if (limbs_cmp(res.l, C->p.l, n) >= 0)
         limbs_sub(res.l, res.l, C->p.l, n);
     *r = res;
 }

@@ -14,8 +14,9 @@ static const uint64_t RoundConstants[24] = {
 #define ROL(v, n) (((v) << (n)) | ((v) >> (64 - (n))))
 
 /* One round body unrolled over named lanes (lane i = x + 5y), the round loop kept: with no rotate
- * instruction and 32-bit registers, indexed loops over the state cost several times the work. */
-void keccak_f1600(uint64_t s[25])
+ * instruction and 32-bit registers, indexed loops over the state cost several times the work.
+ * The permutation where the platform has no Keccak delegation (keccak_f1600 is the platform's). */
+void keccak_f1600_soft(uint64_t s[25])
 {
     uint64_t a00 = s[0], a01 = s[1], a02 = s[2], a03 = s[3], a04 = s[4];
     uint64_t a05 = s[5], a06 = s[6], a07 = s[7], a08 = s[8], a09 = s[9];

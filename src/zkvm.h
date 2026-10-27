@@ -24,6 +24,8 @@ typedef enum
    call it rather than return a wrong answer. */
 __attribute__((noreturn)) void airbender_fail(uint32_t code);
 
+/* The Keccak-f[1600] permutation: the platform's, a delegation on Airbender. */
 void keccak_f1600(uint64_t state[25]);
+void keccak_f1600_soft(uint64_t state[25]);
 
 #endif

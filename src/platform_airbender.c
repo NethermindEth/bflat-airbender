@@ -31,13 +31,33 @@ static inline void csr_write(uint32_t value)
     __asm__ volatile("csrrw x0, 0x7c0, %0" : : "r"(value));
 }
 
-uint32_t u256_op(u256d *a, const u256d *b, uint32_t op)
+/* Airbender v3's Keccak-f[1600] delegation (common_constants delegation_types/keccak_f1600.rs): per
+ * round five column-parity (CSR 0x7cd), five theta/rho (0x7cc) and five chi (0x7ce) calls, then one
+ * column-parity call for the delayed final iota. x10 carries the call's control word, 0 at the
+ * start, and x11 the state: the 25 lanes, the five column parities and scratch, 256-byte aligned
+ * in RAM. The transpiler recognizes the run by its first CSR and its length, so it is one asm
+ * block. */
+#define KECCAK_COLUMN_PARITY "csrrw x0, 0x7cd, x0\n"
+#define KECCAK_THETA_RHO "csrrw x0, 0x7cc, x0\n"
+#define KECCAK_CHI "csrrw x0, 0x7ce, x0\n"
+#define KECCAK_FIVE(call) call call call call call
+#define KECCAK_ROUND KECCAK_FIVE(KECCAK_COLUMN_PARITY) KECCAK_FIVE(KECCAK_THETA_RHO) KECCAK_FIVE(KECCAK_CHI)
+#define KECCAK_FOUR_ROUNDS KECCAK_ROUND KECCAK_ROUND KECCAK_ROUND KECCAK_ROUND
+
+static uint64_t KeccakState[32] __attribute__((aligned(256)));
+
+void keccak_f1600(uint64_t state[25])
 {
-    register uint32_t x10 __asm__("a0") = (uint32_t)a;
-    register uint32_t x11 __asm__("a1") = (uint32_t)b;
-    register uint32_t x12 __asm__("a2") = op;
-    __asm__ volatile("csrrw x0, 0x7ca, x0" : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
-    return x12;
+    memcpy(KeccakState, state, 25 * sizeof(uint64_t));
+    register uint32_t x11 __asm__("a1") = (uint32_t)KeccakState;
+    __asm__ volatile("add x10, x0, x0\n"
+                     KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
+                     KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
+                     KECCAK_COLUMN_PARITY
+                     :
+                     : "r"(x11)
+                     : "a0", "memory");
+    memcpy(state, KeccakState, 25 * sizeof(uint64_t));
 }
 
 void read_input(const uint8_t **buf_ptr, size_t *buf_size)

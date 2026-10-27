@@ -6,15 +6,8 @@
  */
 #include "mont.h"
 
-static u256d Lo, Hi, M, T;
-
-static int is_zero(const u256d *a)
-{
-    uint32_t acc = 0;
-    for (int i = 0; i < 8; i++)
-        acc |= a->w[i];
-    return acc == 0;
-}
+/* Copies go through the delegation too (MEMCOPY), one instruction instead of sixteen. */
+static u256d Lo, Hi, M, T, Zero;
 
 /* *v -= n when that does not borrow, or unconditionally when `wrapped` says *v overflowed. */
 static void reduce_once(u256d *v, uint32_t wrapped, const mont_ctx *ctx)
@@ -24,43 +17,43 @@ static void reduce_once(u256d *v, uint32_t wrapped, const mont_ctx *ctx)
         u256_op(v, &ctx->n, U256_SUB);
         return;
     }
-    T = *v;
+    u256_op(&T, v, U256_MEMCOPY);
     if (!u256_op(&T, &ctx->n, U256_SUB))
-        *v = T;
+        u256_op(v, &T, U256_MEMCOPY);
 }
 
 void mont_mul(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    Lo = *a;
-    Hi = *a;
+    u256_op(&Lo, a, U256_MEMCOPY);
     u256_op(&Lo, b, U256_MUL_LOW);
+    u256_op(&Hi, a, U256_MEMCOPY);
     u256_op(&Hi, b, U256_MUL_HIGH);
 
     /* m = lo * n' mod R makes lo + m*n a multiple of R: its low half is R exactly when lo != 0. */
-    M = Lo;
+    u256_op(&M, &Lo, U256_MEMCOPY);
     u256_op(&M, &ctx->nprime, U256_MUL_LOW);
     u256_op(&M, &ctx->n, U256_MUL_HIGH);
 
-    uint32_t carry = is_zero(&Lo) ? 0 : U256_CARRY;
+    uint32_t carry = u256_op(&Lo, &Zero, U256_EQ) ? 0 : U256_CARRY;
     uint32_t wrapped = u256_op(&Hi, &M, U256_ADD | carry);
     reduce_once(&Hi, wrapped, ctx);
-    *r = Hi;
+    u256_op(r, &Hi, U256_MEMCOPY);
 }
 
 void mont_add(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    Hi = *a;
+    u256_op(&Hi, a, U256_MEMCOPY);
     uint32_t wrapped = u256_op(&Hi, b, U256_ADD);
     reduce_once(&Hi, wrapped, ctx);
-    *r = Hi;
+    u256_op(r, &Hi, U256_MEMCOPY);
 }
 
 void mont_sub(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    Hi = *a;
+    u256_op(&Hi, a, U256_MEMCOPY);
     if (u256_op(&Hi, b, U256_SUB))
         u256_op(&Hi, &ctx->n, U256_ADD);
-    *r = Hi;
+    u256_op(r, &Hi, U256_MEMCOPY);
 }
 
 void mont_to(u256d *r, const u256d *a, const mont_ctx *ctx)

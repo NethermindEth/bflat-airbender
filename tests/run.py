@@ -122,9 +122,12 @@ for msg in [b"abc", b"", rng.randbytes(100)]:
     inp += msg.ljust(128, b"\x00") + len(msg).to_bytes(8, "little") + bytes(8) + b"\x01"
     cases.append((f"blake2f {inp.hex()}", hashlib.blake2b(msg).hexdigest()))
 
-for _ in range(12):
-    d = rng.randrange(1, K1.n)
-    h = rng.randrange(0, 2**256)
+# Random keys and hashes, then the edge keys and hashes: the GLV split and the wNAF tables see
+# every shape of scalar, including u1 = 0 (hash 0 or n).
+k1_cases = [(rng.randrange(1, K1.n), rng.randrange(0, 2**256)) for _ in range(200)]
+k1_cases += [(d, rng.randrange(0, 2**256)) for d in (1, 2, 3, K1.n - 1, K1.n - 2)]
+k1_cases += [(rng.randrange(1, K1.n), h) for h in (0, K1.n, 2**256 - 1)]
+for d, h in k1_cases:
     r, s, recid = sign(K1, d, h % K1.n)
     Q = K1.mul(d, K1.g)
     cases.append((f"ecrecover {h32(h)} {h32(r)}{h32(s)} {recid:02x}", h32(Q[0]) + h32(Q[1])))
