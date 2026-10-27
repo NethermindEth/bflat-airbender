@@ -26,6 +26,9 @@ __attribute__((noreturn)) void airbender_fail(uint32_t code);
 
 /* The Keccak-f[1600] permutation: the platform's, a delegation on Airbender. */
 void keccak_f1600(uint64_t state[25]);
+#ifdef AIRBENDER
+void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32]);
+#endif
 void keccak_f1600_soft(uint64_t state[25]);
 
 #endif

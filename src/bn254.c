@@ -11,7 +11,8 @@
 
 #include "ec.h"
 
-static const curve Bn254 = {
+/* In RAM, where the delegation reads its operands. */
+static curve Bn254 = {
     .n = 8,
     .inv = 0xe4866389,
     .p = {{0xd87cfd47, 0x3c208c16, 0x6871ca8d, 0x97816a91, 0x8181585d, 0xb85045b6, 0xe131a029, 0x30644e72}},

@@ -3,7 +3,7 @@
  *
  * Both curves are y^2 = x^3 + b over a prime field with a pairing-friendly sextic twist, so one
  * implementation serves both, parameterised by the curve table in use (ec_use):
- *   - Fp: Montgomery arithmetic on 32-bit limbs, 8 limbs for BN254 and 12 for BLS12-381;
+ *   - Fp: Montgomery arithmetic on the u256 delegation, 8 limbs for BN254 and 12 for BLS12-381;
  *   - Fp2 = Fp[u]/(u^2 + 1), the same for both;
  *   - Fp12 = Fp2[w]/(w^6 - xi), flat rather than towered, with xi = 9 + u (BN254) or 1 + u
  *     (BLS12-381), so one schoolbook product covers both;
@@ -19,13 +19,15 @@
 
 enum
 {
-    FpMaxLimbs = 12
+    FpMaxLimbs = 16
 };
 
+/* Little-endian limbs in Montgomery form, as two 256-bit digits aligned for the u256 delegation; for
+   BN254 only the first is in use, and for BLS12-381 the limbs past the twelfth are zero. */
 typedef struct
 {
-    uint32_t l[FpMaxLimbs]; /* little-endian limbs, Montgomery form; limbs past n are zero */
-} fp;
+    uint32_t l[FpMaxLimbs];
+} __attribute__((aligned(32))) fp;
 
 typedef struct
 {

@@ -21,57 +21,19 @@ static int limbs_cmp(const uint32_t *a, const uint32_t *b, uint32_t n)
     return 0;
 }
 
-static uint32_t limbs_sub(uint32_t *r, const uint32_t *a, const uint32_t *b, uint32_t n)
-{
-    int64_t borrow = 0;
-    for (uint32_t i = 0; i < n; i++)
-    {
-        borrow += (int64_t)a[i] - b[i];
-        r[i] = (uint32_t)borrow;
-        borrow >>= 32;
-    }
-    return borrow != 0;
-}
-
-/* Both primes leave the top bit of their last limb clear, so a sum of two reduced elements
-   never carries out of n limbs. */
-void fp_add(fp *r, const fp *a, const fp *b)
-{
-    uint32_t n = C->n;
-    uint64_t carry = 0;
-    for (uint32_t i = 0; i < n; i++)
-    {
-        carry += (uint64_t)a->l[i] + b->l[i];
-        r->l[i] = (uint32_t)carry;
-        carry >>= 32;
-    }
-    if (limbs_cmp(r->l, C->p.l, n) >= 0)
-        limbs_sub(r->l, r->l, C->p.l, n);
-}
-
-void fp_sub(fp *r, const fp *a, const fp *b)
-{
-    uint32_t n = C->n;
-    if (limbs_sub(r->l, a->l, b->l, n))
-    {
-        uint64_t carry = 0;
-        for (uint32_t i = 0; i < n; i++)
-        {
-            carry += (uint64_t)r->l[i] + C->p.l[i];
-            r->l[i] = (uint32_t)carry;
-            carry >>= 32;
-        }
-    }
-}
-
-/* Montgomery multiplication on the u256 delegation. An element is split into 256-bit digits, a
- * low one and, for BLS12-381, a high one below 2^128; the product accumulates in T, four digits.
- * The reduction adds multiples of p that clear T from the bottom: one 256-bit step, which is the
- * whole of it for BN254 (R = 2^256), and for BLS12-381 (R = 2^384) a second step that clears only
- * 128 bits. The delegation takes its operands from RAM, 32-byte aligned and distinct, so they all
- * live in these statics. */
-static u256d A0, A1, B0, B1, M, X, T[4], Zero, Pinv, P0, P1;
+/*
+ * The field operations run on the u256 delegation, which takes its operands from RAM, 32-byte aligned
+ * and distinct, and writes its result over the first. An element is two 256-bit digits (ec.h), only
+ * the first in use for BN254, and the curve tables are in RAM, so the operands are read in place.
+ */
+static u256d M, X, T[4], Zero, Pinv, P0, P1;
+static fp Scratch;
 static const curve *Prepared;
+
+static inline u256d *digit(const fp *a, int i)
+{
+    return (u256d *)(uintptr_t)&a->l[8 * i];
+}
 
 /* Pinv = -p^-1 mod 2^256 and p as digits, once per curve. */
 static void prepare(void)
@@ -80,7 +42,7 @@ static void prepare(void)
     for (int i = 0; i < 8; i++)
     {
         P0.w[i] = C->p.l[i];
-        P1.w[i] = i + 8 < (int)C->n ? C->p.l[i + 8] : 0;
+        P1.w[i] = C->p.l[i + 8];
     }
     /* p^-1 mod 2^256 by Newton: p is its own inverse mod 8, and each step doubles the bits. */
     x = P0;
@@ -95,6 +57,85 @@ static void prepare(void)
     Pinv = (u256d){{0}};
     u256_op(&Pinv, &x, U256_SUB);
     Prepared = C;
+}
+
+static inline void use_curve(void)
+{
+    if (Prepared != C)
+        prepare();
+}
+
+/* r = a, digit by digit; r and a may be the same. */
+static inline void fp_copy(fp *r, const fp *a, uint32_t n)
+{
+    if (r == a)
+        return;
+    u256_op(digit(r, 0), digit(a, 0), U256_MEMCOPY);
+    if (n > 8)
+        u256_op(digit(r, 1), digit(a, 1), U256_MEMCOPY);
+}
+
+/* r -= p when r >= p, for r below 2p. */
+static void fp_reduce(fp *r, uint32_t n)
+{
+    u256_op(&T[0], digit(r, 0), U256_MEMCOPY);
+    uint32_t borrow = u256_op(&T[0], &P0, U256_SUB);
+    if (n > 8)
+    {
+        u256_op(&T[1], digit(r, 1), U256_MEMCOPY);
+        borrow = u256_op(&T[1], &P1, U256_SUB | (borrow ? U256_CARRY : 0));
+    }
+    if (borrow)
+        return;
+    u256_op(digit(r, 0), &T[0], U256_MEMCOPY);
+    if (n > 8)
+        u256_op(digit(r, 1), &T[1], U256_MEMCOPY);
+}
+
+/* Both primes leave the top bit of their last limb clear, so a sum of two reduced elements
+   never carries out of n limbs. */
+void fp_add(fp *r, const fp *a, const fp *b)
+{
+    uint32_t n = C->n;
+    use_curve();
+    if (r == b)
+    {
+        const fp *t = a;
+        a = b;
+        b = t;
+    }
+    if (r == b)
+    {
+        /* a, b and r are one element: double a copy of it. */
+        fp_copy(&Scratch, b, n);
+        b = &Scratch;
+    }
+    fp_copy(r, a, n);
+    uint32_t carry = u256_op(digit(r, 0), digit(b, 0), U256_ADD);
+    if (n > 8)
+        u256_op(digit(r, 1), digit(b, 1), U256_ADD | (carry ? U256_CARRY : 0));
+    fp_reduce(r, n);
+}
+
+void fp_sub(fp *r, const fp *a, const fp *b)
+{
+    uint32_t n = C->n;
+    use_curve();
+    if (r == b)
+    {
+        fp_copy(&Scratch, b, n);
+        b = &Scratch;
+    }
+    fp_copy(r, a, n);
+    uint32_t borrow = u256_op(digit(r, 0), digit(b, 0), U256_SUB);
+    if (n > 8)
+        borrow = u256_op(digit(r, 1), digit(b, 1), U256_SUB | (borrow ? U256_CARRY : 0));
+    if (!borrow)
+        return;
+    /* Below zero: add p back, the wrap past 2^(256 * digits) undoing the borrow. */
+    uint32_t carry = u256_op(digit(r, 0), &P0, U256_ADD);
+    if (n > 8)
+        u256_op(digit(r, 1), &P1, U256_ADD | (carry ? U256_CARRY : 0));
 }
 
 /* T[k..] += *v. */
@@ -119,56 +160,66 @@ static void accumulate_product(int k, const u256d *a, const u256d *b, bool high)
     }
 }
 
-/* Montgomery product a*b/R mod p. */
+/*
+ * Montgomery product a*b/R mod p. BN254 (R = 2^256) takes the 512-bit product and one 256-bit
+ * reduction step, all in place. BLS12-381 (R = 2^384) splits an element into a 256-bit digit and one
+ * below 2^128: the product accumulates in T, four digits, and the reduction adds multiples of p
+ * that clear T from the bottom, one 256-bit step and one of 128 bits.
+ */
 void fp_mul(fp *r, const fp *a, const fp *b)
 {
     uint32_t n = C->n;
-    if (Prepared != C)
-        prepare();
-    for (int i = 0; i < 8; i++)
-    {
-        A0.w[i] = a->l[i];
-        B0.w[i] = b->l[i];
-        A1.w[i] = i + 8 < (int)n ? a->l[i + 8] : 0;
-        B1.w[i] = i + 8 < (int)n ? b->l[i + 8] : 0;
-    }
-    for (int i = 0; i < 4; i++)
-        u256_op(&T[i], &Zero, U256_MEMCOPY);
-
-    fp res = {{0}};
+    use_curve();
+    const u256d *a0 = digit(a, 0), *b0 = digit(b, 0);
     if (n == 8)
     {
-        accumulate_product(0, &A0, &B0, true);
+        /* lo + m p is a multiple of 2^256 whose low half is 2^256 exactly when lo != 0. */
+        u256_op(&T[0], a0, U256_MEMCOPY);
+        u256_op(&T[0], b0, U256_MUL_LOW);
+        u256_op(&T[1], a0, U256_MEMCOPY);
+        u256_op(&T[1], b0, U256_MUL_HIGH);
         u256_op(&M, &T[0], U256_MEMCOPY);
         u256_op(&M, &Pinv, U256_MUL_LOW);
-        accumulate_product(0, &M, &P0, true);
-        memcpy(res.l, T[1].w, 8 * sizeof(uint32_t));
+        u256_op(&M, &P0, U256_MUL_HIGH);
+        uint32_t carry = u256_op(&T[0], &Zero, U256_EQ) ? 0 : U256_CARRY;
+        u256_op(&T[1], &M, U256_ADD | carry);
+        /* Below 2p < 2^256: no carry out, and one subtraction reduces. */
+        u256_op(digit(r, 0), &T[1], U256_MEMCOPY);
+        fp_reduce(r, 8);
+        return;
     }
-    else
-    {
-        accumulate_product(0, &A0, &B0, true);
-        accumulate_product(1, &A0, &B1, true);
-        accumulate_product(1, &A1, &B0, true);
-        accumulate_product(2, &A1, &B1, false);
 
-        u256_op(&M, &T[0], U256_MEMCOPY);
-        u256_op(&M, &Pinv, U256_MUL_LOW);
-        accumulate_product(0, &M, &P0, true);
-        accumulate_product(1, &M, &P1, true);
+    const u256d *a1 = digit(a, 1), *b1 = digit(b, 1);
+    u256_op(&T[0], a0, U256_MEMCOPY);
+    u256_op(&T[0], b0, U256_MUL_LOW);
+    u256_op(&T[1], a0, U256_MEMCOPY);
+    u256_op(&T[1], b0, U256_MUL_HIGH);
+    u256_op(&T[2], &Zero, U256_MEMCOPY);
+    u256_op(&T[3], &Zero, U256_MEMCOPY);
+    accumulate_product(1, a0, b1, true);
+    accumulate_product(1, a1, b0, true);
+    accumulate_product(2, a1, b1, false);
 
-        u256_op(&M, &T[1], U256_MEMCOPY);
-        u256_op(&M, &Pinv, U256_MUL_LOW);
-        for (int i = 4; i < 8; i++)
-            M.w[i] = 0;
-        accumulate_product(1, &M, &P0, true);
-        accumulate_product(2, &M, &P1, false);
+    u256_op(&M, &T[0], U256_MEMCOPY);
+    u256_op(&M, &Pinv, U256_MUL_LOW);
+    accumulate_product(0, &M, &P0, true);
+    accumulate_product(1, &M, &P1, true);
 
-        memcpy(res.l, T[1].w + 4, 4 * sizeof(uint32_t));
-        memcpy(res.l + 4, T[2].w, 8 * sizeof(uint32_t));
-    }
-    if (limbs_cmp(res.l, C->p.l, n) >= 0)
-        limbs_sub(res.l, res.l, C->p.l, n);
-    *r = res;
+    u256_op(&M, &T[1], U256_MEMCOPY);
+    u256_op(&M, &Pinv, U256_MUL_LOW);
+    for (int i = 4; i < 8; i++)
+        M.w[i] = 0;
+    accumulate_product(1, &M, &P0, true);
+    accumulate_product(2, &M, &P1, false);
+
+    /* The product over R is T from bit 384 on: words 4-7 of T[1], then T[2]. */
+    for (int i = 0; i < 4; i++)
+        r->l[i] = T[1].w[4 + i];
+    for (int i = 0; i < 8; i++)
+        r->l[4 + i] = T[2].w[i];
+    for (int i = 12; i < FpMaxLimbs; i++)
+        r->l[i] = 0;
+    fp_reduce(r, 12);
 }
 
 bool fp_is_zero(const fp *a)
@@ -292,15 +343,26 @@ static void fq_set_one(fp2 *r)
     r->c[0] = C->one;
 }
 
+/* a^e by 4-bit windows from the top non-zero one: 14 products for the table, then one per window. */
 NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
 {
-    fp2 acc, base = *a;
-    fq_set_one(&acc);
-    for (int i = 32 * (int)C->n - 1; i >= 0; i--)
+    fp2 table[16], acc;
+    fq_set_one(&table[0]);
+    table[1] = *a;
+    for (int i = 2; i < 16; i++)
+        fq_mul(&table[i], &table[i - 1], a, d);
+
+    int window = 8 * (int)C->n - 1;
+    while (window > 0 && ((e->l[window / 8] >> (4 * (window % 8))) & 15) == 0)
+        window--;
+    acc = table[(e->l[window / 8] >> (4 * (window % 8))) & 15];
+    for (window--; window >= 0; window--)
     {
-        fq_mul(&acc, &acc, &acc, d);
-        if ((e->l[i / 32] >> (i % 32)) & 1)
-            fq_mul(&acc, &acc, &base, d);
+        for (int s = 0; s < 4; s++)
+            fq_mul(&acc, &acc, &acc, d);
+        uint32_t bits = (e->l[window / 8] >> (4 * (window % 8))) & 15;
+        if (bits)
+            fq_mul(&acc, &acc, &table[bits], d);
     }
     *r = acc;
 }

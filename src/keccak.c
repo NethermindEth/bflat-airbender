@@ -114,6 +114,10 @@ void syscall_keccak_f(uint64_t state[25])
 
 zkvm_status zkvm_keccak256(const uint8_t *data, size_t len, uint8_t output[32])
 {
+#ifdef AIRBENDER
+    airbender_keccak256(data, len, output);
+    return ZKVM_EOK;
+#else
     enum { Rate = 136 };
     uint64_t state[25] = {0};
     uint8_t block[Rate];
@@ -146,4 +150,5 @@ zkvm_status zkvm_keccak256(const uint8_t *data, size_t len, uint8_t output[32])
         for (int b = 0; b < 8; b++)
             output[i * 8 + b] = (uint8_t)(state[i] >> (8 * b));
     return ZKVM_EOK;
+#endif
 }

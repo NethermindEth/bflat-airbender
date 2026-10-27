@@ -57,9 +57,9 @@ static inline __attribute__((always_inline)) void copy_lanes(uint64_t *to, const
         t[i] = f[i];
 }
 
-void keccak_f1600(uint64_t state[25])
+/* Keccak-f[1600] on KeccakState in place. */
+static inline __attribute__((always_inline)) void permute(void)
 {
-    copy_lanes(KeccakState, state);
     register uint32_t x11 __asm__("a1") = (uint32_t)KeccakState;
     __asm__ volatile("add x10, x0, x0\n"
                      KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
@@ -68,7 +68,76 @@ void keccak_f1600(uint64_t state[25])
                      :
                      : "r"(x11)
                      : "a0", "memory");
+}
+
+void keccak_f1600(uint64_t state[25])
+{
+    copy_lanes(KeccakState, state);
+    permute();
     copy_lanes(state, KeccakState);
+}
+
+enum
+{
+    RateWords = 34 /* 136 bytes */
+};
+
+/* XORs the 136 bytes at data into the rate. A misaligned block is read as the aligned words that cover
+ * it, each output word merged from two of them: the last of those words holds the block's last byte,
+ * so nothing past that word is read. */
+static inline __attribute__((always_inline)) void absorb_block(const uint8_t *data)
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+    uint32_t misalignment = (uintptr_t)data & 3;
+    if (misalignment == 0)
+    {
+        const uint32_t *w = (const uint32_t *)data;
+        for (int i = 0; i < RateWords; i++)
+            s[i] ^= w[i];
+        return;
+    }
+    const uint32_t *w = (const uint32_t *)(data - misalignment);
+    uint32_t low = 8 * misalignment, high = 32 - low;
+    uint32_t current = w[0];
+    for (int i = 0; i < RateWords; i++)
+    {
+        uint32_t next = w[i + 1];
+        s[i] ^= (current >> low) | (next << high);
+        current = next;
+    }
+}
+
+/* Keccak-256 of the len bytes at data into out, absorbed straight into the delegation's state. */
+void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+    for (int i = 0; i < 50; i++)
+        s[i] = 0;
+    while (len >= 4 * RateWords)
+    {
+        absorb_block(data);
+        permute();
+        data += 4 * RateWords;
+        len -= 4 * RateWords;
+    }
+
+    uint32_t tail[RateWords] = {0};
+    memcpy(tail, data, len);
+    ((uint8_t *)tail)[len] ^= 0x01;
+    ((uint8_t *)tail)[4 * RateWords - 1] ^= 0x80;
+    for (int i = 0; i < RateWords; i++)
+        s[i] ^= tail[i];
+    permute();
+
+    if (((uintptr_t)out & 3) == 0)
+    {
+        for (int i = 0; i < 8; i++)
+            ((uint32_t *)out)[i] = s[i];
+    }
+    else
+    {
+        memcpy(out, s, 32);
+    }
 }
 
 /* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR

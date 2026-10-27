@@ -16,7 +16,8 @@
 
 #include "ec.h"
 
-static const curve Bls12 = {
+/* In RAM, where the delegation reads its operands. */
+static curve Bls12 = {
     .n = 12,
     .inv = 0xfffcfffd,
     .p = {{0xffffaaab, 0xb9feffff, 0xb153ffff, 0x1eabfffe, 0xf6b0f624, 0x6730d2a0, 0xf38512bf, 0x64774b84, 0x434bacd7, 0x4b1ba7b6, 0x397fe69a, 0x1a0111ea}},
@@ -39,7 +40,7 @@ enum
 };
 
 /* A primitive cube root of unity: (x, y) -> (beta x, y) acts on G1 as multiplication by -x^2. */
-static const fp Beta = {{0x798a64e8, 0x30f1361b, 0x7ece5a2a, 0xf3b8ddab, 0xc61577f7, 0x16a8ca3a, 0x74fd029b, 0xc26a2ff8, 0x60701c6e, 0x3636b766, 0x241b6160, 0x051ba4ab}};
+static fp Beta = {{0x798a64e8, 0x30f1361b, 0x7ece5a2a, 0xf3b8ddab, 0xc61577f7, 0x16a8ca3a, 0x74fd029b, 0xc26a2ff8, 0x60701c6e, 0x3636b766, 0x241b6160, 0x051ba4ab}};
 
 static bool g1_in_group(const point *p)
 {
