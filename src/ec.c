@@ -141,32 +141,10 @@ void fp_sub(fp *r, const fp *a, const fp *b)
         u256_op(digit(r, 1), &P1, U256_ADD | (carry ? U256_CARRY : 0));
 }
 
-/* T[k..] += *v. */
-static void accumulate(int k, const u256d *v)
-{
-    uint32_t carry = u256_op(&T[k], v, U256_ADD);
-    for (int i = k + 1; carry && i < 4; i++)
-        carry = u256_op(&T[i], &Zero, U256_ADD | U256_CARRY);
-}
-
-/* T += a * b * 2^(256 k); the high half only when the product can reach it. */
-static void accumulate_product(int k, const u256d *a, const u256d *b, bool high)
-{
-    u256_op(&X, a, U256_MEMCOPY);
-    u256_op(&X, b, U256_MUL_LOW);
-    accumulate(k, &X);
-    if (high)
-    {
-        u256_op(&X, a, U256_MEMCOPY);
-        u256_op(&X, b, U256_MUL_HIGH);
-        accumulate(k + 1, &X);
-    }
-}
-
 /*
  * Montgomery product a*b/R mod p. BN254 (R = 2^256) takes the 512-bit product and one 256-bit
  * reduction step, all in place. BLS12-381 (R = 2^384) splits an element into a 256-bit digit and one
- * below 2^128: the product accumulates in T, four digits, and the reduction adds multiples of p
+ * below 2^128: the product accumulates in T, three digits, and the reduction adds multiples of p
  * that clear T from the bottom, one 256-bit step and one of 128 bits.
  */
 void fp_mul(fp *r, const fp *a, const fp *b)
@@ -192,34 +170,63 @@ void fp_mul(fp *r, const fp *a, const fp *b)
         return;
     }
 
+    /* The product lands in three digits, T0 + T1 W + T2 W^2 (W = 2^256), each carry passed on as the next
+       addition's carry in. a1 and b1 are below 2^128, so a1 b1 fits a digit and T2 never carries out. */
     const u256d *a1 = digit(a, 1), *b1 = digit(b, 1);
-    u256_op(&T[0], a0, U256_MEMCOPY);
-    u256_op(&T[0], b0, U256_MUL_LOW);
-    u256_op(&T[1], a0, U256_MEMCOPY);
-    u256_op(&T[1], b0, U256_MUL_HIGH);
-    u256_op(&T[2], &Zero, U256_MEMCOPY);
-    u256_op(&T[3], &Zero, U256_MEMCOPY);
-    accumulate_product(1, a0, b1, true);
-    accumulate_product(1, a1, b0, true);
-    accumulate_product(2, a1, b1, false);
+    u256d *t0 = &T[0], *t1 = &T[1], *t2 = &T[2];
+    u256_op(t0, a0, U256_MEMCOPY);
+    u256_op(t0, b0, U256_MUL_LOW);
+    u256_op(t1, a0, U256_MEMCOPY);
+    u256_op(t1, b0, U256_MUL_HIGH);
+    u256_op(t2, a0, U256_MEMCOPY);
+    u256_op(t2, b1, U256_MUL_HIGH);
+    u256_op(&X, a0, U256_MEMCOPY);
+    u256_op(&X, b1, U256_MUL_LOW);
+    uint32_t c1 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b0, U256_MUL_LOW);
+    uint32_t c2 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b0, U256_MUL_HIGH);
+    u256_op(t2, &X, U256_ADD | (c1 ? U256_CARRY : 0));
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b1, U256_MUL_LOW);
+    u256_op(t2, &X, U256_ADD | (c2 ? U256_CARRY : 0));
 
-    u256_op(&M, &T[0], U256_MEMCOPY);
-    u256_op(&M, &Pinv, U256_MUL_LOW);
-    accumulate_product(0, &M, &P0, true);
-    accumulate_product(1, &M, &P1, true);
+    /* A 256-bit step: m = T0 Pinv, made in T0 itself, and T0 + lo(m P0) is W exactly when T0 != 0. p = P0 + P1 W
+       with P1 below 2^128. */
+    uint32_t low = u256_op(t0, &Zero, U256_EQ) ? 0 : U256_CARRY;
+    u256_op(t0, &Pinv, U256_MUL_LOW);
+    u256_op(&X, t0, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_HIGH);
+    c1 = u256_op(t1, &X, U256_ADD | low);
+    u256_op(&X, t0, U256_MEMCOPY);
+    u256_op(&X, &P1, U256_MUL_LOW);
+    c2 = u256_op(t1, &X, U256_ADD);
+    u256_op(t0, &P1, U256_MUL_HIGH);
+    u256_op(t2, t0, U256_ADD | (c1 ? U256_CARRY : 0));
+    if (c2)
+        u256_op(t2, &Zero, U256_ADD | U256_CARRY);
 
-    u256_op(&M, &T[1], U256_MEMCOPY);
+    /* A 128-bit step: m = T1 Pinv mod 2^128 clears the low half of T1; m P1 is below 2^253. */
+    u256_op(&M, t1, U256_MEMCOPY);
     u256_op(&M, &Pinv, U256_MUL_LOW);
     for (int i = 4; i < 8; i++)
         M.w[i] = 0;
-    accumulate_product(1, &M, &P0, true);
-    accumulate_product(2, &M, &P1, false);
+    u256_op(&X, &M, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_LOW);
+    c1 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, &M, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_HIGH);
+    u256_op(&M, &P1, U256_MUL_LOW);
+    u256_op(t2, &X, U256_ADD | (c1 ? U256_CARRY : 0));
+    u256_op(t2, &M, U256_ADD);
 
-    /* The product over R is T from bit 384 on: words 4-7 of T[1], then T[2]. */
+    /* The product over R = 2^384 is T from bit 384 on: words 4-7 of T1, then T2; below 2p. */
     for (int i = 0; i < 4; i++)
-        r->l[i] = T[1].w[4 + i];
+        r->l[i] = t1->w[4 + i];
     for (int i = 0; i < 8; i++)
-        r->l[4 + i] = T[2].w[i];
+        r->l[4 + i] = t2->w[i];
     for (int i = 12; i < FpMaxLimbs; i++)
         r->l[i] = 0;
     fp_reduce(r, 12);
