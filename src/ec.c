@@ -701,10 +701,9 @@ void fp12_one(fp12 *r)
     r->c[0].c[0] = C->one;
 }
 
-/* Schoolbook product modulo w^6 - xi. Zero coefficients of b are skipped, which makes the
-   product by a line (three non-zero coefficients) half the cost; a square (a == b) takes each
-   cross product once, doubled, for 21 Fp2 products instead of 36. */
-NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
+/* Schoolbook product modulo w^6 - xi, which skips the zero coefficients of b: the product by a line
+   (three non-zero coefficients) takes 18 Fp2 products. */
+NOINLINE static void fp12_mul_schoolbook(fp12 *r, const fp12 *a, const fp12 *b)
 {
     fp2 t[11], m;
     memset(t, 0, sizeof(t));
@@ -712,11 +711,9 @@ NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
     {
         if (fq_is_zero(&b->c[j], 2))
             continue;
-        for (int i = a == b ? j : 0; i < 6; i++)
+        for (int i = 0; i < 6; i++)
         {
             fq_mul(&m, &a->c[i], &b->c[j], 2);
-            if (a == b && i != j)
-                fq_add(&m, &m, &m, 2);
             fq_add(&t[i + j], &t[i + j], &m, 2);
         }
     }
@@ -726,6 +723,136 @@ NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
         fq_add(&t[k - 6], &t[k - 6], &m, 2);
     }
     memcpy(r->c, t, sizeof(r->c));
+}
+
+/*
+ * Fp12 as Fp6[w]/(w^2 - v) over Fp6 = Fp2[v]/(v^3 - xi), v = w^2: the even coefficients of the flat
+ * form are the Fp6 element A and the odd ones B, for A + B w. Karatsuba at both levels takes 18 Fp2
+ * products for a product and 12 for a square, against 36 and 21 for the flat schoolbook.
+ */
+typedef struct
+{
+    fp2 c[3]; /* c[0] + c[1] v + c[2] v^2 */
+} fp6;
+
+static void fp6_add(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    for (int i = 0; i < 3; i++)
+        fq_add(&r->c[i], &a->c[i], &b->c[i], 2);
+}
+
+static void fp6_sub(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    for (int i = 0; i < 3; i++)
+        fq_sub(&r->c[i], &a->c[i], &b->c[i], 2);
+}
+
+/* r = a v: (a0 + a1 v + a2 v^2) v = xi a2 + a0 v + a1 v^2. */
+static void fp6_mul_v(fp6 *r, const fp6 *a)
+{
+    fp2 t;
+    fp2_mul_xi(&t, &a->c[2]);
+    r->c[2] = a->c[1];
+    r->c[1] = a->c[0];
+    r->c[0] = t;
+}
+
+NOINLINE static void fp6_mul(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    fp2 t0, t1, t2, s, u;
+    fp6 out;
+    fq_mul(&t0, &a->c[0], &b->c[0], 2);
+    fq_mul(&t1, &a->c[1], &b->c[1], 2);
+    fq_mul(&t2, &a->c[2], &b->c[2], 2);
+
+    /* c0 = t0 + xi ((a1 + a2)(b1 + b2) - t1 - t2) */
+    fq_add(&s, &a->c[1], &a->c[2], 2);
+    fq_add(&u, &b->c[1], &b->c[2], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t1, 2);
+    fq_sub(&s, &s, &t2, 2);
+    fp2_mul_xi(&s, &s);
+    fq_add(&out.c[0], &t0, &s, 2);
+
+    /* c1 = (a0 + a1)(b0 + b1) - t0 - t1 + xi t2 */
+    fq_add(&s, &a->c[0], &a->c[1], 2);
+    fq_add(&u, &b->c[0], &b->c[1], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t0, 2);
+    fq_sub(&s, &s, &t1, 2);
+    fp2_mul_xi(&u, &t2);
+    fq_add(&out.c[1], &s, &u, 2);
+
+    /* c2 = (a0 + a2)(b0 + b2) - t0 - t2 + t1 */
+    fq_add(&s, &a->c[0], &a->c[2], 2);
+    fq_add(&u, &b->c[0], &b->c[2], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t0, 2);
+    fq_sub(&s, &s, &t2, 2);
+    fq_add(&out.c[2], &s, &t1, 2);
+    *r = out;
+}
+
+static void fp12_split(fp6 *even, fp6 *odd, const fp12 *a)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        even->c[i] = a->c[2 * i];
+        odd->c[i] = a->c[2 * i + 1];
+    }
+}
+
+static void fp12_join(fp12 *r, const fp6 *even, const fp6 *odd)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        r->c[2 * i] = even->c[i];
+        r->c[2 * i + 1] = odd->c[i];
+    }
+}
+
+NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
+{
+    int zeros = 0;
+    for (int j = 0; j < 6; j++)
+        zeros += fq_is_zero(&b->c[j], 2);
+    if (a != b && zeros >= 3)
+    {
+        fp12_mul_schoolbook(r, a, b);
+        return;
+    }
+
+    fp6 x, y, s, t, u;
+    fp12_split(&x, &y, a);
+    if (a == b)
+    {
+        /* (A + B w)^2 = (A^2 + v B^2) + 2 A B w, where (A + B)(A + v B) = A^2 + v B^2 + (1 + v) A B. */
+        fp6_mul(&u, &x, &y);
+        fp6_mul_v(&t, &y);
+        fp6_add(&t, &t, &x);
+        fp6_add(&s, &x, &y);
+        fp6_mul(&s, &s, &t);
+        fp6_sub(&s, &s, &u);
+        fp6_mul_v(&t, &u);
+        fp6_sub(&s, &s, &t);
+        fp6_add(&t, &u, &u);
+        fp12_join(r, &s, &t);
+        return;
+    }
+
+    /* (A + B w)(C + D w) = (A C + v B D) + ((A + B)(C + D) - A C - B D) w */
+    fp6 c, d, ac, bd;
+    fp12_split(&c, &d, b);
+    fp6_mul(&ac, &x, &c);
+    fp6_mul(&bd, &y, &d);
+    fp6_add(&s, &x, &y);
+    fp6_add(&t, &c, &d);
+    fp6_mul(&s, &s, &t);
+    fp6_sub(&s, &s, &ac);
+    fp6_sub(&s, &s, &bd);
+    fp6_mul_v(&t, &bd);
+    fp6_add(&t, &t, &ac);
+    fp12_join(r, &t, &s);
 }
 
 /* The p^6-power Frobenius, w -> -w; it inverts elements of the cyclotomic subgroup. */

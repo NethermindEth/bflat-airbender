@@ -82,24 +82,24 @@ enum
     RateWords = 34 /* 136 bytes */
 };
 
-/* XORs the 136 bytes at data into the rate. A misaligned block is read as the aligned words that cover
- * it, each output word merged from two of them: the last of those words holds the block's last byte,
- * so nothing past that word is read. */
-static inline __attribute__((always_inline)) void absorb_block(const uint8_t *data)
+/* XORs the `words` words at data into the rate. Misaligned data is read as the aligned words that
+ * cover it, each output word merged from two of them; the last of those words may run up to three bytes
+ * past the data, within its own aligned word. */
+static inline __attribute__((always_inline)) void absorb_words(const uint8_t *data, int words)
 {
     uint32_t *s = (uint32_t *)KeccakState;
     uint32_t misalignment = (uintptr_t)data & 3;
     if (misalignment == 0)
     {
         const uint32_t *w = (const uint32_t *)data;
-        for (int i = 0; i < RateWords; i++)
+        for (int i = 0; i < words; i++)
             s[i] ^= w[i];
         return;
     }
     const uint32_t *w = (const uint32_t *)(data - misalignment);
     uint32_t low = 8 * misalignment, high = 32 - low;
     uint32_t current = w[0];
-    for (int i = 0; i < RateWords; i++)
+    for (int i = 0; i < words; i++)
     {
         uint32_t next = w[i + 1];
         s[i] ^= (current >> low) | (next << high);
@@ -115,18 +115,20 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
         s[i] = 0;
     while (len >= 4 * RateWords)
     {
-        absorb_block(data);
+        absorb_words(data, RateWords);
         permute();
         data += 4 * RateWords;
         len -= 4 * RateWords;
     }
 
-    uint32_t tail[RateWords] = {0};
-    memcpy(tail, data, len);
-    ((uint8_t *)tail)[len] ^= 0x01;
-    ((uint8_t *)tail)[4 * RateWords - 1] ^= 0x80;
-    for (int i = 0; i < RateWords; i++)
-        s[i] ^= tail[i];
+    /* The tail's whole words, then its last bytes with the 0x01 pad byte above them, and the final 0x80. */
+    int words = (int)(len >> 2);
+    absorb_words(data, words);
+    uint32_t rest = len & 3, last = 0;
+    for (uint32_t b = 0; b < rest; b++)
+        last |= (uint32_t)data[4 * words + b] << (8 * b);
+    s[words] ^= last ^ (1u << (8 * rest));
+    s[RateWords - 1] ^= 0x80000000u;
     permute();
 
     if (((uintptr_t)out & 3) == 0)
