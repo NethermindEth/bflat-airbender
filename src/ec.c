@@ -717,17 +717,27 @@ void pt_store(uint8_t *out, const point *p, int d, bool swap)
  */
 void pt_frob(point *r, const point *p, bool inverse)
 {
-    fp2 g, g2, g3;
-    g = C->gamma;
-    if (inverse)
-        fq_inv(&g, &g, 2);
-    fq_mul(&g2, &g, &g, 2);
-    fq_mul(&g3, &g2, &g, 2);
+    /* g^2 and g^3 per curve and direction, formed once: 1/gamma is an exponentiation. */
+    static struct
+    {
+        const curve *cv;
+        fp2 g2, g3;
+    } factors[2][2];
+    __typeof__(factors[0][0]) *k = &factors[C->mtwist][inverse];
+    if (k->cv != C)
+    {
+        fp2 g = C->gamma;
+        if (inverse)
+            fq_inv(&g, &g, 2);
+        fq_mul(&k->g2, &g, &g, 2);
+        fq_mul(&k->g3, &k->g2, &g, 2);
+        k->cv = C;
+    }
     fp2_conj(&r->x, &p->x);
     fp2_conj(&r->y, &p->y);
     fp2_conj(&r->z, &p->z);
-    fq_mul(&r->x, &r->x, &g2, 2);
-    fq_mul(&r->y, &r->y, &g3, 2);
+    fq_mul(&r->x, &r->x, &k->g2, 2);
+    fq_mul(&r->y, &r->y, &k->g3, 2);
 }
 
 /* ---- Fp12 ----------------------------------------------------------------------------------- */

@@ -315,7 +315,8 @@ static void poly(fp2 *r, const fp *table, int len, const fp2 *x, int d)
 }
 
 /* map_to_curve: the simplified SWU map (RFC 9380 section 6.6.2, not constant time) followed by
-   the isogeny; an exceptional input mapping to a zero denominator gives the point at infinity. */
+   the isogeny, as a Jacobian point; an exceptional input mapping to a zero denominator gives the point
+   at infinity. */
 static void map_to_curve(point *r, const fp2 *u, int d)
 {
     const isogeny *m = &Maps[d - 1];
@@ -325,6 +326,17 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     coef(&z, m->abz, 2, d);
     memset(&one, 0, sizeof(one));
     one.c[0] = C->one;
+
+    /* -b/a of each map, formed once: an inverse is an exponentiation. */
+    static fp2 minus_b_over_a[2];
+    static bool have_minus_b_over_a[2];
+    if (!have_minus_b_over_a[d - 1])
+    {
+        fq_inv(&minus_b_over_a[d - 1], &a, d);
+        fq_mul(&minus_b_over_a[d - 1], &minus_b_over_a[d - 1], &b, d);
+        fq_neg(&minus_b_over_a[d - 1], &minus_b_over_a[d - 1], d);
+        have_minus_b_over_a[d - 1] = true;
+    }
 
     fq_mul(&t, u, u, d);
     fq_mul(&t, &t, &z, d);
@@ -340,10 +352,7 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     {
         fq_inv(&tv, &tv, d);
         fq_add(&tv, &tv, &one, d);
-        fq_inv(&x, &a, d);
-        fq_mul(&x, &x, &b, d);
-        fq_neg(&x, &x, d);
-        fq_mul(&x, &x, &tv, d);
+        fq_mul(&x, &minus_b_over_a[d - 1], &tv, d);
     }
     sswu_g(&gx, &x, &a, &b, d);
     if (!fq_sqrt(&y, &gx, d))
@@ -355,29 +364,31 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     if (sgn0(u, d) != sgn0(&y, d))
         fq_neg(&y, &y, d);
 
-    fp2 num, den;
+    /* The isogeny gives x = xn / xd and y = y yn / yd; with Z = xd yd that is the Jacobian point
+       (xn xd yd^2, y yn xd^3 yd^2, Z), which no inverse forms. */
+    fp2 xn, xd, yn, yd, yd2, xd3;
     const fp *k = m->iso;
-    memset(r, 0, sizeof(*r));
-    poly(&num, k, m->len[0], &x, d);
+    poly(&xn, k, m->len[0], &x, d);
     k += m->len[0] * d;
-    poly(&den, k, m->len[1], &x, d);
+    poly(&xd, k, m->len[1], &x, d);
     k += m->len[1] * d;
-    if (fq_is_zero(&den, d))
-        return;
-    fq_inv(&den, &den, d);
-    fq_mul(&r->x, &num, &den, d);
-    poly(&num, k, m->len[2], &x, d);
+    poly(&yn, k, m->len[2], &x, d);
     k += m->len[2] * d;
-    poly(&den, k, m->len[3], &x, d);
-    if (fq_is_zero(&den, d))
+    poly(&yd, k, m->len[3], &x, d);
+    fq_mul(&r->z, &xd, &yd, d);
+    if (fq_is_zero(&r->z, d))
     {
         memset(r, 0, sizeof(*r));
         return;
     }
-    fq_inv(&den, &den, d);
-    fq_mul(&r->y, &num, &den, d);
-    fq_mul(&r->y, &r->y, &y, d);
-    r->z = one;
+    fq_mul(&yd2, &yd, &yd, d);
+    fq_mul(&r->x, &xn, &xd, d);
+    fq_mul(&r->x, &r->x, &yd2, d);
+    fq_mul(&xd3, &xd, &xd, d);
+    fq_mul(&xd3, &xd3, &xd, d);
+    fq_mul(&r->y, &y, &yn, d);
+    fq_mul(&r->y, &r->y, &xd3, d);
+    fq_mul(&r->y, &r->y, &yd2, d);
 }
 
 zkvm_status zkvm_bls12_map_fp_to_g1(const uint8_t field_element[48], uint8_t result[96])
