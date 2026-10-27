@@ -26,7 +26,7 @@ static int limbs_cmp(const uint32_t *a, const uint32_t *b, uint32_t n)
  * and distinct, and writes its result over the first. An element is two 256-bit digits (ec.h), only
  * the first in use for BN254, and the curve tables are in RAM, so the operands are read in place.
  */
-static u256d M, X, T[4], Zero, Pinv, P0, P1;
+static u256d M, X, T[4], Zero, Pinv, PInverse, P0, P1;
 static fp Scratch;
 static const curve *Prepared;
 
@@ -35,7 +35,7 @@ static inline u256d *digit(const fp *a, int i)
     return (u256d *)(uintptr_t)&a->l[8 * i];
 }
 
-/* Pinv = -p^-1 mod 2^256 and p as digits, once per curve. */
+/* Pinv = -p^-1 mod 2^256, PInverse = p^-1 mod 2^256 and p as digits, once per curve. */
 static __attribute__((noinline)) void prepare(void)
 {
     static u256d x, t, two;
@@ -54,6 +54,7 @@ static __attribute__((noinline)) void prepare(void)
         u256_op(&two, &t, U256_SUB);
         u256_op(&x, &two, U256_MUL_LOW);
     }
+    PInverse = x;
     Pinv = (u256d){{0}};
     u256_op(&Pinv, &x, U256_SUB);
     Prepared = C;
@@ -104,10 +105,9 @@ static inline __attribute__((always_inline)) void fp_reduce(fp *r, uint32_t n)
 }
 
 /* Both primes leave the top bit of their last limb clear, so a sum of two reduced elements
-   never carries out of n limbs. */
-void fp_add(fp *r, const fp *a, const fp *b)
+   never carries out of n limbs. Inline for the Fp2 operations, which pass a literal n. */
+static inline __attribute__((always_inline)) void fp_add_n(fp *r, const fp *a, const fp *b, uint32_t n)
 {
-    uint32_t n = C->n;
     if (r == b)
     {
         const fp *t = a;
@@ -127,9 +127,13 @@ void fp_add(fp *r, const fp *a, const fp *b)
     fp_reduce(r, n);
 }
 
-void fp_sub(fp *r, const fp *a, const fp *b)
+void fp_add(fp *r, const fp *a, const fp *b)
 {
-    uint32_t n = C->n;
+    fp_add_n(r, a, b, C->n);
+}
+
+static inline __attribute__((always_inline)) void fp_sub_n(fp *r, const fp *a, const fp *b, uint32_t n)
+{
     if (r == b)
     {
         fp_copy(&Scratch, b, n);
@@ -147,6 +151,11 @@ void fp_sub(fp *r, const fp *a, const fp *b)
         u256_op(digit(r, 1), &P1, U256_ADD | (carry ? U256_CARRY : 0));
 }
 
+void fp_sub(fp *r, const fp *a, const fp *b)
+{
+    fp_sub_n(r, a, b, C->n);
+}
+
 /*
  * Montgomery product a*b/R mod p. BN254 (R = 2^256) takes the 512-bit product and one 256-bit
  * reduction step, all in place. BLS12-381 (R = 2^384) splits an element into a 256-bit digit and one
@@ -159,19 +168,29 @@ void fp_mul(fp *r, const fp *a, const fp *b)
     const u256d *a0 = digit(a, 0), *b0 = digit(b, 0);
     if (n == 8)
     {
-        /* lo + m p is a multiple of 2^256 whose low half is 2^256 exactly when lo != 0. */
+        /* With m = lo(ab) p^-1, m p has the low half of ab, so (ab - m p) / R = hi(ab) - hi(m p): a difference in
+           (-p, p) that needs no carry from the low halves. hi(ab) is formed in r itself, unless r is b alone. */
+        u256d *rd = digit(r, 0);
+        if (rd == b0 && rd != a0)
+        {
+            const u256d *t = a0;
+            a0 = b0;
+            b0 = t;
+        }
+        if (b0 == rd)
+        {
+            u256_op(&T[1], b0, U256_MEMCOPY);
+            b0 = &T[1];
+        }
         u256_op(&T[0], a0, U256_MEMCOPY);
         u256_op(&T[0], b0, U256_MUL_LOW);
-        u256_op(&T[1], a0, U256_MEMCOPY);
-        u256_op(&T[1], b0, U256_MUL_HIGH);
-        u256_op(&M, &T[0], U256_MEMCOPY);
-        u256_op(&M, &Pinv, U256_MUL_LOW);
-        u256_op(&M, &P0, U256_MUL_HIGH);
-        uint32_t carry = u256_op(&T[0], &Zero, U256_EQ) ? 0 : U256_CARRY;
-        u256_op(&T[1], &M, U256_ADD | carry);
-        /* Below 2p < 2^256: no carry out, and one subtraction reduces. */
-        u256_op(digit(r, 0), &T[1], U256_MEMCOPY);
-        fp_reduce(r, 8);
+        u256_op(&T[0], &PInverse, U256_MUL_LOW);
+        u256_op(&T[0], &P0, U256_MUL_HIGH);
+        if (rd != a0)
+            u256_op(rd, a0, U256_MEMCOPY);
+        u256_op(rd, b0, U256_MUL_HIGH);
+        if (u256_op(rd, &T[0], U256_SUB))
+            u256_op(rd, &P0, U256_ADD);
         return;
     }
 
@@ -301,14 +320,26 @@ static void p_exp(fp *e, int32_t add, unsigned shift)
 
 NOINLINE void fq_add(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
+    if (C->n == 8)
+    {
+        for (int i = 0; i < d; i++)
+            fp_add_n(&r->c[i], &a->c[i], &b->c[i], 8);
+        return;
+    }
     for (int i = 0; i < d; i++)
-        fp_add(&r->c[i], &a->c[i], &b->c[i]);
+        fp_add_n(&r->c[i], &a->c[i], &b->c[i], 12);
 }
 
 NOINLINE void fq_sub(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
+    if (C->n == 8)
+    {
+        for (int i = 0; i < d; i++)
+            fp_sub_n(&r->c[i], &a->c[i], &b->c[i], 8);
+        return;
+    }
     for (int i = 0; i < d; i++)
-        fp_sub(&r->c[i], &a->c[i], &b->c[i]);
+        fp_sub_n(&r->c[i], &a->c[i], &b->c[i], 12);
 }
 
 NOINLINE void fq_neg(fp2 *r, const fp2 *a, int d)
@@ -534,15 +565,20 @@ NOINLINE static void fp2_mul_xi(fp2 *r, const fp2 *a)
     const fp2 *ka = a;
     if (C->xi > 1)
     {
-        /* k a by doubling and adding from the top bit of k: 9 a in four additions rather than eight. */
-        uint32_t xi = C->xi;
-        k = *a;
-        for (int bit = 30 - __builtin_clz(xi); bit >= 0; bit--)
+        /* k a as two products by k in Montgomery form, formed once per curve: an addition costs a third of a
+           product, and 9 a takes four of them per coefficient. */
+        static fp k_mont;
+        static const curve *k_for;
+        if (k_for != C)
         {
-            fq_add(&k, &k, &k, 2);
-            if ((xi >> bit) & 1)
-                fq_add(&k, &k, a, 2);
+            fp plain;
+            memset(&plain, 0, sizeof(plain));
+            plain.l[0] = C->xi;
+            fp_mul(&k_mont, &plain, &C->r2);
+            k_for = C;
         }
+        fp_mul(&k.c[0], &a->c[0], &k_mont);
+        fp_mul(&k.c[1], &a->c[1], &k_mont);
         ka = &k;
     }
     fp_sub(&t.c[0], &ka->c[0], &a->c[1]);
