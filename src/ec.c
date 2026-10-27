@@ -448,11 +448,23 @@ NOINLINE bool fq_sqrt(fp2 *r, const fp2 *a, int d)
 /* a * xi with xi = k + u: (a0 k - a1) + (a0 + a1 k) u. */
 NOINLINE static void fp2_mul_xi(fp2 *r, const fp2 *a)
 {
-    fp2 k = *a, t;
-    for (uint32_t i = 1; i < C->xi; i++)
-        fq_add(&k, &k, a, 2);
-    fp_sub(&t.c[0], &k.c[0], &a->c[1]);
-    fp_add(&t.c[1], &k.c[1], &a->c[0]);
+    fp2 k, t;
+    const fp2 *ka = a;
+    if (C->xi > 1)
+    {
+        /* k a by doubling and adding from the top bit of k: 9 a in four additions rather than eight. */
+        uint32_t xi = C->xi;
+        k = *a;
+        for (int bit = 30 - __builtin_clz(xi); bit >= 0; bit--)
+        {
+            fq_add(&k, &k, &k, 2);
+            if ((xi >> bit) & 1)
+                fq_add(&k, &k, a, 2);
+        }
+        ka = &k;
+    }
+    fp_sub(&t.c[0], &ka->c[0], &a->c[1]);
+    fp_add(&t.c[1], &ka->c[1], &a->c[0]);
     *r = t;
 }
 
