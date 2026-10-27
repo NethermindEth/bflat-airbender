@@ -24,19 +24,23 @@ static inline uint32_t rotr32(uint32_t x, unsigned n)
 #define SSIG1(x) (rotr32(x, 17) ^ rotr32(x, 19) ^ ((x) >> 10))
 
 /* One round with the working variables renamed rather than moved: eight rounds bring them back
- * to their places. kw is K[i] + W[i]. */
+ * to their places. kw is K[i] + W[i]. Maj(a, b, c) = b ^ ((a ^ b) & (b ^ c)), and this round's a ^ b
+ * is the next one's b ^ c: bc carries it. */
 #define ROUND(a, b, c, d, e, f, g, h, kw)                                                          \
     do                                                                                             \
     {                                                                                              \
         uint32_t t1 = (h) + BSIG1(e) + ((g) ^ ((e) & ((f) ^ (g)))) + (kw);                         \
+        uint32_t ab = (a) ^ (b);                                                                   \
         (d) += t1;                                                                                 \
-        (h) = t1 + BSIG0(a) + (((a) & (b)) | ((c) & ((a) | (b))));                                 \
+        (h) = t1 + BSIG0(a) + ((b) ^ (ab & bc));                                                   \
+        bc = ab;                                                                                   \
     } while (0)
 
 /* The 64 rounds over kw[i] = K[i] + W[i]. */
 static void rounds(uint32_t h[8], const uint32_t kw[64])
 {
     uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    uint32_t bc = b ^ c;
     for (int i = 0; i < 64; i += 8)
     {
         ROUND(a, b, c, d, e, f, g, hh, kw[i]);
