@@ -21,21 +21,26 @@ void mont_from(u256d *r, const u256d *a, const mont_ctx *ctx)
     mont_mul(r, a, &one_plain, ctx);
 }
 
+/* By 4-bit windows from the top non-zero one. */
 void mont_pow(u256d *r, const u256d *a, const u256d *e, const mont_ctx *ctx)
 {
-    static u256d base, acc;
-    base = *a;
-    acc = ctx->one;
-    int started = 0;
-    for (int i = 255; i >= 0; i--)
+    static u256d table[16], acc;
+    table[0] = ctx->one;
+    table[1] = *a;
+    for (int i = 2; i < 16; i++)
+        mont_mul(&table[i], &table[i - 1], a, ctx);
+
+    int window = 63;
+    while (window > 0 && ((e->w[window / 8] >> (4 * (window % 8))) & 15) == 0)
+        window--;
+    acc = table[(e->w[window / 8] >> (4 * (window % 8))) & 15];
+    for (window--; window >= 0; window--)
     {
-        if (started)
+        for (int s = 0; s < 4; s++)
             mont_mul(&acc, &acc, &acc, ctx);
-        if ((e->w[i / 32] >> (i % 32)) & 1)
-        {
-            mont_mul(&acc, &acc, &base, ctx);
-            started = 1;
-        }
+        uint32_t bits = (e->w[window / 8] >> (4 * (window % 8))) & 15;
+        if (bits)
+            mont_mul(&acc, &acc, &table[bits], ctx);
     }
     *r = acc;
 }
