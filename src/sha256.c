@@ -63,11 +63,16 @@ static void schedule(uint32_t kw[64], uint32_t w[16])
 {
     for (int i = 0; i < 16; i++)
         kw[i] = K[i] + w[i];
-    for (int i = 16; i < 64; i++)
+    /* Sixteen steps a round, so every index into the window is a constant. */
+    for (int i = 16; i < 64; i += 16)
     {
-        uint32_t next = w[i & 15] + SSIG0(w[(i + 1) & 15]) + w[(i + 9) & 15] + SSIG1(w[(i + 14) & 15]);
-        w[i & 15] = next;
-        kw[i] = K[i] + next;
+#pragma clang loop unroll(full)
+        for (int j = 0; j < 16; j++)
+        {
+            uint32_t next = w[j] + SSIG0(w[(j + 1) & 15]) + w[(j + 9) & 15] + SSIG1(w[(j + 14) & 15]);
+            w[j] = next;
+            kw[i + j] = K[i + j] + next;
+        }
     }
 }
 
