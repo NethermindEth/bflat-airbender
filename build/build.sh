@@ -38,7 +38,7 @@ if [ "$platform" = airbender ]; then
 {
   "name": "libairbender",
   "builds": [
-    { "arch": "riscv32", "os": "linux", "libc": "airbender", "static_lib": "libairbender.a" }
+    { "arch": "riscv32", "os": "linux", "libc": "airbender", "static_lib": "libairbender.a", "wrap_symbols": ["memcpy"] }
   ]
 }
 EOF

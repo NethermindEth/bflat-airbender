@@ -142,6 +142,78 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
     }
 }
 
+/* memcpy, by --wrap (the manifest's wrap_symbols): the guest copies megabytes of witness nodes from
+ * misaligned input positions. 32 bytes a round; a misaligned source is read as the aligned words that
+ * cover it, each output word merged from two of them, and the last may run up to three bytes past the
+ * source within its own aligned word. no_builtin keeps the byte loops from becoming memcpy calls. */
+__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+{
+    uint8_t *d = dest;
+    const uint8_t *s = src;
+    if (n < 16)
+    {
+        while (n--)
+            *d++ = *s++;
+        return dest;
+    }
+    while ((uintptr_t)d & 3)
+    {
+        *d++ = *s++;
+        n--;
+    }
+    uint32_t *dw = (uint32_t *)d;
+    uint32_t misalignment = (uintptr_t)s & 3;
+    if (misalignment == 0)
+    {
+        const uint32_t *sw = (const uint32_t *)s;
+        for (; n >= 32; n -= 32, dw += 8, sw += 8)
+        {
+            uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
+            dw[0] = w0;
+            dw[1] = w1;
+            dw[2] = w2;
+            dw[3] = w3;
+            dw[4] = w4;
+            dw[5] = w5;
+            dw[6] = w6;
+            dw[7] = w7;
+        }
+        for (; n >= 4; n -= 4)
+            *dw++ = *sw++;
+        s = (const uint8_t *)sw;
+    }
+    else
+    {
+        const uint32_t *sw = (const uint32_t *)(s - misalignment);
+        uint32_t low = 8 * misalignment, high = 32 - low;
+        uint32_t current = *sw++;
+        for (; n >= 32; n -= 32, dw += 8, sw += 8)
+        {
+            uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
+            dw[0] = (current >> low) | (w0 << high);
+            dw[1] = (w0 >> low) | (w1 << high);
+            dw[2] = (w1 >> low) | (w2 << high);
+            dw[3] = (w2 >> low) | (w3 << high);
+            dw[4] = (w3 >> low) | (w4 << high);
+            dw[5] = (w4 >> low) | (w5 << high);
+            dw[6] = (w5 >> low) | (w6 << high);
+            dw[7] = (w6 >> low) | (w7 << high);
+            current = w7;
+        }
+        for (; n >= 4; n -= 4)
+        {
+            uint32_t next = *sw++;
+            *dw++ = (current >> low) | (next << high);
+            current = next;
+        }
+        s = (const uint8_t *)sw - 4 + misalignment;
+    }
+    d = (uint8_t *)dw;
+    while (n--)
+        *d++ = *s++;
+    return dest;
+}
+
 /* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR
  * access in place of a call to this. */
 uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
