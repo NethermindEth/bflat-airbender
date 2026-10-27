@@ -373,7 +373,7 @@ static void load_words(u256d *r, const uint32_t w[8])
    pointer. */
 typedef struct
 {
-    u256d bit255, half_p1;
+    u256d bit255, half_p1, zero;
     u256d s, l;
     u256d z12, h, rr, h2, h3, az;
 } ec_scratch;
@@ -469,7 +469,8 @@ static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d 
     MUL(rr, rr, z);
     SUB(h, h, &r->x);
     SUB(rr, rr, &r->y);
-    if (is_zero(h))
+    /* EQ leaves h as it is: one delegation where a test of eight words takes sixteen instructions. */
+    if (u256_op(h, &k->zero, U256_EQ))
     {
         if (is_zero(rr))
         {
