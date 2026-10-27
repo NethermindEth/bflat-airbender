@@ -78,9 +78,17 @@ static inline void fp_copy(fp *r, const fp *a, uint32_t n)
 /* r -= p when r >= p, for r below 2p. */
 static void fp_reduce(fp *r, uint32_t n)
 {
-    /* A top limb below p's settles it without the trial subtraction. */
+    /* A top limb below p's settles it without the trial subtraction, and one above makes r > p, so p comes off in
+       place; only an equal top limb needs the trial. */
     if (r->l[n - 1] < C->p.l[n - 1])
         return;
+    if (r->l[n - 1] > C->p.l[n - 1])
+    {
+        uint32_t below = u256_op(digit(r, 0), &P0, U256_SUB);
+        if (n > 8)
+            u256_op(digit(r, 1), &P1, U256_SUB | (below ? U256_CARRY : 0));
+        return;
+    }
     u256_op(&T[0], digit(r, 0), U256_MEMCOPY);
     uint32_t borrow = u256_op(&T[0], &P0, U256_SUB);
     if (n > 8)
