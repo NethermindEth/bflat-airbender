@@ -97,37 +97,45 @@ enum
 /* XORs the `words` words at data into the rate. Misaligned data is read as the aligned words that
  * cover it, each output word merged from two of them; the last of those words may run up to three bytes
  * past the data, within its own aligned word. */
-static inline __attribute__((always_inline)) void absorb_words(const uint8_t *data, int words)
+static inline __attribute__((always_inline)) void absorb_words(const uint8_t *data, int words, int overwrite)
 {
     uint32_t *s = (uint32_t *)KeccakState;
     uint32_t misalignment = (uintptr_t)data & 3;
     if (misalignment == 0)
     {
         const uint32_t *w = (const uint32_t *)data;
+#pragma clang loop unroll_count(8)
         for (int i = 0; i < words; i++)
-            s[i] ^= w[i];
+            s[i] = overwrite ? w[i] : s[i] ^ w[i];
         return;
     }
     const uint32_t *w = (const uint32_t *)(data - misalignment);
     uint32_t low = 8 * misalignment, high = 32 - low;
     uint32_t current = w[0];
+#pragma clang loop unroll_count(8)
     for (int i = 0; i < words; i++)
     {
         uint32_t next = w[i + 1];
-        s[i] ^= (current >> low) | (next << high);
+        uint32_t word = (current >> low) | (next << high);
+        s[i] = overwrite ? word : s[i] ^ word;
         current = next;
     }
 }
 
-/* Keccak-256 of the len bytes at data into out, absorbed straight into the delegation's state. */
+/* Keccak-256 of the len bytes at data into out, absorbed straight into the delegation's state. The first
+ * block is written over the rate rather than XORed into zeros, so only the capacity, and any rate word a
+ * short input leaves, starts at zero. */
 void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
 {
     uint32_t *s = (uint32_t *)KeccakState;
-    for (int i = 0; i < 50; i++)
+#pragma clang loop unroll(full)
+    for (int i = RateWords; i < 50; i++)
         s[i] = 0;
+    int first = 1;
     while (len >= 4 * RateWords)
     {
-        absorb_words(data, RateWords);
+        absorb_words(data, RateWords, first);
+        first = 0;
         permute();
         data += 4 * RateWords;
         len -= 4 * RateWords;
@@ -135,7 +143,13 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
 
     /* The tail's whole words, then its last bytes with the 0x01 pad byte above them, and the final 0x80. */
     int words = (int)(len >> 2);
-    absorb_words(data, words);
+    absorb_words(data, words, first);
+    if (first)
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = words; i < RateWords; i++)
+            s[i] = 0;
+    }
     uint32_t rest = len & 3, last = 0;
     for (uint32_t b = 0; b < rest; b++)
         last |= (uint32_t)data[4 * words + b] << (8 * b);
