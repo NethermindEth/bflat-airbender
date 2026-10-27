@@ -330,6 +330,16 @@ NOINLINE void fq_mul(fp2 *r, const fp2 *a, const fp2 *b, int d)
         return;
     }
     fp t0, t1, t2, t3;
+    if (a == b)
+    {
+        /* A square by the complex method, u^2 = -1: (a0 + a1)(a0 - a1) + 2 a0 a1 u, two products for three. */
+        fp_add(&t0, &a->c[0], &a->c[1]);
+        fp_sub(&t1, &a->c[0], &a->c[1]);
+        fp_mul(&t2, &a->c[0], &a->c[1]);
+        fp_mul(&r->c[0], &t0, &t1);
+        fp_add(&r->c[1], &t2, &t2);
+        return;
+    }
     fp_mul(&t0, &a->c[0], &b->c[0]);
     fp_mul(&t1, &a->c[1], &b->c[1]);
     fp_add(&t2, &a->c[0], &a->c[1]);
