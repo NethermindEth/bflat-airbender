@@ -373,22 +373,13 @@ static u256d Bit255 = {{0, 0, 0, 0, 0, 0, 0, 0x80000000u}};
 static u256d HalfP1;
 
 /* r = 2p for a = 0, as libsecp256k1's gej_double: L = 3/2 X^2, S = Y^2, T = X S, X3 = L^2 - 2T,
-   Y3 = L (T - X3) - S^2, Z3 = Y Z; 3M + 4S and few additions, all in place on r. r may be p. */
+   Y3 = L (T - X3) - S^2, Z3 = Y Z; 3M + 4S and few additions, all in place on r. r may be p.
+   p must not be at infinity; the result is not either, as secp256k1 has prime order and so no point with
+   y = 0. glv_init sets HalfP1 first. */
 static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
 {
-    if (is_zero(&p->z) || is_zero(&p->y))
-    {
-        r->z = (u256d){{0}};
-        return;
-    }
     if (r != p)
         *r = *p;
-    if (HalfP1.w[7] == 0)
-    {
-        HalfP1 = f->n;
-        u256_op(&HalfP1, &Bit255, U256_MUL_HIGH);
-        HalfP1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
-    }
     /* Static: 32-byte aligned locals would make the function realign its stack and keep a frame pointer. */
     static u256d s, l;
     MUL(&r->z, &r->z, &r->y);
@@ -415,8 +406,9 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
 
 /* r = p + q for p not at infinity and q affine, as libsecp256k1's gej_add_ge_var: 8M + 3S, in place on r.
    r may be p. With zinv, q is the Jacobian point (q.x, q.y, 1 / zinv), at one multiplication more
-   (gej_add_zinv_var). With zr, the ratio of the new z to the old one is stored there. */
-static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d *zinv, u256d *zr, const mont_ctx *f)
+   (gej_add_zinv_var). With zr, the ratio of the new z to the old one is stored there. Returns whether the
+   sum is at infinity (q = -p). */
+static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d *zinv, u256d *zr, const mont_ctx *f)
 {
     if (r != p)
         *r = *p;
@@ -437,10 +429,12 @@ static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d
     if (is_zero(&h))
     {
         if (is_zero(&rr))
+        {
             jdouble0(r, r, f);
-        else
-            r->z = (u256d){{0}};
-        return;
+            return 0;
+        }
+        r->z = (u256d){{0}};
+        return 1;
     }
     if (zr)
         *zr = h;
@@ -460,6 +454,7 @@ static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d
     MUL(&h3, &h3, &r->y);
     SUB(&r->y, &r->x, &h3);
     u256_op(&r->x, &h2, U256_MEMCOPY);
+    return 0;
 }
 
 /* r = a^(2^k). */
@@ -547,6 +542,10 @@ static void glv_init(const curve *cv)
     mont_to(&Glv.minus_lambda, &u, n);
     load_words(&u, Beta);
     mont_to(&Glv.beta, &u, f);
+
+    HalfP1 = f->n;
+    u256_op(&HalfP1, &Bit255, U256_MUL_HIGH);
+    HalfP1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
 
     pts[0].x = cv->gx;
     pts[0].y = cv->gy;
@@ -684,8 +683,7 @@ static void add_affine_term(jpoint *acc, int *inf, const apoint *table, const ap
         *inf = 0;
         return;
     }
-    jadd_affine(acc, acc, q, zinv, NULL, f);
-    *inf = is_zero(&acc->z);
+    *inf = jadd_affine(acc, acc, q, zinv, NULL, f);
 }
 
 /* u1*G + u2*R for plain scalars below n and R affine (z = 1). */
@@ -756,10 +754,7 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     for (int i = top; i >= 0; i--)
     {
         if (!inf)
-        {
             jdouble0(&acc, &acc, f);
-            inf = is_zero(&acc.z);
-        }
         if (d[0][i])
             add_affine_term(&acc, &inf, Glv.g, Glv.neg_g, d[0][i], na1, &global_z, f);
         if (d[1][i])
