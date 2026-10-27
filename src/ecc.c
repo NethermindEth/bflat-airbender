@@ -359,6 +359,7 @@ static struct
     u256d minus_b1, minus_b2, minus_lambda;     /* Montgomery form mod n */
     u256d beta;                                 /* Montgomery form mod p */
     apoint g[EntriesG], lambda_g[EntriesG];     /* odd multiples of G and lambda*G */
+    apoint neg_g[EntriesG], neg_lambda_g[EntriesG]; /* and their negations */
 } Glv;
 
 static void load_words(u256d *r, const uint32_t w[8])
@@ -553,6 +554,11 @@ static void glv_init(const curve *cv)
         MUL(&Glv.g[i].y, &pts[i].y, &zinv3);
         MUL(&Glv.lambda_g[i].x, &Glv.g[i].x, &Glv.beta);
         Glv.lambda_g[i].y = Glv.g[i].y;
+        Glv.neg_g[i].x = Glv.g[i].x;
+        Glv.neg_lambda_g[i].x = Glv.lambda_g[i].x;
+        u256d zero = {{0}};
+        SUB(&Glv.neg_g[i].y, &zero, &Glv.g[i].y);
+        Glv.neg_lambda_g[i].y = Glv.neg_g[i].y;
     }
     Glv.ready = 1;
 }
@@ -628,52 +634,45 @@ static void wnaf(int8_t digits[MaxDigits], const u256d *s, int w)
 }
 
 /* acc += the table entry of digit (negated when the signs disagree); *inf tracks acc at infinity. */
-static void add_affine_term(jpoint *acc, int *inf, const apoint *table, int digit, int negate, const mont_ctx *f)
+/* acc += the table entry of digit, from the negated table when the signs disagree; *inf tracks acc at infinity.
+   The entries are read in place: the tables carry both signs. */
+static void add_affine_term(jpoint *acc, int *inf, const apoint *table, const apoint *negated, int digit, int negate,
+                            const mont_ctx *f)
 {
     if (digit < 0)
     {
         digit = -digit;
         negate = !negate;
     }
-    apoint q = table[digit >> 1];
-    if (negate)
-    {
-        u256d zero = {{0}};
-        SUB(&q.y, &zero, &q.y);
-    }
+    const apoint *q = negate ? &negated[digit >> 1] : &table[digit >> 1];
     if (*inf)
     {
-        acc->x = q.x;
-        acc->y = q.y;
+        acc->x = q->x;
+        acc->y = q->y;
         acc->z = f->one;
         *inf = 0;
         return;
     }
-    jadd_affine(acc, acc, &q, f);
+    jadd_affine(acc, acc, q, f);
     *inf = is_zero(&acc->z);
 }
 
-static void add_jacobian_term(jpoint *acc, int *inf, const jpoint *table, int digit, int negate, const curve *cv)
+static void add_jacobian_term(jpoint *acc, int *inf, const jpoint *table, const jpoint *negated, int digit, int negate,
+                              const curve *cv)
 {
-    const mont_ctx *f = &cv->p;
     if (digit < 0)
     {
         digit = -digit;
         negate = !negate;
     }
-    jpoint q = table[digit >> 1];
-    if (negate)
-    {
-        u256d zero = {{0}};
-        SUB(&q.y, &zero, &q.y);
-    }
+    const jpoint *q = negate ? &negated[digit >> 1] : &table[digit >> 1];
     if (*inf)
     {
-        *acc = q;
+        *acc = *q;
         *inf = is_zero(&acc->z);
         return;
     }
-    jadd(acc, acc, &q, cv);
+    jadd(acc, acc, q, cv);
     *inf = is_zero(&acc->z);
 }
 
@@ -694,7 +693,7 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     wnaf(d[2], &b1, WindowR);
     wnaf(d[3], &b2, WindowR);
 
-    jpoint tr[EntriesR], tlr[EntriesR], twice;
+    jpoint tr[EntriesR], tlr[EntriesR], ntr[EntriesR], ntlr[EntriesR], twice;
     tr[0] = *rp;
     jdouble0(&twice, rp, f);
     for (int i = 1; i < EntriesR; i++)
@@ -703,6 +702,11 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     {
         tlr[i] = tr[i];
         MUL(&tlr[i].x, &tr[i].x, &Glv.beta);
+        ntr[i] = tr[i];
+        u256d zero = {{0}};
+        SUB(&ntr[i].y, &zero, &tr[i].y);
+        ntlr[i] = tlr[i];
+        ntlr[i].y = ntr[i].y;
     }
 
     int top = MaxDigits - 1;
@@ -718,13 +722,13 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
             inf = is_zero(&acc.z);
         }
         if (d[0][i])
-            add_affine_term(&acc, &inf, Glv.g, d[0][i], na1, f);
+            add_affine_term(&acc, &inf, Glv.g, Glv.neg_g, d[0][i], na1, f);
         if (d[1][i])
-            add_affine_term(&acc, &inf, Glv.lambda_g, d[1][i], na2, f);
+            add_affine_term(&acc, &inf, Glv.lambda_g, Glv.neg_lambda_g, d[1][i], na2, f);
         if (d[2][i])
-            add_jacobian_term(&acc, &inf, tr, d[2][i], nb1, cv);
+            add_jacobian_term(&acc, &inf, tr, ntr, d[2][i], nb1, cv);
         if (d[3][i])
-            add_jacobian_term(&acc, &inf, tlr, d[3][i], nb2, cv);
+            add_jacobian_term(&acc, &inf, tlr, ntlr, d[3][i], nb2, cv);
     }
     if (inf)
         acc.z = (u256d){{0}};
