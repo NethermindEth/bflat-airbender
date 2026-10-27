@@ -57,10 +57,10 @@ static inline __attribute__((always_inline)) void copy_lanes(uint64_t *to, const
         t[i] = f[i];
 }
 
-/* Keccak-f[1600] on KeccakState in place. */
-static inline __attribute__((always_inline)) void permute(void)
+/* Keccak-f[1600] in place on the delegation's state at `state`. */
+static inline __attribute__((always_inline)) void permute_at(uint64_t *state)
 {
-    register uint32_t x11 __asm__("a1") = (uint32_t)KeccakState;
+    register uint32_t x11 __asm__("a1") = (uint32_t)state;
     __asm__ volatile("add x10, x0, x0\n"
                      KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
                      KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
@@ -70,11 +70,23 @@ static inline __attribute__((always_inline)) void permute(void)
                      : "a0", "memory");
 }
 
+static inline __attribute__((always_inline)) void permute(void)
+{
+    permute_at(KeccakState);
+}
+
 void keccak_f1600(uint64_t state[25])
 {
     copy_lanes(KeccakState, state);
     permute();
     copy_lanes(state, KeccakState);
+}
+
+/* Keccak-f[1600] on a caller's state in place, with no copies: 256-byte aligned in RAM, its lanes 25-31
+ * left to the delegation's column parities and scratch. */
+void airbender_keccak_f1600_in_place(uint64_t state[32])
+{
+    permute_at(state);
 }
 
 enum
