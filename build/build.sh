@@ -18,7 +18,9 @@ case "$platform" in
     *) echo "unknown platform $platform" >&2; exit 1 ;;
 esac
 
-sources=(keccak sha256 ripemd160 blake2f ecc modexp ec bn254 bls12 "platform_$platform")
+sources=(keccak sha256 ripemd160 blake2f ecc modexp ec bn254 bls12 mont "platform_$platform")
+# The u256 delegation exists only on Airbender; elsewhere u256_soft computes its results.
+[ "$platform" = airbender ] || sources+=(u256_soft)
 out="$TOP/output/$platform"
 obj="$out/obj"
 mkdir -p "$obj"

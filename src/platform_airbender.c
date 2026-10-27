@@ -9,6 +9,7 @@
  * airbender_finish_success (platform_airbender.S) loads in the exact sequence the Airbender
  * tooling looks for in the binary.
  */
+#include "u256.h"
 #include "zkvm.h"
 
 void *malloc(size_t size);
@@ -28,6 +29,15 @@ static inline uint32_t csr_read(void)
 static inline void csr_write(uint32_t value)
 {
     __asm__ volatile("csrrw x0, 0x7c0, %0" : : "r"(value));
+}
+
+uint32_t u256_op(u256d *a, const u256d *b, uint32_t op)
+{
+    register uint32_t x10 __asm__("a0") = (uint32_t)a;
+    register uint32_t x11 __asm__("a1") = (uint32_t)b;
+    register uint32_t x12 __asm__("a2") = op;
+    __asm__ volatile("csrrw x0, 0x7ca, x0" : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
+    return x12;
 }
 
 void read_input(const uint8_t **buf_ptr, size_t *buf_size)
