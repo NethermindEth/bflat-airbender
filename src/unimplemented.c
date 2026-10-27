@@ -11,9 +11,6 @@
         airbender_fail(code);                                                                                          \
     }
 
-UNIMPLEMENTED(zkvm_bn254_g1_add, 0x101)
-UNIMPLEMENTED(zkvm_bn254_g1_mul, 0x102)
-UNIMPLEMENTED(zkvm_bn254_pairing, 0x103)
 UNIMPLEMENTED(zkvm_kzg_point_eval, 0x104)
 UNIMPLEMENTED(zkvm_bls12_g1_add, 0x105)
 UNIMPLEMENTED(zkvm_bls12_g1_msm, 0x106)
