@@ -63,9 +63,13 @@ typedef struct
 
 extern const curve *C;
 
+/* Readies the field constants of the curve in use; ec_use calls it, so the field operations need not. */
+void ec_prepare(void);
+
 static inline void ec_use(const curve *cv)
 {
     C = cv;
+    ec_prepare();
 }
 
 void fp_add(fp *r, const fp *a, const fp *b);

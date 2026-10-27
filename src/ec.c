@@ -59,7 +59,7 @@ static __attribute__((noinline)) void prepare(void)
     Prepared = C;
 }
 
-static inline __attribute__((always_inline)) void use_curve(void)
+void ec_prepare(void)
 {
     if (Prepared != C)
         prepare();
@@ -108,7 +108,6 @@ static inline __attribute__((always_inline)) void fp_reduce(fp *r, uint32_t n)
 void fp_add(fp *r, const fp *a, const fp *b)
 {
     uint32_t n = C->n;
-    use_curve();
     if (r == b)
     {
         const fp *t = a;
@@ -131,7 +130,6 @@ void fp_add(fp *r, const fp *a, const fp *b)
 void fp_sub(fp *r, const fp *a, const fp *b)
 {
     uint32_t n = C->n;
-    use_curve();
     if (r == b)
     {
         fp_copy(&Scratch, b, n);
@@ -158,7 +156,6 @@ void fp_sub(fp *r, const fp *a, const fp *b)
 void fp_mul(fp *r, const fp *a, const fp *b)
 {
     uint32_t n = C->n;
-    use_curve();
     const u256d *a0 = digit(a, 0), *b0 = digit(b, 0);
     if (n == 8)
     {
