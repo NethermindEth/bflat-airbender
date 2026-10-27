@@ -10,7 +10,7 @@
 typedef struct
 {
     u256d n;      /* the modulus, odd */
-    u256d nprime; /* -n^-1 mod R */
+    u256d ninv;   /* n^-1 mod R */
     u256d r2;     /* R^2 mod n, to enter the domain */
     u256d one;    /* R mod n, the domain's 1 */
 } mont_ctx;
@@ -40,25 +40,31 @@ MONT_INLINE void mont_reduce_once(u256d *v, uint32_t wrapped, const mont_ctx *ct
 }
 
 /* r = a * b * R^-1 mod n, for a, b < n. r may alias a or b. */
+/* With m = lo(ab) * n^-1 mod R, m*n has the low half of ab, so (ab - mn) / R = hi(ab) - hi(mn): a
+   difference in (-n, n) that needs no carry from the low halves. hi(ab) is formed in r itself. */
 MONT_INLINE void mont_mul(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    u256_op(&MontLo, a, U256_MEMCOPY);
-    u256_op(&MontLo, b, U256_MUL_LOW);
-    /* The high half accumulates in r itself when r is neither operand. */
-    u256d *hi = (r != a && r != b) ? r : &MontHi;
-    u256_op(hi, a, U256_MEMCOPY);
-    u256_op(hi, b, U256_MUL_HIGH);
-
-    /* m = lo * n' mod R makes lo + m*n a multiple of R: its low half is R exactly when lo != 0. */
-    u256_op(&MontM, &MontLo, U256_MEMCOPY);
-    u256_op(&MontM, &ctx->nprime, U256_MUL_LOW);
-    u256_op(&MontM, &ctx->n, U256_MUL_HIGH);
-
-    uint32_t carry = u256_op(&MontLo, &MontZero, U256_EQ) ? 0 : U256_CARRY;
-    uint32_t wrapped = u256_op(hi, &MontM, U256_ADD | carry);
-    mont_reduce_once(hi, wrapped, ctx);
-    if (hi != r)
-        u256_op(r, hi, U256_MEMCOPY);
+    if (r == b && r != a)
+    {
+        const u256d *t = a;
+        a = b;
+        b = t;
+    }
+    /* Now r is a or neither; a square in place needs b in a copy of its own. */
+    if (b == r)
+    {
+        u256_op(&MontHi, b, U256_MEMCOPY);
+        b = &MontHi;
+    }
+    u256_op(&MontT, a, U256_MEMCOPY);
+    u256_op(&MontT, b, U256_MUL_LOW);
+    u256_op(&MontT, &ctx->ninv, U256_MUL_LOW);
+    u256_op(&MontT, &ctx->n, U256_MUL_HIGH);
+    if (r != a)
+        u256_op(r, a, U256_MEMCOPY);
+    u256_op(r, b, U256_MUL_HIGH);
+    if (u256_op(r, &MontT, U256_SUB))
+        u256_op(r, &ctx->n, U256_ADD);
 }
 
 /* r = a + b mod n and r = a - b mod n, for a, b < n. r may alias a or b. */

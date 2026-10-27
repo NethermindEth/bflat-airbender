@@ -61,8 +61,7 @@ void mont_init(mont_ctx *ctx, const uint32_t n[8])
         u256_op(&two, &t, U256_SUB);
         u256_op(&x, &two, U256_MUL_LOW);
     }
-    ctx->nprime = (u256d){{0}};
-    u256_op(&ctx->nprime, &x, U256_SUB);
+    ctx->ninv = x;
 
     /* R mod n = (R - n) mod n. */
     u = (u256d){{0}};
