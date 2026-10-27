@@ -380,6 +380,11 @@ typedef struct
 
 static ec_scratch EcScratch = {.bit255 = {{0, 0, 0, 0, 0, 0, 0, 0x80000000u}}};
 
+/* Tells the compiler that two words are apart. The Montgomery operations test their operands for aliasing, as the
+   delegation's must differ; told, the compiler drops the tests it cannot fold by itself, such as of the scratch, which
+   it sees only through ec_scratch_base, against a point's coordinates. */
+#define APART(a, b) __builtin_assume((const void *)(a) != (const void *)(b))
+
 /* EcScratch through a pointer the compiler cannot see through: it stays in a register, and each word is an offset
    from it rather than an address formed again at every use. */
 static inline __attribute__((always_inline)) ec_scratch *ec_scratch_base(void)
@@ -399,6 +404,12 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
         *r = *p;
     ec_scratch *k = ec_scratch_base();
     u256d *s = &k->s, *l = &k->l;
+    APART(s, &r->x);
+    APART(s, &r->y);
+    APART(s, &r->z);
+    APART(l, &r->x);
+    APART(l, &r->y);
+    APART(l, &r->z);
     MUL(&r->z, &r->z, &r->y);
     MUL(s, &r->y, &r->y);
 
@@ -431,6 +442,21 @@ static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d 
         *r = *p;
     ec_scratch *k = ec_scratch_base();
     u256d *z12 = &k->z12, *h = &k->h, *rr = &k->rr, *h2 = &k->h2, *h3 = &k->h3;
+    /* The scratch is none of r's or q's words, and q (a table entry) none of r's. */
+    for (int i = 0; i < 3; i++)
+    {
+        const u256d *c = i == 0 ? &r->x : i == 1 ? &r->y : &r->z;
+        APART(z12, c);
+        APART(h, c);
+        APART(rr, c);
+        APART(h2, c);
+        APART(h3, c);
+        APART(&q->x, c);
+        APART(&q->y, c);
+    }
+    APART(h, &q->x);
+    APART(rr, &q->y);
+    APART(h3, &q->y);
     const u256d *z = &r->z;
     if (zinv)
     {
