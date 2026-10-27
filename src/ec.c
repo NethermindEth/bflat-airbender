@@ -946,14 +946,67 @@ NOINLINE static void fp12_inv(fp12 *r, const fp12 *a)
     fp12_mul(r, &c, &t);
 }
 
-/* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup when x < 0. */
+/* (z + y v)^2 in Fp4 = Fp2[v]/(v^2 - xi), as t + s v. */
+static void fp4_sqr(fp2 *t, fp2 *s, const fp2 *z, const fp2 *y)
+{
+    fp2 product, sum, shifted;
+    fq_mul(&product, z, y, 2);
+    fq_add(&sum, z, y, 2);
+    fp2_mul_xi(&shifted, y);
+    fq_add(&shifted, &shifted, z, 2);
+    fq_mul(t, &sum, &shifted, 2);
+    fq_sub(t, t, &product, 2);
+    fp2_mul_xi(&shifted, &product);
+    fq_sub(t, t, &shifted, 2);
+    fq_add(s, &product, &product, 2);
+}
+
+/* *z = 3 t + 2 z when plus, else 3 t - 2 z. */
+static void cyclotomic_part(fp2 *z, const fp2 *t, bool plus)
+{
+    if (plus)
+        fq_add(z, t, z, 2);
+    else
+        fq_sub(z, t, z, 2);
+    fq_add(z, z, z, 2);
+    fq_add(z, z, t, 2);
+}
+
+/*
+ * r = a^2 for a in the cyclotomic subgroup, by Granger and Scott (ePrint 2009/565): three Fp4 squarings, 18 Fp
+ * products where a general square takes 36. The arrangement follows arkworks' cyclotomic_square, whose Fp6 parts
+ * are the even and the odd coefficients of w here.
+ */
+NOINLINE static void fp12_cyclotomic_sqr(fp12 *r, const fp12 *a)
+{
+    fp2 z0 = a->c[0], z4 = a->c[2], z3 = a->c[4], z2 = a->c[1], z1 = a->c[3], z5 = a->c[5];
+    fp2 t0, t1, t2, t3, t4, t5, x;
+    fp4_sqr(&t0, &t1, &z0, &z1);
+    fp4_sqr(&t2, &t3, &z2, &z3);
+    fp4_sqr(&t4, &t5, &z4, &z5);
+    cyclotomic_part(&z0, &t0, false);
+    cyclotomic_part(&z1, &t1, true);
+    fp2_mul_xi(&x, &t5);
+    cyclotomic_part(&z2, &x, true);
+    cyclotomic_part(&z3, &t4, false);
+    cyclotomic_part(&z4, &t2, false);
+    cyclotomic_part(&z5, &t3, true);
+    r->c[0] = z0;
+    r->c[2] = z4;
+    r->c[4] = z3;
+    r->c[1] = z2;
+    r->c[3] = z1;
+    r->c[5] = z5;
+}
+
+/* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper. */
 NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 {
     fp12 acc, base = *a;
     fp12_one(&acc);
     for (int i = 63; i >= 0; i--)
     {
-        fp12_mul(&acc, &acc, &acc);
+        fp12_cyclotomic_sqr(&acc, &acc);
         if ((C->x >> i) & 1)
             fp12_mul(&acc, &acc, &base);
     }
