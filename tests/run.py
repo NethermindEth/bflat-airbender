@@ -1,0 +1,171 @@
+"""Checks the accelerators against pure-Python references. Usage: run.py <harness-command...>"""
+import hashlib
+import random
+import subprocess
+import sys
+
+rng = random.Random(1234)
+
+
+# --- Keccak-256 reference -------------------------------------------------------------------
+def keccak_f(a):
+    rc = [0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+          0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+          0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+          0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+          0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+          0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008]
+    rot = [[0, 36, 3, 41, 18], [1, 44, 10, 45, 2], [62, 6, 43, 15, 61], [28, 55, 25, 21, 56], [27, 20, 39, 8, 14]]
+    m = (1 << 64) - 1
+    rl = lambda x, n: ((x << n) | (x >> (64 - n))) & m if n else x
+    for r in range(24):
+        c = [a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20] for x in range(5)]
+        d = [c[(x - 1) % 5] ^ rl(c[(x + 1) % 5], 1) for x in range(5)]
+        a = [a[i] ^ d[i % 5] for i in range(25)]
+        b = [0] * 25
+        for x in range(5):
+            for y in range(5):
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = rl(a[x + 5 * y], rot[x][y])
+        a = [b[i] ^ (~b[(i % 5 + 1) % 5 + 5 * (i // 5)] & b[(i % 5 + 2) % 5 + 5 * (i // 5)]) for i in range(25)]
+        a[0] ^= rc[r]
+    return a
+
+
+def keccak256(data):
+    rate = 136
+    data = bytearray(data) + b"\x01"
+    data += b"\x00" * (-len(data) % rate)
+    data[-1] |= 0x80
+    st = [0] * 25
+    for off in range(0, len(data), rate):
+        for i in range(rate // 8):
+            st[i] ^= int.from_bytes(data[off + 8 * i: off + 8 * i + 8], "little")
+        st = keccak_f(st)
+    return b"".join(x.to_bytes(8, "little") for x in st[:4])
+
+
+# --- curves -----------------------------------------------------------------------------------
+class Curve:
+    def __init__(self, p, n, a, b, gx, gy):
+        self.p, self.n, self.a, self.b, self.g = p, n, a, b, (gx, gy)
+
+    def add(self, P, Q):
+        p = self.p
+        if P is None:
+            return Q
+        if Q is None:
+            return P
+        if P[0] == Q[0]:
+            if (P[1] + Q[1]) % p == 0:
+                return None
+            lam = (3 * P[0] * P[0] + self.a) * pow(2 * P[1], -1, p) % p
+        else:
+            lam = (Q[1] - P[1]) * pow(Q[0] - P[0], -1, p) % p
+        x = (lam * lam - P[0] - Q[0]) % p
+        return x, (lam * (P[0] - x) - P[1]) % p
+
+    def mul(self, k, P):
+        R = None
+        while k:
+            if k & 1:
+                R = self.add(R, P)
+            P = self.add(P, P)
+            k >>= 1
+        return R
+
+
+K1 = Curve(2**256 - 2**32 - 977, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141, 0, 7,
+           0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+           0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+R1 = Curve(0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF,
+           0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551,
+           0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC,
+           0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B,
+           0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+           0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def sign(cv, d, h):
+    while True:
+        k = rng.randrange(1, cv.n)
+        R = cv.mul(k, cv.g)
+        r = R[0] % cv.n
+        s = pow(k, -1, cv.n) * (h + r * d) % cv.n
+        if r and s:
+            recid = (R[1] & 1) | (2 if R[0] >= cv.n else 0)
+            return r, s, recid
+
+
+h32 = lambda v: v.to_bytes(32, "big").hex()
+
+cases = []  # (line, expected)
+
+for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range(40)] + [bytes(136), bytes(272)]:
+    arg = data.hex() or "-"
+    cases.append((f"keccak {arg}", keccak256(data).hex()))
+    cases.append((f"sha256 {arg}", hashlib.sha256(data).hexdigest()))
+try:
+    for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 300)) for _ in range(20)]:
+        cases.append((f"ripemd {data.hex() or '-'}", hashlib.new("ripemd160", data).hexdigest() + "00" * 12))
+except ValueError:
+    cases.append(("ripemd -", "9c1185a5c5e9fc54612808977ee8f548b2258d31" + "00" * 12))
+    cases.append(("ripemd 616263", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc" + "00" * 12))
+
+# blake2b("abc") is one F call with the final flag, rounds 12, over the parameter-xored IV.
+iv = [0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+      0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179]
+for msg in [b"abc", b"", rng.randbytes(100)]:
+    h = iv[:]
+    h[0] ^= 0x01010040
+    inp = (12).to_bytes(4, "big") + b"".join(x.to_bytes(8, "little") for x in h)
+    inp += msg.ljust(128, b"\x00") + len(msg).to_bytes(8, "little") + bytes(8) + b"\x01"
+    cases.append((f"blake2f {inp.hex()}", hashlib.blake2b(msg).hexdigest()))
+
+for _ in range(12):
+    d = rng.randrange(1, K1.n)
+    h = rng.randrange(0, 2**256)
+    r, s, recid = sign(K1, d, h % K1.n)
+    Q = K1.mul(d, K1.g)
+    cases.append((f"ecrecover {h32(h)} {h32(r)}{h32(s)} {recid:02x}", h32(Q[0]) + h32(Q[1])))
+    # The high-s twin recovers the same key with the other parity.
+    cases.append((f"ecrecover {h32(h)} {h32(r)}{h32(K1.n - s)} {recid ^ 1:02x}", h32(Q[0]) + h32(Q[1])))
+cases.append((f"ecrecover {h32(1)} {h32(0)}{h32(1)} 00", "fail"))
+cases.append((f"ecrecover {h32(1)} {h32(1)}{h32(K1.n)} 00", "fail"))
+cases.append((f"ecrecover {h32(1)} {h32(1)}{h32(1)} 04", "fail"))
+# x = 5 is not on secp256k1 (5^3 + 7 = 132 is a non-residue mod p).
+cases.append((f"ecrecover {h32(1)} {h32(5)}{h32(1)} 00",
+              "fail" if pow(132, (K1.p - 1) // 2, K1.p) != 1 else None))
+
+for _ in range(6):
+    d = rng.randrange(1, R1.n)
+    h = rng.randrange(0, 2**256)
+    r, s, _ = sign(R1, d, h % R1.n)
+    Q = R1.mul(d, R1.g)
+    pk = h32(Q[0]) + h32(Q[1])
+    cases.append((f"p256 {h32(h)} {h32(r)}{h32(s)} {pk}", "1"))
+    cases.append((f"p256 {h32(h ^ 1)} {h32(r)}{h32(s)} {pk}", "0"))
+    cases.append((f"p256 {h32(h)} {h32(r)}{h32(s)} {h32(Q[0])}{h32(Q[1] ^ 1)}", "0"))
+
+for _ in range(60):
+    bl, el, ml = rng.randrange(0, 70), rng.randrange(0, 40), rng.randrange(0, 70)
+    b, e, m = rng.randbytes(bl), rng.randbytes(el), rng.randbytes(ml)
+    if ml and rng.random() < 0.3:
+        m = b"\x00" * (ml // 2) + m[ml // 2:]
+    mi = int.from_bytes(m, "big")
+    exp = "-" if ml == 0 else (pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), mi) if mi else 0).to_bytes(ml, "big").hex()
+    cases.append((f"modexp {b.hex() or '-'} {e.hex() or '-'} {m.hex() or '-'}", exp))
+for ml in (128, 256, 512):
+    b, e, m = rng.randbytes(ml), rng.randbytes(8), rng.randbytes(ml)
+    exp = pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), int.from_bytes(m, "big")).to_bytes(ml, "big").hex()
+    cases.append((f"modexp {b.hex()} {e.hex()} {m.hex()}", exp))
+
+cases = [c for c in cases if c[1] is not None]
+out = subprocess.run(sys.argv[1:], input="\n".join(c[0] for c in cases) + "\n", capture_output=True, text=True).stdout.split("\n")
+bad = 0
+for (line, want), got in zip(cases, out):
+    if got != want:
+        bad += 1
+        if bad <= 10:
+            print(f"MISMATCH {line.split()[0]}: got {got[:80]} want {want[:80]}")
+print(f"{len(cases) - bad}/{len(cases)} passed")
+sys.exit(1 if bad else 0)
