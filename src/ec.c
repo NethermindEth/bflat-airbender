@@ -36,7 +36,7 @@ static inline u256d *digit(const fp *a, int i)
 }
 
 /* Pinv = -p^-1 mod 2^256 and p as digits, once per curve. */
-static void prepare(void)
+static __attribute__((noinline)) void prepare(void)
 {
     static u256d x, t, two;
     for (int i = 0; i < 8; i++)
@@ -59,7 +59,7 @@ static void prepare(void)
     Prepared = C;
 }
 
-static inline void use_curve(void)
+static inline __attribute__((always_inline)) void use_curve(void)
 {
     if (Prepared != C)
         prepare();
