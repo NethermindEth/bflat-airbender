@@ -1221,43 +1221,61 @@ NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *
 }
 
 /*
- * Multiplies f by the Miller function of the optimal ate pairing of p (G1) and q (G2); a pair
- * with a point at infinity pairs to 1 and leaves f alone. BN254 loops over 6x + 2 and closes
- * with the lines to pi(q) and -pi^2(q). BLS12-381 loops over |x| = -x; the function of x itself
- * is the inverse of that one up to a vertical line, so every pair's value is inverted alike and
- * a product of pairings is 1 either both ways or neither.
+ * Multiplies f by the Miller functions of the optimal ate pairing of each pair g1[i] (G1) and
+ * g2[i] (G2), at most PairingBatch of them, in one loop that squares its accumulator once a step
+ * for all; a pair with a point at infinity pairs to 1 and leaves f alone. BN254 loops over 6x + 2
+ * and closes with the lines to pi(q) and -pi^2(q). BLS12-381 loops over |x| = -x; the function of
+ * x itself is the inverse of that one up to a vertical line, so every pair's value is inverted
+ * alike and a product of pairings is 1 either both ways or neither.
  */
-void pairing_add(fp12 *f, const point *g1, const point *g2)
+void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
 {
-    if (pt_is_inf(g1, 1) || pt_is_inf(g2, 2))
+    point pa[PairingBatch], qa[PairingBatch], t[PairingBatch];
+    int k = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (pt_is_inf(&g1[i], 1) || pt_is_inf(&g2[i], 2))
+            continue;
+        pa[k] = g1[i];
+        qa[k] = g2[i];
+        pt_set_affine(&pa[k], 1);
+        pt_set_affine(&qa[k], 2);
+        t[k] = qa[k];
+        k++;
+    }
+    if (k == 0)
         return;
     fp12 acc, l;
-    point pa = *g1, qa = *g2;
-    pt_set_affine(&pa, 1);
-    pt_set_affine(&qa, 2);
-    const point *p = &pa, *q = &qa;
-    point t = qa;
     fp12_one(&acc);
     int top = 8 * (int)sizeof(C->loop) - 1;
     while (!((C->loop[sizeof(C->loop) - 1 - top / 8] >> (top % 8)) & 1))
         top--;
     for (int i = top - 1; i >= 0; i--)
     {
-        fp12_mul(&acc, &acc, &acc);
-        line_dbl(&l, &t, p);
-        fp12_mul(&acc, &acc, &l);
-        pt_dbl(&t, &t, 2);
+        /* The first square is of 1. */
+        if (i != top - 1)
+            fp12_mul(&acc, &acc, &acc);
+        for (int j = 0; j < k; j++)
+        {
+            line_dbl(&l, &t[j], &pa[j]);
+            fp12_mul(&acc, &acc, &l);
+            pt_dbl(&t[j], &t[j], 2);
+        }
         if ((C->loop[sizeof(C->loop) - 1 - i / 8] >> (i % 8)) & 1)
-            miller_add(&acc, &t, q, p);
+            for (int j = 0; j < k; j++)
+                miller_add(&acc, &t[j], &qa[j], &pa[j]);
     }
     if (!C->mtwist)
     {
-        point q1, q2;
-        pt_frob(&q1, q, false);
-        pt_frob(&q2, &q1, false);
-        pt_neg(&q2, &q2, 2);
-        miller_add(&acc, &t, &q1, p);
-        miller_add(&acc, &t, &q2, p);
+        for (int j = 0; j < k; j++)
+        {
+            point q1, q2;
+            pt_frob(&q1, &qa[j], false);
+            pt_frob(&q2, &q1, false);
+            pt_neg(&q2, &q2, 2);
+            miller_add(&acc, &t[j], &q1, &pa[j]);
+            miller_add(&acc, &t[j], &q2, &pa[j]);
+        }
     }
     fp12_mul(f, f, &acc);
 }

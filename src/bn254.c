@@ -84,13 +84,17 @@ zkvm_status zkvm_bn254_pairing(const uint8_t *pairs, size_t num_pairs, bool *ver
     fp12 f;
     fp12_one(&f);
     *verified = false;
-    for (size_t i = 0; i < num_pairs; i++)
+    for (size_t i = 0; i < num_pairs; i += PairingBatch)
     {
-        point p, q;
-        const uint8_t *in = pairs + 192 * i;
-        if (!load_g1(&p, in) || !load_g2(&q, in + 64))
-            return ZKVM_EFAIL;
-        pairing_add(&f, &p, &q);
+        point p[PairingBatch], q[PairingBatch];
+        int count = num_pairs - i < PairingBatch ? (int)(num_pairs - i) : PairingBatch;
+        for (int j = 0; j < count; j++)
+        {
+            const uint8_t *in = pairs + 192 * (i + j);
+            if (!load_g1(&p[j], in) || !load_g2(&q[j], in + 64))
+                return ZKVM_EFAIL;
+        }
+        pairing_add_batch(&f, p, q, count);
     }
     *verified = pairing_is_one(&f);
     return ZKVM_EOK;

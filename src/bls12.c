@@ -135,13 +135,17 @@ zkvm_status zkvm_bls12_pairing(const uint8_t *pairs, size_t num_pairs, bool *ver
     fp12 f;
     fp12_one(&f);
     *verified = false;
-    for (size_t i = 0; i < num_pairs; i++)
+    for (size_t i = 0; i < num_pairs; i += PairingBatch)
     {
-        point p, q;
-        const uint8_t *in = pairs + 288 * i;
-        if (!load(&p, in, 1, true) || !load(&q, in + 96, 2, true))
-            return ZKVM_EFAIL;
-        pairing_add(&f, &p, &q);
+        point p[PairingBatch], q[PairingBatch];
+        int count = num_pairs - i < PairingBatch ? (int)(num_pairs - i) : PairingBatch;
+        for (int j = 0; j < count; j++)
+        {
+            const uint8_t *in = pairs + 288 * (i + j);
+            if (!load(&p[j], in, 1, true) || !load(&q[j], in + 96, 2, true))
+                return ZKVM_EFAIL;
+        }
+        pairing_add_batch(&f, p, q, count);
     }
     *verified = pairing_is_one(&f);
     return ZKVM_EOK;
@@ -557,8 +561,8 @@ zkvm_status zkvm_kzg_point_eval(const uint8_t commitment[48], const uint8_t z[32
 
     fp12 f;
     fp12_one(&f);
-    pairing_add(&f, &c, &g);
-    pairing_add(&f, &pi, &q);
+    point g1s[2] = {c, pi}, g2s[2] = {g, q};
+    pairing_add_batch(&f, g1s, g2s, 2);
     *verified = pairing_is_one(&f);
     return ZKVM_EOK;
 }

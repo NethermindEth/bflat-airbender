@@ -104,7 +104,13 @@ bool pt_load(point *p, const uint8_t *in, int d, bool swap);
 void pt_store(uint8_t *out, const point *p, int d, bool swap);
 void pt_frob(point *r, const point *p, bool inverse);
 
-void pairing_add(fp12 *f, const point *p, const point *q);
+/* The most pairs pairing_add_batch takes. */
+enum
+{
+    PairingBatch = 4
+};
+
+void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count);
 bool pairing_is_one(fp12 *f);
 void fp12_one(fp12 *r);
 
