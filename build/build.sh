@@ -29,6 +29,20 @@ for s in "${sources[@]}"; do
     clang "${flags[@]}" -c "$TOP/src/$s.c" -o "$obj/$s.o"
     objects+=("$obj/$s.o")
 done
+# The finish and error sequences Airbender recognizes, which only assembly can lay down.
+if [ "$platform" = airbender ]; then
+    clang --target=riscv32-unknown-elf -march=rv32im -mabi=ilp32 -c "$TOP/src/platform_airbender_asm.S" -o "$obj/platform_airbender_asm.o"
+    objects+=("$obj/platform_airbender_asm.o")
+    # What bflat --extlib reads: the static library and the target it is for.
+    cat > "$out/libairbender.bflat.manifest" <<'EOF'
+{
+  "name": "libairbender",
+  "builds": [
+    { "arch": "riscv32", "os": "linux", "libc": "airbender", "static_lib": "libairbender.a" }
+  ]
+}
+EOF
+fi
 rm -f "$out/libairbender.a"
 llvm-ar rcs "$out/libairbender.a" "${objects[@]}"
 echo "built $out/libairbender.a"
