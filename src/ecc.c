@@ -412,45 +412,52 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
     SUB(&r->y, &r->y, &s);
 }
 
-/* r = p + q for p not at infinity and q affine (madd-2007-bl): 7M + 4S. r may be p. */
-static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const mont_ctx *f)
+/* r = p + q for p not at infinity and q affine, as libsecp256k1's gej_add_ge_var: 8M + 3S, in place on r.
+   r may be p. With zinv, q is the Jacobian point (q.x, q.y, 1 / zinv), at one multiplication more
+   (gej_add_zinv_var). With zr, the ratio of the new z to the old one is stored there. */
+static void jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d *zinv, u256d *zr, const mont_ctx *f)
 {
-    u256d z1z1, u2, s2, h, hh, i, j, rr, v, x3;
-    MUL(&z1z1, &p->z, &p->z);
-    MUL(&u2, &q->x, &z1z1);
-    MUL(&s2, &q->y, &p->z);
-    MUL(&s2, &s2, &z1z1);
-    SUB(&h, &u2, &p->x);
-    SUB(&rr, &s2, &p->y);
+    if (r != p)
+        *r = *p;
+    u256d z12, h, rr, h2, h3, az;
+    const u256d *z = &r->z;
+    if (zinv)
+    {
+        MUL(&az, &r->z, zinv);
+        z = &az;
+    }
+    MUL(&z12, z, z);
+    MUL(&h, &q->x, &z12);
+    MUL(&rr, &q->y, &z12);
+    MUL(&rr, &rr, z);
+    SUB(&h, &h, &r->x);
+    SUB(&rr, &rr, &r->y);
     if (is_zero(&h))
     {
         if (is_zero(&rr))
-            jdouble0(r, p, f);
+            jdouble0(r, r, f);
         else
             r->z = (u256d){{0}};
         return;
     }
-    MUL(&hh, &h, &h);
-    ADD(&i, &hh, &hh);
-    ADD(&i, &i, &i);
-    MUL(&j, &h, &i);
-    ADD(&rr, &rr, &rr);
-    MUL(&v, &p->x, &i);
-    MUL(&x3, &rr, &rr);
-    SUB(&x3, &x3, &j);
-    SUB(&x3, &x3, &v);
-    SUB(&x3, &x3, &v);
-    ADD(&u2, &p->z, &h);
-    MUL(&u2, &u2, &u2);
-    SUB(&u2, &u2, &z1z1);
-    SUB(&u2, &u2, &hh);
-    SUB(&v, &v, &x3);
-    MUL(&v, &rr, &v);
-    MUL(&s2, &p->y, &j);
-    ADD(&s2, &s2, &s2);
-    SUB(&r->y, &v, &s2);
-    r->x = x3;
-    r->z = u2;
+    if (zr)
+        *zr = h;
+    MUL(&r->z, &r->z, &h);
+    MUL(&h2, &h, &h);
+    MUL(&h3, &h2, &h);
+    /* t = x h^2 replaces x, which nothing else reads. */
+    MUL(&r->x, &r->x, &h2);
+    /* x3 = rr^2 - h^3 - 2t, formed in h2. */
+    MUL(&h2, &rr, &rr);
+    SUB(&h2, &h2, &h3);
+    SUB(&h2, &h2, &r->x);
+    SUB(&h2, &h2, &r->x);
+    /* y3 = rr (t - x3) - y h^3. */
+    SUB(&r->x, &r->x, &h2);
+    MUL(&r->x, &r->x, &rr);
+    MUL(&h3, &h3, &r->y);
+    SUB(&r->y, &r->x, &h3);
+    u256_op(&r->x, &h2, U256_MEMCOPY);
 }
 
 /* r = a^(2^k). */
@@ -648,7 +655,7 @@ static void wnaf(int8_t digits[MaxDigits], const u256d *s, int w)
 /* acc += the table entry of digit, from the negated table when the signs disagree; *inf tracks acc at infinity.
    The entries are read in place: the tables carry both signs. */
 static void add_affine_term(jpoint *acc, int *inf, const apoint *table, const apoint *negated, int digit, int negate,
-                            const mont_ctx *f)
+                            const u256d *zinv, const mont_ctx *f)
 {
     if (digit < 0)
     {
@@ -658,32 +665,24 @@ static void add_affine_term(jpoint *acc, int *inf, const apoint *table, const ap
     const apoint *q = negate ? &negated[digit >> 1] : &table[digit >> 1];
     if (*inf)
     {
-        acc->x = q->x;
-        acc->y = q->y;
+        if (zinv)
+        {
+            u256d zinv2, zinv3;
+            MUL(&zinv2, zinv, zinv);
+            MUL(&zinv3, &zinv2, zinv);
+            MUL(&acc->x, &q->x, &zinv2);
+            MUL(&acc->y, &q->y, &zinv3);
+        }
+        else
+        {
+            acc->x = q->x;
+            acc->y = q->y;
+        }
         acc->z = f->one;
         *inf = 0;
         return;
     }
-    jadd_affine(acc, acc, q, f);
-    *inf = is_zero(&acc->z);
-}
-
-static void add_jacobian_term(jpoint *acc, int *inf, const jpoint *table, const jpoint *negated, int digit, int negate,
-                              const curve *cv)
-{
-    if (digit < 0)
-    {
-        digit = -digit;
-        negate = !negate;
-    }
-    const jpoint *q = negate ? &negated[digit >> 1] : &table[digit >> 1];
-    if (*inf)
-    {
-        *acc = *q;
-        *inf = is_zero(&acc->z);
-        return;
-    }
-    jadd(acc, acc, q, cv);
+    jadd_affine(acc, acc, q, zinv, NULL, f);
     *inf = is_zero(&acc->z);
 }
 
@@ -704,19 +703,46 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     wnaf(d[2], &b1, WindowR);
     wnaf(d[3], &b2, WindowR);
 
-    jpoint tr[EntriesR], tlr[EntriesR], ntr[EntriesR], ntlr[EntriesR], twice;
-    tr[0] = *rp;
+    /* R's odd multiples, affine on the isomorphic curve y^2 = x^3 + 7 Z^6 (libsecp256k1's
+       ecmult_odd_multiples_table and ge_table_set_globalz): the accumulator lives on that curve, so each
+       of R's terms is a mixed addition; G's enter through zinv = Z, and the result's z is scaled by Z. */
+    apoint tr[EntriesR], tlr[EntriesR], ntr[EntriesR], ntlr[EntriesR];
+    u256d zr[EntriesR], global_z, c2, c3;
+    jpoint twice, ai;
     jdouble0(&twice, rp, f);
+    apoint d_ge = {twice.x, twice.y};
+    MUL(&c2, &twice.z, &twice.z);
+    MUL(&c3, &c2, &twice.z);
+    MUL(&tr[0].x, &rp->x, &c2);
+    MUL(&tr[0].y, &rp->y, &c3);
+    ai.x = tr[0].x;
+    ai.y = tr[0].y;
+    ai.z = f->one;
     for (int i = 1; i < EntriesR; i++)
-        jadd(&tr[i], &tr[i - 1], &twice, cv);
+    {
+        jadd_affine(&ai, &ai, &d_ge, NULL, &zr[i], f);
+        tr[i].x = ai.x;
+        tr[i].y = ai.y;
+    }
+    MUL(&global_z, &ai.z, &twice.z);
+    u256d zs = zr[EntriesR - 1], zs2, zs3;
+    for (int i = EntriesR - 2; i >= 0; i--)
+    {
+        if (i < EntriesR - 2)
+            MUL(&zs, &zs, &zr[i + 1]);
+        MUL(&zs2, &zs, &zs);
+        MUL(&zs3, &zs2, &zs);
+        MUL(&tr[i].x, &tr[i].x, &zs2);
+        MUL(&tr[i].y, &tr[i].y, &zs3);
+    }
     for (int i = 0; i < EntriesR; i++)
     {
-        tlr[i] = tr[i];
         MUL(&tlr[i].x, &tr[i].x, &Glv.beta);
-        ntr[i] = tr[i];
+        tlr[i].y = tr[i].y;
+        ntr[i].x = tr[i].x;
         u256d zero = {{0}};
         SUB(&ntr[i].y, &zero, &tr[i].y);
-        ntlr[i] = tlr[i];
+        ntlr[i].x = tlr[i].x;
         ntlr[i].y = ntr[i].y;
     }
 
@@ -733,16 +759,18 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
             inf = is_zero(&acc.z);
         }
         if (d[0][i])
-            add_affine_term(&acc, &inf, Glv.g, Glv.neg_g, d[0][i], na1, f);
+            add_affine_term(&acc, &inf, Glv.g, Glv.neg_g, d[0][i], na1, &global_z, f);
         if (d[1][i])
-            add_affine_term(&acc, &inf, Glv.lambda_g, Glv.neg_lambda_g, d[1][i], na2, f);
+            add_affine_term(&acc, &inf, Glv.lambda_g, Glv.neg_lambda_g, d[1][i], na2, &global_z, f);
         if (d[2][i])
-            add_jacobian_term(&acc, &inf, tr, ntr, d[2][i], nb1, cv);
+            add_affine_term(&acc, &inf, tr, ntr, d[2][i], nb1, NULL, f);
         if (d[3][i])
-            add_jacobian_term(&acc, &inf, tlr, ntlr, d[3][i], nb2, cv);
+            add_affine_term(&acc, &inf, tlr, ntlr, d[3][i], nb2, NULL, f);
     }
     if (inf)
         acc.z = (u256d){{0}};
+    else
+        MUL(&acc.z, &acc.z, &global_z);
     *r = acc;
 }
 
