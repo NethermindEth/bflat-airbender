@@ -63,8 +63,10 @@ MONT_INLINE void mont_mul(u256d *r, const u256d *a, const u256d *b, const mont_c
     if (r != a)
         u256_op(r, a, U256_MEMCOPY);
     u256_op(r, b, U256_MUL_HIGH);
-    if (u256_op(r, &MontT, U256_SUB))
-        u256_op(r, &ctx->n, U256_ADD);
+    /* A borrow leaves 1 in x12, which is U256_ADD, so the addition takes the flag as its operation. */
+    uint32_t borrow = u256_op(r, &MontT, U256_SUB);
+    if (borrow)
+        u256_op(r, &ctx->n, borrow);
 }
 
 /* r = a + b mod n and r = a - b mod n, for a, b < n. r may alias a or b. */
@@ -97,8 +99,9 @@ MONT_INLINE void mont_sub(u256d *r, const u256d *a, const u256d *b, const mont_c
     }
     if (r != a)
         u256_op(r, a, U256_MEMCOPY);
-    if (u256_op(r, b, U256_SUB))
-        u256_op(r, &ctx->n, U256_ADD);
+    uint32_t borrow = u256_op(r, b, U256_SUB);
+    if (borrow)
+        u256_op(r, &ctx->n, borrow);
 }
 
 /* Into the domain (a < n) and out of it. */

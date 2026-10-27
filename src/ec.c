@@ -145,8 +145,8 @@ static inline __attribute__((always_inline)) void fp_sub_n(fp *r, const fp *a, c
         borrow = u256_op(digit(r, 1), digit(b, 1), U256_SUB | (borrow ? U256_CARRY : 0));
     if (!borrow)
         return;
-    /* Below zero: add p back, the wrap past 2^(256 * digits) undoing the borrow. */
-    uint32_t carry = u256_op(digit(r, 0), &P0, U256_ADD);
+    /* Below zero: add p back, the wrap past 2^(256 * digits) undoing the borrow. The borrow is 1, U256_ADD. */
+    uint32_t carry = u256_op(digit(r, 0), &P0, borrow);
     if (n > 8)
         u256_op(digit(r, 1), &P1, U256_ADD | (carry ? U256_CARRY : 0));
 }
@@ -189,8 +189,10 @@ void fp_mul(fp *r, const fp *a, const fp *b)
         if (rd != a0)
             u256_op(rd, a0, U256_MEMCOPY);
         u256_op(rd, b0, U256_MUL_HIGH);
-        if (u256_op(rd, &T[0], U256_SUB))
-            u256_op(rd, &P0, U256_ADD);
+        /* A borrow leaves 1 in x12, which is U256_ADD. */
+        uint32_t borrow = u256_op(rd, &T[0], U256_SUB);
+        if (borrow)
+            u256_op(rd, &P0, borrow);
         return;
     }
 
