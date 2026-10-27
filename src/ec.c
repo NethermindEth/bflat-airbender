@@ -421,45 +421,105 @@ NOINLINE void fp2_conj(fp2 *r, const fp2 *a)
     fp_sub(&r->c[1], &zero, &a->c[1]);
 }
 
+/* 1/2 in Montgomery form, formed once per curve: half of R mod p, which is C->one. */
+static const fp *fp_half(void)
+{
+    static fp half;
+    static const curve *formed_for;
+    if (formed_for != C)
+    {
+        uint32_t n = C->n;
+        fp t = C->one;
+        uint64_t carry = 0;
+        if (t.l[0] & 1)
+        {
+            for (uint32_t i = 0; i < n; i++)
+            {
+                carry += (uint64_t)t.l[i] + C->p.l[i];
+                t.l[i] = (uint32_t)carry;
+                carry >>= 32;
+            }
+        }
+        for (uint32_t i = 0; i < n; i++)
+            t.l[i] = (t.l[i] >> 1) | (i + 1 < n ? t.l[i + 1] << 31 : (uint32_t)carry << 31);
+        half = t;
+        formed_for = C;
+    }
+    return &half;
+}
+
+/* r = a^((p+1)/4) in Fp, held in an Fp2's first coefficient; true when it squares back to a. */
+static bool fp_sqrt_in(fp2 *r, const fp2 *a)
+{
+    fp e;
+    fp2 t;
+    p_exp(&e, 1, 2);
+    fq_pow(r, a, &e, 1);
+    fq_mul(&t, r, r, 1);
+    return fq_eq(&t, a, 1);
+}
+
 /*
  * A square root, false when there is none. Both primes are 3 mod 4: in Fp the root is
- * a^((p+1)/4); in Fp2 it is Algorithm 9 of Adj and Rodriguez-Henriquez, "Square root computation
- * over even extension fields" (2012). Either candidate is checked by squaring.
+ * a^((p+1)/4). In Fp2 = Fp(u), u^2 = -1, a = a0 + a1 u with a1 != 0 is a square exactly when its
+ * norm a0^2 + a1^2 is one in Fp, with root alpha; then one of delta = (a0 +- alpha) / 2 is a square
+ * in Fp, and with t = delta^((p-3)/4), gamma = t delta is its root and 1/gamma is t, so the root of a
+ * is gamma + (a1 t / 2) u. Two or three exponentiations in Fp, and one for a non-square, where the
+ * powers in Fp2 took two. Either candidate is checked by squaring.
  */
 NOINLINE bool fq_sqrt(fp2 *r, const fp2 *a, int d)
 {
-    fp e;
     fp2 x, t;
     if (d == 1)
     {
-        p_exp(&e, 1, 2);
-        fq_pow(&x, a, &e, 1);
+        fp_sqrt_in(&x, a);
+    }
+    else if (fp_is_zero(&a->c[1]))
+    {
+        /* a0 or -a0 is a square in Fp, as -1 is not: the root is sqrt(a0) or sqrt(-a0) u. */
+        fp2 b;
+        memset(&b, 0, sizeof(b));
+        b.c[0] = a->c[0];
+        memset(&x, 0, sizeof(x));
+        if (!fp_sqrt_in(&t, &b))
+        {
+            fq_neg(&b, &b, 1);
+            fp_sqrt_in(&t, &b);
+            x.c[1] = t.c[0];
+        }
+        else
+            x.c[0] = t.c[0];
     }
     else
     {
-        fp2 a1, alpha, minus_one;
+        fp2 n, alpha, delta, power, gamma;
+        fp s, e;
+        memset(&n, 0, sizeof(n));
+        fp_mul(&n.c[0], &a->c[0], &a->c[0]);
+        fp_mul(&s, &a->c[1], &a->c[1]);
+        fp_add(&n.c[0], &n.c[0], &s);
+        if (!fp_sqrt_in(&alpha, &n))
+        {
+            *r = *a;
+            return false;
+        }
         p_exp(&e, -3, 2);
-        fq_pow(&a1, a, &e, 2);
-        fq_mul(&alpha, &a1, &a1, 2);
-        fq_mul(&alpha, &alpha, a, 2);
-        fq_mul(&x, &a1, a, 2);
-        fq_set_one(&t);
-        fq_neg(&minus_one, &t, 2);
-        if (fq_eq(&alpha, &minus_one, 2))
+        memset(&delta, 0, sizeof(delta));
+        fp_add(&delta.c[0], &a->c[0], &alpha.c[0]);
+        fp_mul(&delta.c[0], &delta.c[0], fp_half());
+        fq_pow(&power, &delta, &e, 1);
+        fq_mul(&gamma, &power, &delta, 1);
+        fq_mul(&t, &gamma, &gamma, 1);
+        if (!fq_eq(&t, &delta, 1))
         {
-            /* x = u x0 = -x0.c1 + x0.c0 u */
-            fq_neg(&t, &x, 2);
-            t.c[0] = t.c[1];
-            t.c[1] = x.c[0];
-            x = t;
+            fp_sub(&delta.c[0], &a->c[0], &alpha.c[0]);
+            fp_mul(&delta.c[0], &delta.c[0], fp_half());
+            fq_pow(&power, &delta, &e, 1);
+            fq_mul(&gamma, &power, &delta, 1);
         }
-        else
-        {
-            fq_add(&alpha, &alpha, &t, 2);
-            p_exp(&e, -1, 1);
-            fq_pow(&alpha, &alpha, &e, 2);
-            fq_mul(&x, &alpha, &x, 2);
-        }
+        x.c[0] = gamma.c[0];
+        fp_mul(&x.c[1], &a->c[1], &power.c[0]);
+        fp_mul(&x.c[1], &x.c[1], fp_half());
     }
     fq_mul(&t, &x, &x, d);
     bool ok = fq_eq(&t, a, d);
@@ -650,6 +710,10 @@ bool pt_eq(const point *p, const point *q, int d)
 void pt_set_affine(point *p, int d)
 {
     if (pt_is_inf(p, d))
+        return;
+    fp2 one;
+    fq_set_one(&one);
+    if (fq_eq(&p->z, &one, d))
         return;
     fp2 zi, zi2;
     fq_inv(&zi, &p->z, d);
