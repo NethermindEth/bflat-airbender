@@ -152,8 +152,23 @@ uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
 void read_input(const uint8_t **buf_ptr, size_t *buf_size)
 {
     uint32_t len = csr_read();
-    uint32_t *words = malloc(((size_t)len + 3) & ~(size_t)3);
-    for (uint32_t i = 0; i < (len + 3) / 4; i++)
+    uint32_t count = (len + 3) / 4;
+    uint32_t *words = malloc((size_t)count * 4);
+    /* Eight words a round: the input is megabytes, and the loop's own instructions would be a third of each
+     * word's cost. Nothing past the input is read: the source has no more words to give. */
+    uint32_t i = 0;
+    for (; i + 8 <= count; i += 8)
+    {
+        words[i] = csr_read();
+        words[i + 1] = csr_read();
+        words[i + 2] = csr_read();
+        words[i + 3] = csr_read();
+        words[i + 4] = csr_read();
+        words[i + 5] = csr_read();
+        words[i + 6] = csr_read();
+        words[i + 7] = csr_read();
+    }
+    for (; i < count; i++)
         words[i] = csr_read();
     *buf_ptr = (const uint8_t *)words;
     *buf_size = len;
