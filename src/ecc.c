@@ -368,7 +368,12 @@ static void load_words(u256d *r, const uint32_t w[8])
         r->w[i] = w[i];
 }
 
-/* r = 2p for a = 0 (dbl-2009-l): 2M + 5S. r may be p. */
+/* Constants the doubling reads through the delegation: 2^255, to halve by MUL_HIGH, and (p + 1) / 2. */
+static u256d Bit255 = {{0, 0, 0, 0, 0, 0, 0, 0x80000000u}};
+static u256d HalfP1;
+
+/* r = 2p for a = 0, as libsecp256k1's gej_double: L = 3/2 X^2, S = Y^2, T = X S, X3 = L^2 - 2T,
+   Y3 = L (T - X3) - S^2, Z3 = Y Z; 3M + 4S and few additions, all in place on r. r may be p. */
 static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
 {
     if (is_zero(&p->z) || is_zero(&p->y))
@@ -376,29 +381,35 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
         r->z = (u256d){{0}};
         return;
     }
-    u256d a, b, c, d, e, t, x3;
-    MUL(&a, &p->x, &p->x);
-    MUL(&b, &p->y, &p->y);
-    MUL(&c, &b, &b);
-    ADD(&d, &p->x, &b);
-    MUL(&d, &d, &d);
-    SUB(&d, &d, &a);
-    SUB(&d, &d, &c);
-    ADD(&d, &d, &d);
-    ADD(&e, &a, &a);
-    ADD(&e, &e, &a);
-    MUL(&t, &e, &e);
-    SUB(&x3, &t, &d);
-    SUB(&x3, &x3, &d);
-    MUL(&r->z, &p->y, &p->z);
-    ADD(&r->z, &r->z, &r->z);
-    SUB(&t, &d, &x3);
-    MUL(&t, &e, &t);
-    ADD(&c, &c, &c);
-    ADD(&c, &c, &c);
-    ADD(&c, &c, &c);
-    SUB(&r->y, &t, &c);
-    r->x = x3;
+    if (r != p)
+        *r = *p;
+    if (HalfP1.w[7] == 0)
+    {
+        HalfP1 = f->n;
+        u256_op(&HalfP1, &Bit255, U256_MUL_HIGH);
+        HalfP1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
+    }
+    u256d s, l;
+    MUL(&r->z, &r->z, &r->y);
+    MUL(&s, &r->y, &r->y);
+
+    /* x / 2 mod p is x >> 1, plus (p + 1) / 2 when x is odd; it stays below p. */
+    uint32_t odd = r->x.w[0] & 1;
+    u256_op(&l, &r->x, U256_MEMCOPY);
+    u256_op(&l, &Bit255, U256_MUL_HIGH);
+    if (odd)
+        u256_op(&l, &HalfP1, U256_ADD);
+    ADD(&l, &l, &r->x);
+    MUL(&l, &l, &r->x);
+
+    MUL(&r->y, &r->x, &s);
+    MUL(&r->x, &l, &l);
+    SUB(&r->x, &r->x, &r->y);
+    SUB(&r->x, &r->x, &r->y);
+    SUB(&r->y, &r->y, &r->x);
+    MUL(&r->y, &r->y, &l);
+    MUL(&s, &s, &s);
+    SUB(&r->y, &r->y, &s);
 }
 
 /* r = p + q for p not at infinity and q affine (madd-2007-bl): 7M + 4S. r may be p. */
