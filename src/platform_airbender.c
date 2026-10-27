@@ -46,9 +46,20 @@ static inline void csr_write(uint32_t value)
 
 static uint64_t KeccakState[32] __attribute__((aligned(256)));
 
+/* 25 lanes as 50 word moves: the state is at least word aligned, and a call to memcpy costs
+ * half as much again in its loop. */
+static inline __attribute__((always_inline)) void copy_lanes(uint64_t *to, const uint64_t *from)
+{
+    uint32_t *t = (uint32_t *)to;
+    const uint32_t *f = (const uint32_t *)from;
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 50; i++)
+        t[i] = f[i];
+}
+
 void keccak_f1600(uint64_t state[25])
 {
-    memcpy(KeccakState, state, 25 * sizeof(uint64_t));
+    copy_lanes(KeccakState, state);
     register uint32_t x11 __asm__("a1") = (uint32_t)KeccakState;
     __asm__ volatile("add x10, x0, x0\n"
                      KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
@@ -57,7 +68,14 @@ void keccak_f1600(uint64_t state[25])
                      :
                      : "r"(x11)
                      : "a0", "memory");
-    memcpy(state, KeccakState, 25 * sizeof(uint64_t));
+    copy_lanes(state, KeccakState);
+}
+
+/* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR
+ * access in place of a call to this. */
+uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
+{
+    return u256_op(a, b, op);
 }
 
 void read_input(const uint8_t **buf_ptr, size_t *buf_size)

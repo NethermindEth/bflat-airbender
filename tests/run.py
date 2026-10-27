@@ -101,7 +101,7 @@ h32 = lambda v: v.to_bytes(32, "big").hex()
 
 cases = []  # (line, expected)
 
-for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range(40)] + [bytes(136), bytes(272)]:
+for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range(40)] + [rng.randbytes(n) for n in (55, 56, 63, 64, 64, 65, 119, 120, 128)] + [bytes(64), bytes(136), bytes(272)]:
     arg = data.hex() or "-"
     cases.append((f"keccak {arg}", keccak256(data).hex()))
     cases.append((f"sha256 {arg}", hashlib.sha256(data).hexdigest()))
