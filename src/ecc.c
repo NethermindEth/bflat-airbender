@@ -368,40 +368,57 @@ static void load_words(u256d *r, const uint32_t w[8])
         r->w[i] = w[i];
 }
 
-/* Constants the doubling reads through the delegation: 2^255, to halve by MUL_HIGH, and (p + 1) / 2. */
-static u256d Bit255 = {{0, 0, 0, 0, 0, 0, 0, 0x80000000u}};
-static u256d HalfP1;
+/* The doubling's and the addition's scratch, after the doubling's constants: 2^255, to halve by MUL_HIGH, and
+   (p + 1) / 2. Static, as 32-byte aligned locals would make the functions realign their stacks and keep a frame
+   pointer. */
+typedef struct
+{
+    u256d bit255, half_p1;
+    u256d s, l;
+    u256d z12, h, rr, h2, h3, az;
+} ec_scratch;
+
+static ec_scratch EcScratch = {.bit255 = {{0, 0, 0, 0, 0, 0, 0, 0x80000000u}}};
+
+/* EcScratch through a pointer the compiler cannot see through: it stays in a register, and each word is an offset
+   from it rather than an address formed again at every use. */
+static inline __attribute__((always_inline)) ec_scratch *ec_scratch_base(void)
+{
+    ec_scratch *k = &EcScratch;
+    __asm__("" : "+r"(k));
+    return k;
+}
 
 /* r = 2p for a = 0, as libsecp256k1's gej_double: L = 3/2 X^2, S = Y^2, T = X S, X3 = L^2 - 2T,
    Y3 = L (T - X3) - S^2, Z3 = Y Z; 3M + 4S and few additions, all in place on r. r may be p.
    p must not be at infinity; the result is not either, as secp256k1 has prime order and so no point with
-   y = 0. glv_init sets HalfP1 first. */
+   y = 0. glv_init sets (p + 1) / 2 first. */
 static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
 {
     if (r != p)
         *r = *p;
-    /* Static: 32-byte aligned locals would make the function realign its stack and keep a frame pointer. */
-    static u256d s, l;
+    ec_scratch *k = ec_scratch_base();
+    u256d *s = &k->s, *l = &k->l;
     MUL(&r->z, &r->z, &r->y);
-    MUL(&s, &r->y, &r->y);
+    MUL(s, &r->y, &r->y);
 
     /* x / 2 mod p is x >> 1, plus (p + 1) / 2 when x is odd; it stays below p. */
     uint32_t odd = r->x.w[0] & 1;
-    u256_op(&l, &r->x, U256_MEMCOPY);
-    u256_op(&l, &Bit255, U256_MUL_HIGH);
+    u256_op(l, &r->x, U256_MEMCOPY);
+    u256_op(l, &k->bit255, U256_MUL_HIGH);
     if (odd)
-        u256_op(&l, &HalfP1, U256_ADD);
-    ADD(&l, &l, &r->x);
-    MUL(&l, &l, &r->x);
+        u256_op(l, &k->half_p1, U256_ADD);
+    ADD(l, l, &r->x);
+    MUL(l, l, &r->x);
 
-    MUL(&r->y, &r->x, &s);
-    MUL(&r->x, &l, &l);
+    MUL(&r->y, &r->x, s);
+    MUL(&r->x, l, l);
     SUB(&r->x, &r->x, &r->y);
     SUB(&r->x, &r->x, &r->y);
     SUB(&r->y, &r->y, &r->x);
-    MUL(&r->y, &r->y, &l);
-    MUL(&s, &s, &s);
-    SUB(&r->y, &r->y, &s);
+    MUL(&r->y, &r->y, l);
+    MUL(s, s, s);
+    SUB(&r->y, &r->y, s);
 }
 
 /* r = p + q for p not at infinity and q affine, as libsecp256k1's gej_add_ge_var: 8M + 3S, in place on r.
@@ -412,23 +429,23 @@ static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d 
 {
     if (r != p)
         *r = *p;
-    /* Static: 32-byte aligned locals would make the function realign its stack and keep a frame pointer. */
-    static u256d z12, h, rr, h2, h3, az;
+    ec_scratch *k = ec_scratch_base();
+    u256d *z12 = &k->z12, *h = &k->h, *rr = &k->rr, *h2 = &k->h2, *h3 = &k->h3;
     const u256d *z = &r->z;
     if (zinv)
     {
-        MUL(&az, &r->z, zinv);
-        z = &az;
+        MUL(&k->az, &r->z, zinv);
+        z = &k->az;
     }
-    MUL(&z12, z, z);
-    MUL(&h, &q->x, &z12);
-    MUL(&rr, &q->y, &z12);
-    MUL(&rr, &rr, z);
-    SUB(&h, &h, &r->x);
-    SUB(&rr, &rr, &r->y);
-    if (is_zero(&h))
+    MUL(z12, z, z);
+    MUL(h, &q->x, z12);
+    MUL(rr, &q->y, z12);
+    MUL(rr, rr, z);
+    SUB(h, h, &r->x);
+    SUB(rr, rr, &r->y);
+    if (is_zero(h))
     {
-        if (is_zero(&rr))
+        if (is_zero(rr))
         {
             jdouble0(r, r, f);
             return 0;
@@ -437,23 +454,23 @@ static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d 
         return 1;
     }
     if (zr)
-        *zr = h;
-    MUL(&r->z, &r->z, &h);
-    MUL(&h2, &h, &h);
-    MUL(&h3, &h2, &h);
+        *zr = *h;
+    MUL(&r->z, &r->z, h);
+    MUL(h2, h, h);
+    MUL(h3, h2, h);
     /* t = x h^2 replaces x, which nothing else reads. */
-    MUL(&r->x, &r->x, &h2);
+    MUL(&r->x, &r->x, h2);
     /* x3 = rr^2 - h^3 - 2t, formed in h2. */
-    MUL(&h2, &rr, &rr);
-    SUB(&h2, &h2, &h3);
-    SUB(&h2, &h2, &r->x);
-    SUB(&h2, &h2, &r->x);
+    MUL(h2, rr, rr);
+    SUB(h2, h2, h3);
+    SUB(h2, h2, &r->x);
+    SUB(h2, h2, &r->x);
     /* y3 = rr (t - x3) - y h^3. */
-    SUB(&r->x, &r->x, &h2);
-    MUL(&r->x, &r->x, &rr);
-    MUL(&h3, &h3, &r->y);
-    SUB(&r->y, &r->x, &h3);
-    u256_op(&r->x, &h2, U256_MEMCOPY);
+    SUB(&r->x, &r->x, h2);
+    MUL(&r->x, &r->x, rr);
+    MUL(h3, h3, &r->y);
+    SUB(&r->y, &r->x, h3);
+    u256_op(&r->x, h2, U256_MEMCOPY);
     return 0;
 }
 
@@ -543,9 +560,9 @@ static void glv_init(const curve *cv)
     load_words(&u, Beta);
     mont_to(&Glv.beta, &u, f);
 
-    HalfP1 = f->n;
-    u256_op(&HalfP1, &Bit255, U256_MUL_HIGH);
-    HalfP1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
+    EcScratch.half_p1 = f->n;
+    u256_op(&EcScratch.half_p1, &EcScratch.bit255, U256_MUL_HIGH);
+    EcScratch.half_p1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
 
     pts[0].x = cv->gx;
     pts[0].y = cv->gy;

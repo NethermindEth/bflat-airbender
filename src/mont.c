@@ -6,8 +6,6 @@
  */
 #include "mont.h"
 
-/* The scratch of the inline operations in mont.h, in RAM where the delegation reads its operands. */
-u256d MontLo, MontHi, MontM, MontT, MontZero;
 
 void mont_to(u256d *r, const u256d *a, const mont_ctx *ctx)
 {
