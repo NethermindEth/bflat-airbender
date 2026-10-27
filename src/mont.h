@@ -31,6 +31,9 @@ MONT_INLINE void mont_reduce_once(u256d *v, uint32_t wrapped, const mont_ctx *ct
         u256_op(v, &ctx->n, U256_SUB);
         return;
     }
+    /* A top word below the modulus' settles it without the trial subtraction. */
+    if (v->w[7] < ctx->n.w[7])
+        return;
     u256_op(&MontT, v, U256_MEMCOPY);
     if (!u256_op(&MontT, &ctx->n, U256_SUB))
         u256_op(v, &MontT, U256_MEMCOPY);
@@ -41,8 +44,10 @@ MONT_INLINE void mont_mul(u256d *r, const u256d *a, const u256d *b, const mont_c
 {
     u256_op(&MontLo, a, U256_MEMCOPY);
     u256_op(&MontLo, b, U256_MUL_LOW);
-    u256_op(&MontHi, a, U256_MEMCOPY);
-    u256_op(&MontHi, b, U256_MUL_HIGH);
+    /* The high half accumulates in r itself when r is neither operand. */
+    u256d *hi = (r != a && r != b) ? r : &MontHi;
+    u256_op(hi, a, U256_MEMCOPY);
+    u256_op(hi, b, U256_MUL_HIGH);
 
     /* m = lo * n' mod R makes lo + m*n a multiple of R: its low half is R exactly when lo != 0. */
     u256_op(&MontM, &MontLo, U256_MEMCOPY);
@@ -50,26 +55,44 @@ MONT_INLINE void mont_mul(u256d *r, const u256d *a, const u256d *b, const mont_c
     u256_op(&MontM, &ctx->n, U256_MUL_HIGH);
 
     uint32_t carry = u256_op(&MontLo, &MontZero, U256_EQ) ? 0 : U256_CARRY;
-    uint32_t wrapped = u256_op(&MontHi, &MontM, U256_ADD | carry);
-    mont_reduce_once(&MontHi, wrapped, ctx);
-    u256_op(r, &MontHi, U256_MEMCOPY);
+    uint32_t wrapped = u256_op(hi, &MontM, U256_ADD | carry);
+    mont_reduce_once(hi, wrapped, ctx);
+    if (hi != r)
+        u256_op(r, hi, U256_MEMCOPY);
 }
 
 /* r = a + b mod n and r = a - b mod n, for a, b < n. r may alias a or b. */
 MONT_INLINE void mont_add(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    u256_op(&MontHi, a, U256_MEMCOPY);
-    uint32_t wrapped = u256_op(&MontHi, b, U256_ADD);
-    mont_reduce_once(&MontHi, wrapped, ctx);
-    u256_op(r, &MontHi, U256_MEMCOPY);
+    if (r == b)
+    {
+        const u256d *t = a;
+        a = b;
+        b = t;
+    }
+    if (r == b)
+    {
+        /* r = 2r: the delegation's operands must differ. */
+        u256_op(&MontHi, b, U256_MEMCOPY);
+        b = &MontHi;
+    }
+    if (r != a)
+        u256_op(r, a, U256_MEMCOPY);
+    uint32_t wrapped = u256_op(r, b, U256_ADD);
+    mont_reduce_once(r, wrapped, ctx);
 }
 
 MONT_INLINE void mont_sub(u256d *r, const u256d *a, const u256d *b, const mont_ctx *ctx)
 {
-    u256_op(&MontHi, a, U256_MEMCOPY);
-    if (u256_op(&MontHi, b, U256_SUB))
-        u256_op(&MontHi, &ctx->n, U256_ADD);
-    u256_op(r, &MontHi, U256_MEMCOPY);
+    if (r == b)
+    {
+        u256_op(&MontHi, b, U256_MEMCOPY);
+        b = &MontHi;
+    }
+    if (r != a)
+        u256_op(r, a, U256_MEMCOPY);
+    if (u256_op(r, b, U256_SUB))
+        u256_op(r, &ctx->n, U256_ADD);
 }
 
 /* Into the domain (a < n) and out of it. */
