@@ -194,15 +194,61 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
  * misaligned input positions. 32 bytes a round; a misaligned source is read as the aligned words that
  * cover it, each output word merged from two of them, and the last may run up to three bytes past the
  * source within its own aligned word. no_builtin keeps the byte loops from becoming memcpy calls. */
-__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+/* 2^(256 - 8m) for m = 1..31, in RAM for the delegation: a product by it shifts a word right by m bytes (MUL_HIGH)
+   or left by 32 - m bytes (MUL_LOW). */
+static u256d FunnelFactor[32];
+/* The delegation reads only RAM, which starts at 64 MiB (the linker script's ram region); a source in ROM takes the
+   word loop. */
+static const uintptr_t RamStart = 64u << 20;
+static u256d FunnelScratch;
+static int FunnelReady;
+
+/* Copies the 32-byte blocks of d (32-byte aligned) from s (any alignment), each merged by the delegation from the
+   two aligned source words that cover it: two copies, two products by the funnel factor and an addition, where the
+   word loop takes forty instructions a block. Both regions are in RAM, and the source words may extend up to 31
+   bytes past either end of the source, which only reads them. Returns how many bytes it copied. */
+static size_t funnel_copy(uint8_t *d, const uint8_t *s, size_t n)
 {
-    uint8_t *d = dest;
-    const uint8_t *s = src;
+    uint32_t m = (uintptr_t)s & 31;
+    const u256d *a = (const u256d *)(s - m);
+    u256d *out = (u256d *)d;
+    size_t blocks = n >> 5;
+    if (m == 0)
+    {
+        for (size_t i = 0; i < blocks; i++)
+            u256_op(&out[i], &a[i], U256_MEMCOPY);
+        return blocks << 5;
+    }
+    if (!FunnelReady)
+    {
+        for (uint32_t k = 1; k < 32; k++)
+        {
+            uint32_t bit = 256 - 8 * k;
+            FunnelFactor[k].w[bit >> 5] = 1u << (bit & 31);
+        }
+        FunnelReady = 1;
+    }
+    const u256d *factor = &FunnelFactor[m];
+    for (size_t i = 0; i < blocks; i++)
+    {
+        u256_op(&out[i], &a[i], U256_MEMCOPY);
+        u256_op(&out[i], factor, U256_MUL_HIGH);
+        u256_op(&FunnelScratch, &a[i + 1], U256_MEMCOPY);
+        u256_op(&FunnelScratch, factor, U256_MUL_LOW);
+        u256_op(&out[i], &FunnelScratch, U256_ADD);
+    }
+    return blocks << 5;
+}
+
+/* The word loops: a misaligned source is read as the aligned words that cover it, each output word merged from two
+   of them, and the last may run up to three bytes past the source within its own aligned word. */
+__attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_words(uint8_t *d, const uint8_t *s, size_t n)
+{
     if (n < 16)
     {
         while (n--)
             *d++ = *s++;
-        return dest;
+        return;
     }
     while ((uintptr_t)d & 3)
     {
@@ -259,6 +305,28 @@ __attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, c
     d = (uint8_t *)dw;
     while (n--)
         *d++ = *s++;
+}
+
+__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+{
+    uint8_t *d = dest;
+    const uint8_t *s = src;
+    /* Long enough to pay for aligning the destination to a block: the delegation copies a block in one operation when
+       source and destination share their alignment within it, and merges it in five otherwise. A copy onto itself,
+       which callers make, would hand the delegation one operand twice. */
+    if (n >= 128 && (uintptr_t)s >= RamStart + 32 && d != s)
+    {
+        size_t head = -(uintptr_t)d & 31;
+        copy_words(d, s, head);
+        d += head;
+        s += head;
+        n -= head;
+        size_t done = funnel_copy(d, s, n);
+        d += done;
+        s += done;
+        n -= done;
+    }
+    copy_words(d, s, n);
     return dest;
 }
 
