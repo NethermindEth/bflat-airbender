@@ -101,24 +101,46 @@ static inline __attribute__((always_inline)) void absorb_words(const uint8_t *da
 {
     uint32_t *s = (uint32_t *)KeccakState;
     uint32_t misalignment = (uintptr_t)data & 3;
+    /* A loop each for writing and XORing: the compiler keeps the test of `overwrite` in the loop. */
     if (misalignment == 0)
     {
         const uint32_t *w = (const uint32_t *)data;
+        if (overwrite)
+        {
 #pragma clang loop unroll_count(8)
-        for (int i = 0; i < words; i++)
-            s[i] = overwrite ? w[i] : s[i] ^ w[i];
+            for (int i = 0; i < words; i++)
+                s[i] = w[i];
+        }
+        else
+        {
+#pragma clang loop unroll_count(8)
+            for (int i = 0; i < words; i++)
+                s[i] ^= w[i];
+        }
         return;
     }
     const uint32_t *w = (const uint32_t *)(data - misalignment);
     uint32_t low = 8 * misalignment, high = 32 - low;
     uint32_t current = w[0];
-#pragma clang loop unroll_count(8)
-    for (int i = 0; i < words; i++)
+    if (overwrite)
     {
-        uint32_t next = w[i + 1];
-        uint32_t word = (current >> low) | (next << high);
-        s[i] = overwrite ? word : s[i] ^ word;
-        current = next;
+#pragma clang loop unroll_count(8)
+        for (int i = 0; i < words; i++)
+        {
+            uint32_t next = w[i + 1];
+            s[i] = (current >> low) | (next << high);
+            current = next;
+        }
+    }
+    else
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = 0; i < words; i++)
+        {
+            uint32_t next = w[i + 1];
+            s[i] ^= (current >> low) | (next << high);
+            current = next;
+        }
     }
 }
 
