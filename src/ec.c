@@ -1154,12 +1154,12 @@ NOINLINE static void bn_hard(fp12 *r, const fp12 *f)
     fp12 y1, y3, y4, y8, y9, t;
     fp12_pow_x(&t, f);
     fp12_conj(&t, &t);
-    fp12_mul(&y1, &t, &t);
-    fp12_mul(&y3, &y1, &y1);
+    fp12_cyclotomic_sqr(&y1, &t);
+    fp12_cyclotomic_sqr(&y3, &y1);
     fp12_mul(&y3, &y3, &y1);
     fp12_pow_x(&y4, &y3);
     fp12_conj(&y4, &y4);
-    fp12_mul(&t, &y4, &y4);
+    fp12_cyclotomic_sqr(&t, &y4);
     fp12_pow_x(&t, &t);
     fp12_mul(&y8, &t, &y4);
     fp12_conj(&t, &y3);
@@ -1203,7 +1203,7 @@ NOINLINE static void bls_hard(fp12 *r, const fp12 *f)
     fp12_mul(&t, &t, &a);
     fp12_conj(&b, &b);
     fp12_mul(&t, &t, &b);
-    fp12_mul(&a, f, f);
+    fp12_cyclotomic_sqr(&a, f);
     fp12_mul(&a, &a, f);
     fp12_mul(r, &t, &a);
 }
