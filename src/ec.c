@@ -848,30 +848,6 @@ void fp12_one(fp12 *r)
     r->c[0].c[0] = C->one;
 }
 
-/* Schoolbook product modulo w^6 - xi, which skips the zero coefficients of b: the product by a line
-   (three non-zero coefficients) takes 18 Fp2 products. */
-NOINLINE static void fp12_mul_schoolbook(fp12 *r, const fp12 *a, const fp12 *b)
-{
-    fp2 t[11], m;
-    memset(t, 0, sizeof(t));
-    for (int j = 0; j < 6; j++)
-    {
-        if (fq_is_zero(&b->c[j], 2))
-            continue;
-        for (int i = 0; i < 6; i++)
-        {
-            fq_mul(&m, &a->c[i], &b->c[j], 2);
-            fq_add(&t[i + j], &t[i + j], &m, 2);
-        }
-    }
-    for (int k = 10; k >= 6; k--)
-    {
-        fp2_mul_xi(&m, &t[k]);
-        fq_add(&t[k - 6], &t[k - 6], &m, 2);
-    }
-    memcpy(r->c, t, sizeof(r->c));
-}
-
 /*
  * Fp12 as Fp6[w]/(w^2 - v) over Fp6 = Fp2[v]/(v^3 - xi), v = w^2: the even coefficients of the flat
  * form are the Fp6 element A and the odd ones B, for A + B w. Karatsuba at both levels takes 18 Fp2
@@ -960,15 +936,6 @@ static void fp12_join(fp12 *r, const fp6 *even, const fp6 *odd)
 
 NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
 {
-    int zeros = 0;
-    for (int j = 0; j < 6; j++)
-        zeros += fq_is_zero(&b->c[j], 2);
-    if (a != b && zeros >= 3)
-    {
-        fp12_mul_schoolbook(r, a, b);
-        return;
-    }
-
     fp6 x, y, s, t, u;
     fp12_split(&x, &y, a);
     if (a == b)
@@ -1003,6 +970,76 @@ NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
 }
 
 /* The p^6-power Frobenius, w -> -w; it inverts elements of the cyclotomic subgroup. */
+/* r = a (b0 + b1 v): 5 Fp2 products by Karatsuba. r may be a. */
+static void fp6_mul_01(fp6 *r, const fp6 *a, const fp2 *b0, const fp2 *b1)
+{
+    fp2 t0, t1, c0, c1, c2;
+    fq_mul(&t0, &a->c[0], b0, 2);
+    fq_mul(&t1, &a->c[1], b1, 2);
+    fq_add(&c1, &a->c[0], &a->c[1], 2);
+    fq_add(&c2, b0, b1, 2);
+    fq_mul(&c1, &c1, &c2, 2);
+    fq_sub(&c1, &c1, &t0, 2);
+    fq_sub(&c1, &c1, &t1, 2);
+    fq_mul(&c0, &a->c[2], b1, 2);
+    fp2_mul_xi(&c0, &c0);
+    fq_add(&c0, &c0, &t0, 2);
+    fq_mul(&c2, &a->c[2], b0, 2);
+    fq_add(&c2, &c2, &t1, 2);
+    r->c[0] = c0;
+    r->c[1] = c1;
+    r->c[2] = c2;
+}
+
+/* r = a b1 v: 3 Fp2 products. r may be a. */
+static void fp6_mul_1(fp6 *r, const fp6 *a, const fp2 *b1)
+{
+    fp2 c0, c1, c2;
+    fq_mul(&c0, &a->c[2], b1, 2);
+    fp2_mul_xi(&c0, &c0);
+    fq_mul(&c1, &a->c[0], b1, 2);
+    fq_mul(&c2, &a->c[1], b1, 2);
+    r->c[0] = c0;
+    r->c[1] = c1;
+    r->c[2] = c2;
+}
+
+/*
+ * f *= l for a line from line_place: l0 + l2 w^2 + l3 w^3 on an M-type twist, l0 + l1 w + l3 w^3 on a D-type one.
+ * As L0 + L1 w over Fp6, one of L0 and L1 is a single Fp2 term and the other has two, so Karatsuba takes 13 Fp2
+ * products where a dense product takes 18.
+ */
+NOINLINE static void fp12_mul_line(fp12 *f, const fp12 *l)
+{
+    fp6 x, y, a, b, s;
+    fp2 sum;
+    fp12_split(&x, &y, f);
+    fp6_add(&s, &x, &y);
+    if (C->mtwist)
+    {
+        /* L0 = l0 + l2 v, L1 = l3 v */
+        fp6_mul_01(&a, &x, &l->c[0], &l->c[2]);
+        fp6_mul_1(&b, &y, &l->c[3]);
+        fq_add(&sum, &l->c[2], &l->c[3], 2);
+        fp6_mul_01(&s, &s, &l->c[0], &sum);
+    }
+    else
+    {
+        /* L0 = l0, L1 = l1 + l3 v */
+        for (int i = 0; i < 3; i++)
+            fq_mul(&a.c[i], &x.c[i], &l->c[0], 2);
+        fp6_mul_01(&b, &y, &l->c[1], &l->c[3]);
+        fq_add(&sum, &l->c[0], &l->c[1], 2);
+        fp6_mul_01(&s, &s, &sum, &l->c[3]);
+    }
+    /* (F0 + F1 w)(L0 + L1 w) = (F0 L0 + v F1 L1) + ((F0 + F1)(L0 + L1) - F0 L0 - F1 L1) w */
+    fp6_sub(&s, &s, &a);
+    fp6_sub(&s, &s, &b);
+    fp6_mul_v(&b, &b);
+    fp6_add(&a, &a, &b);
+    fp12_join(f, &a, &s);
+}
+
 NOINLINE static void fp12_conj(fp12 *r, const fp12 *a)
 {
     *r = *a;
@@ -1216,7 +1253,7 @@ NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *
 {
     fp12 l;
     line_add(&l, t, q, p);
-    fp12_mul(f, f, &l);
+    fp12_mul_line(f, &l);
     pt_add(t, t, q, 2);
 }
 
@@ -1258,7 +1295,11 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
         for (int j = 0; j < k; j++)
         {
             line_dbl(&l, &t[j], &pa[j]);
-            fp12_mul(&acc, &acc, &l);
+            /* The first line multiplies 1. */
+            if (i == top - 1 && j == 0)
+                acc = l;
+            else
+                fp12_mul_line(&acc, &l);
             pt_dbl(&t[j], &t[j], 2);
         }
         if ((C->loop[sizeof(C->loop) - 1 - i / 8] >> (i % 8)) & 1)
