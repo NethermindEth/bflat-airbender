@@ -162,6 +162,18 @@ for ml in (128, 256, 512):
     b, e, m = rng.randbytes(ml), rng.randbytes(8), rng.randbytes(ml)
     exp = pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), int.from_bytes(m, "big")).to_bytes(ml, "big").hex()
     cases.append((f"modexp {b.hex()} {e.hex()} {m.hex()}", exp))
+# Odd moduli of up to 1024 bits take the Montgomery path: every length, exponents with leading zeros and of
+# one bit, bases above the modulus.
+for mbytes in list(range(1, 33)) + [32, 32, 33, 48, 63, 64, 64, 65, 96, 127, 128, 128]:
+    m = rng.randrange(1, 256 ** mbytes) | 1
+    if m == 1:
+        m = 3
+    for b, e in [(rng.randrange(0, 256 ** 40), rng.randrange(0, 256 ** 32)), (rng.randrange(0, m), 1),
+                 (rng.randrange(0, m), 0), (m + 5, rng.randrange(0, 256 ** 3))]:
+        bb = b.to_bytes(max(1, (b.bit_length() + 7) // 8), "big")
+        eb = e.to_bytes(32, "big")
+        mb = m.to_bytes(mbytes, "big")
+        cases.append((f"modexp {bb.hex()} {eb.hex()} {mb.hex()}", pow(b, e, m).to_bytes(mbytes, "big").hex()))
 
 # BN254, BLS12-381 and KZG: precompile vectors and py_ecc cases built by gen_vectors.py.
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors", "ec.txt")) as f:
