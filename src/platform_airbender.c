@@ -312,9 +312,11 @@ __attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, c
     uint8_t *d = dest;
     const uint8_t *s = src;
     /* Long enough to pay for aligning the destination to a block: the delegation copies a block in one operation when
-       source and destination share their alignment within it, and merges it in five otherwise. A copy onto itself,
-       which callers make, would hand the delegation one operand twice. */
-    if (n >= 128 && (uintptr_t)s >= RamStart + 32 && d != s)
+       source and destination share their alignment within it, and merges it in five when they differ within a word;
+       sharing a word's alignment only, the word loop is as quick. A copy onto itself, which callers make, would hand
+       the delegation one operand twice. */
+    uintptr_t apart = (uintptr_t)d ^ (uintptr_t)s;
+    if (n >= 128 && (uintptr_t)s >= RamStart + 32 && d != s && ((apart & 31) == 0 || (apart & 3) != 0))
     {
         size_t head = -(uintptr_t)d & 31;
         copy_words(d, s, head);
