@@ -107,10 +107,10 @@ for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range
     cases.append((f"sha256 {arg}", hashlib.sha256(data).hexdigest()))
 try:
     for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 300)) for _ in range(20)]:
-        cases.append((f"ripemd {data.hex() or '-'}", hashlib.new("ripemd160", data).hexdigest() + "00" * 12))
+        cases.append((f"ripemd {data.hex() or '-'}", "00" * 12 + hashlib.new("ripemd160", data).hexdigest()))
 except ValueError:
-    cases.append(("ripemd -", "9c1185a5c5e9fc54612808977ee8f548b2258d31" + "00" * 12))
-    cases.append(("ripemd 616263", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc" + "00" * 12))
+    cases.append(("ripemd -", "00" * 12 + "9c1185a5c5e9fc54612808977ee8f548b2258d31"))
+    cases.append(("ripemd 616263", "00" * 12 + "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"))
 
 # blake2b("abc") is one F call with the final flag, rounds 12, over the parameter-xored IV.
 iv = [0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
