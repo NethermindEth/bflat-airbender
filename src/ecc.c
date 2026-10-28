@@ -432,28 +432,45 @@ static void jdouble0(jpoint *r, const jpoint *p, const mont_ctx *f)
     SUB(&r->y, &r->y, s);
 }
 
-/* r = p + q for p not at infinity and q affine, as libsecp256k1's gej_add_ge_var: 8M + 3S, in place on r.
-   r may be p. With zinv, q is the Jacobian point (q.x, q.y, 1 / zinv), at one multiplication more
-   (gej_add_zinv_var). With zr, the ratio of the new z to the old one is stored there. Returns whether the
-   sum is at infinity (q = -p). */
-static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d *zinv, u256d *zr, const mont_ctx *f)
+/* r += q for r not at infinity and q affine, as libsecp256k1's gej_add_ge_var: 8M + 3S, in place. With zinv, q
+   is the Jacobian point (q.x, q.y, 1 / zinv), at one multiplication more (gej_add_zinv_var). With zr, the ratio
+   of the new z to the old one is stored there. Returns whether the sum is at infinity (q = -r). Inlined into one
+   function per variant below, so each runs without the tests of the options it does not take. */
+static inline __attribute__((always_inline)) int jadd_affine(jpoint *r, const apoint *q, const u256d *zinv, u256d *zr,
+                                                             const mont_ctx *f)
 {
-    if (r != p)
-        *r = *p;
     ec_scratch *k = ec_scratch_base();
     u256d *z12 = &k->z12, *h = &k->h, *rr = &k->rr, *h2 = &k->h2, *h3 = &k->h3;
-    /* The scratch is none of r's or q's words, and q (a table entry) none of r's. */
-    for (int i = 0; i < 3; i++)
+    /* The scratch, the context's included, is none of r's or q's words, and q (a table entry) none of r's. Spelled out
+       per word: through a loop over the coordinates, the compiler keeps some of the tests the hints should drop. */
+#define APART_R(p) \
+    do \
+    { \
+        APART((p), &r->x); \
+        APART((p), &r->y); \
+        APART((p), &r->z); \
+    } while (0)
+    APART_R(z12);
+    APART_R(h);
+    APART_R(rr);
+    APART_R(h2);
+    APART_R(h3);
+    APART_R(&k->az);
+    APART_R(&q->x);
+    APART_R(&q->y);
+    APART_R(&f->t);
+    APART_R(&f->hi);
+    APART(&f->t, &q->x);
+    APART(&f->t, &q->y);
+    APART(&f->hi, &q->x);
+    APART(&f->hi, &q->y);
+    if (zinv)
     {
-        const u256d *c = i == 0 ? &r->x : i == 1 ? &r->y : &r->z;
-        APART(z12, c);
-        APART(h, c);
-        APART(rr, c);
-        APART(h2, c);
-        APART(h3, c);
-        APART(&q->x, c);
-        APART(&q->y, c);
+        APART_R(zinv);
+        APART(&f->t, zinv);
+        APART(&f->hi, zinv);
     }
+#undef APART_R
     APART(h, &q->x);
     APART(rr, &q->y);
     APART(h3, &q->y);
@@ -499,6 +516,21 @@ static int jadd_affine(jpoint *r, const jpoint *p, const apoint *q, const u256d 
     SUB(&r->y, &r->x, h3);
     u256_op(&r->x, h2, U256_MEMCOPY);
     return 0;
+}
+
+static __attribute__((noinline)) int jadd_ge(jpoint *r, const apoint *q, const mont_ctx *f)
+{
+    return jadd_affine(r, q, NULL, NULL, f);
+}
+
+static __attribute__((noinline)) int jadd_zinv(jpoint *r, const apoint *q, const u256d *zinv, const mont_ctx *f)
+{
+    return jadd_affine(r, q, zinv, NULL, f);
+}
+
+static __attribute__((noinline)) int jadd_zr(jpoint *r, const apoint *q, u256d *zr, const mont_ctx *f)
+{
+    return jadd_affine(r, q, NULL, zr, f);
 }
 
 /* r = a^(2^k). */
@@ -727,7 +759,7 @@ static void add_affine_term(jpoint *acc, int *inf, const apoint *table, const ap
         *inf = 0;
         return;
     }
-    *inf = jadd_affine(acc, acc, q, zinv, NULL, f);
+    *inf = zinv ? jadd_zinv(acc, q, zinv, f) : jadd_ge(acc, q, f);
 }
 
 /* u1*G + u2*R for plain scalars below n and R affine (z = 1). */
@@ -764,7 +796,7 @@ static void glv_double_mul(jpoint *r, const u256d *u1, const u256d *u2, const jp
     ai.z = f->one;
     for (int i = 1; i < EntriesR; i++)
     {
-        jadd_affine(&ai, &ai, &d_ge, NULL, &zr[i], f);
+        jadd_zr(&ai, &d_ge, &zr[i], f);
         tr[i].x = ai.x;
         tr[i].y = ai.y;
     }
