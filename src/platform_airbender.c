@@ -147,7 +147,7 @@ static inline __attribute__((always_inline)) void absorb_words(const uint8_t *da
 /* Keccak-256 of the len bytes at data into out, absorbed straight into the delegation's state. The first
  * block is written over the rate rather than XORed into zeros, so only the capacity, and any rate word a
  * short input leaves, starts at zero. */
-void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
+__attribute__((noinline)) static void keccak256_long(const uint8_t *data, size_t len, uint8_t out[32])
 {
     uint32_t *s = (uint32_t *)KeccakState;
 #pragma clang loop unroll(full)
@@ -188,6 +188,33 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
     {
         memcpy(out, s, 32);
     }
+}
+
+/* One block from aligned input and output, most calls, by a path small enough to need no frame; the rest by
+ * keccak256_long. The last word of the input may be read past its end, within its own aligned word. */
+void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
+{
+    if (len >= 4 * RateWords || (((uintptr_t)data | (uintptr_t)out) & 3) != 0)
+    {
+        keccak256_long(data, len, out);
+        return;
+    }
+    uint32_t *s = (uint32_t *)KeccakState;
+    const uint32_t *w = (const uint32_t *)data;
+    uint32_t words = (uint32_t)(len >> 2), rest = (uint32_t)(len & 3);
+    uint32_t i = 0;
+#pragma clang loop unroll_count(8)
+    for (; i < words; i++)
+        s[i] = w[i];
+    s[i] = (rest ? w[i] & ((1u << (8 * rest)) - 1) : 0) | (1u << (8 * rest));
+#pragma clang loop unroll_count(8)
+    for (i++; i < 50; i++)
+        s[i] = 0;
+    s[RateWords - 1] ^= 0x80000000u;
+    permute();
+    uint32_t *o = (uint32_t *)out;
+    for (i = 0; i < 8; i++)
+        o[i] = s[i];
 }
 
 /* memcpy, by --wrap (the manifest's wrap_symbols): the guest copies megabytes of witness nodes from
