@@ -25,8 +25,8 @@ zkvm_status zkvm_bls12_pairing(const uint8_t *pairs, size_t n, bool *ok);
 zkvm_status zkvm_bls12_map_fp_to_g1(const uint8_t *fe, uint8_t *out);
 zkvm_status zkvm_bls12_map_fp2_to_g2(const uint8_t *fe, uint8_t *out);
 
-static uint8_t Args[4][65536];
-static size_t ArgLen[4];
+static uint8_t Args[6][65536];
+static size_t ArgLen[6];
 
 static size_t unhex(uint8_t *out, const char *s)
 {
@@ -57,7 +57,7 @@ int main(void)
         if (!op)
             continue;
         int argc = 0;
-        for (char *tok; argc < 4 && (tok = strtok(NULL, " \n"));)
+        for (char *tok; argc < 6 && (tok = strtok(NULL, " \n"));)
         {
             ArgLen[argc] = unhex(Args[argc], tok);
             argc++;
@@ -111,6 +111,12 @@ int main(void)
                 else
                     printf("fail");
             }
+        }
+        else if (!strcmp(op, "verifybatch"))
+        {
+            /* Hashes, signatures, recovery ids, keys, R's ys and weights, each concatenated. */
+            printf("%d", airbender_secp256k1_verify_batch(Args[0], Args[1], Args[2], Args[3], Args[4], Args[5],
+                                                          (uint32_t)ArgLen[2]));
         }
         else if (!strcmp(op, "p256"))
         {

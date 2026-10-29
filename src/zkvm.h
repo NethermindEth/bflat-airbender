@@ -38,4 +38,11 @@ void keccak_f1600_soft(uint64_t state[25]);
 void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
                                          uint8_t *outputs, uint8_t *ok, uint32_t count);
 
+/* Returns 1 when airbender_secp256k1_ecrecover_batch would recover keys[i] (x || y, big-endian) from every
+   signature i, given rys[i], the big-endian y of the signature's R, and 0 otherwise, with a false 1 at a chance of
+   about 2^-127. weights holds 16 random little-endian bytes per signature, which must be drawn after the keys and
+   the ys are fixed. The checks are one multi-scalar product for the whole batch rather than a recovery each. */
+int airbender_secp256k1_verify_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                                     const uint8_t *keys, const uint8_t *rys, const uint8_t *weights, uint32_t count);
+
 #endif

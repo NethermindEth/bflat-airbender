@@ -1028,6 +1028,234 @@ void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sig
     }
 }
 
+/* ---- secp256k1: batch verification of given keys --------------------------------------------- */
+/*
+ * Given each signature's key Q and the y of its R, recovery returns Q exactly when s R = e G + r Q. Weighted by
+ * 128-bit z drawn after the keys, the checks fold into one sum, z R - (z e / s) G - (z r / s) Q summed over the
+ * signatures being the point at infinity, which a false signature passes with probability about 2^-127. Each Q
+ * term splits by the endomorphism into two of about 128 bits, as do the G terms once summed, so the sum has
+ * 3 count + 2 terms below 2^129, added by Pippenger's buckets: per window, one mixed addition per term and a
+ * running sum over the buckets, against two doubling chains and a square root per recovery.
+ */
+
+enum
+{
+    VerifyBatch = 512,
+    MsmTerms = 3 * VerifyBatch + 2,
+    MsmMinWindow = 4,
+    MsmMaxWindow = 7,
+    /* Digits of a scalar below 2^129, one more for the last carry. */
+    MsmMaxDigits = (129 + MsmMinWindow - 1) / MsmMinWindow + 1
+};
+
+static apoint MsmBase[MsmTerms];
+static u256d MsmScalar[MsmTerms]; /* plain */
+static int8_t MsmDigits[MsmMaxDigits][MsmTerms];
+static jpoint MsmBuckets[1 << (MsmMaxWindow - 1)];
+static u256d VerifyS[VerifyBatch], VerifyPrefix[VerifyBatch];
+
+/* The c-bit window of k at bit `at`; k has 256 bits, at + c stays below them. */
+static uint32_t window_bits(const u256d *k, int at, int c)
+{
+    int limb = at >> 5, offset = at & 31;
+    uint32_t bits = k->w[limb] >> offset;
+    if (offset + c > 32)
+        bits |= k->w[limb + 1] << (32 - offset);
+    return bits & ((1u << c) - 1);
+}
+
+/* Whether the sum of MsmScalar[i] MsmBase[i] over the first `terms` is the point at infinity. */
+static int msm_is_infinity(uint32_t terms, const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    u256d zero = {{0}};
+    int c = terms < 32 ? 4 : terms < 128 ? 5 : terms < 512 ? 6 : 7;
+    int digits = (129 + c - 1) / c + 1;
+    int buckets = 1 << (c - 1);
+
+    /* Signed digits in [-2^(c-1), 2^(c-1)]: a window above half its range borrows from the next. */
+    for (uint32_t i = 0; i < terms; i++)
+    {
+        uint32_t carry = 0;
+        for (int j = 0; j < digits; j++)
+        {
+            int32_t v = (int32_t)(window_bits(&MsmScalar[i], j * c, c) + carry);
+            carry = v > buckets;
+            MsmDigits[j][i] = (int8_t)(carry ? v - (1 << c) : v);
+        }
+    }
+
+    jpoint acc;
+    acc.z = zero;
+    for (int j = digits - 1; j >= 0; j--)
+    {
+        if (!is_zero(&acc.z))
+            for (int k = 0; k < c; k++)
+                jdouble0(&acc, &acc, f);
+        for (int b = 0; b < buckets; b++)
+            MsmBuckets[b].z = zero;
+        for (uint32_t i = 0; i < terms; i++)
+        {
+            int d = MsmDigits[j][i];
+            if (!d)
+                continue;
+            const apoint *q = &MsmBase[i];
+            apoint negated;
+            if (d < 0)
+            {
+                negated.x = q->x;
+                SUB(&negated.y, &zero, &q->y);
+                q = &negated;
+                d = -d;
+            }
+            jpoint *bucket = &MsmBuckets[d - 1];
+            if (is_zero(&bucket->z))
+            {
+                bucket->x = q->x;
+                bucket->y = q->y;
+                bucket->z = f->one;
+            }
+            else
+                jadd_ge(bucket, q, f);
+        }
+        /* sum b * bucket[b - 1] as a running sum from the top bucket down. */
+        jpoint running, total;
+        running.z = zero;
+        total.z = zero;
+        for (int b = buckets - 1; b >= 0; b--)
+        {
+            jadd(&running, &running, &MsmBuckets[b], cv);
+            jadd(&total, &total, &running, cv);
+        }
+        jadd(&acc, &acc, &total, cv);
+    }
+    return is_zero(&acc.z);
+}
+
+/* Sets the terms of signature i at MsmBase[3 i]: R, then Q and lambda Q, their scalars filled in later. */
+static int verify_parse(uint32_t i, const uint8_t sig[64], uint8_t recid, const uint8_t key[64], const uint8_t ry[32],
+                        const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    u256d r, s, x, y, qx, qy;
+    from_be(&r, sig);
+    from_be(&s, sig + 32);
+    if (recid > 3 || !in_scalar_range(&r, cv) || !in_scalar_range(&s, cv))
+        return 0;
+    x = r;
+    if (recid & 2)
+    {
+        u256d nn = cv->n.n;
+        if (u256_op(&x, &nn, U256_ADD))
+            return 0;
+    }
+    from_be(&y, ry);
+    from_be(&qx, key);
+    from_be(&qy, key + 32);
+    if (!less(&x, &f->n) || !less(&y, &f->n) || !less(&qx, &f->n) || !less(&qy, &f->n))
+        return 0;
+    if ((y.w[0] & 1) != (recid & 1u))
+        return 0;
+
+    apoint *rp = &MsmBase[3 * i], *q = &MsmBase[3 * i + 1];
+    mont_to(&rp->x, &x, f);
+    mont_to(&rp->y, &y, f);
+    mont_to(&q->x, &qx, f);
+    mont_to(&q->y, &qy, f);
+    if (!on_curve(&rp->x, &rp->y, cv) || !on_curve(&q->x, &q->y, cv))
+        return 0;
+    mont_to(&VerifyS[i], &s, &cv->n);
+    return 1;
+}
+
+static int verify_chunk(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids, const uint8_t *keys,
+                        const uint8_t *rys, const uint8_t *weights, uint32_t count)
+{
+    const curve *cv = get_curve(&CurveK1, &CurveK1Ready, &K1);
+    const mont_ctx *f = &cv->p;
+    const mont_ctx *n = &cv->n;
+    if (!Glv.ready)
+        glv_init(cv);
+    u256d zero = {{0}};
+
+    u256d product = n->one;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (!verify_parse(i, sigs + 64 * i, recids[i], keys + 64 * i, rys + 32 * i, cv))
+            return 0;
+        VerifyPrefix[i] = product;
+        mont_mul(&product, &product, &VerifyS[i], n);
+    }
+    u256d inv;
+    inverse(&inv, &product, n);
+
+    u256d gsum = zero;
+    for (uint32_t i = count; i-- > 0;)
+    {
+        u256d w, e, rm, z, zm, t, k;
+        mont_mul(&w, &inv, &VerifyPrefix[i], n);
+        mont_mul(&inv, &inv, &VerifyS[i], n);
+
+        z = zero;
+        for (int b = 0; b < 4; b++)
+        {
+            const uint8_t *p = weights + 16 * i + 4 * b;
+            z.w[b] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        }
+        /* A zero weight would drop its signature from the sum. */
+        z.w[0] |= 1;
+        MsmScalar[3 * i] = z;
+        mont_to(&zm, &z, n);
+
+        /* G's scalar sums z e / s; Q's is -z r / s. */
+        hash_to_scalar(&e, msgs + 32 * i, cv);
+        mont_mul(&t, &e, &w, n);
+        mont_mul(&t, &t, &zm, n);
+        mont_add(&gsum, &gsum, &t, n);
+        from_be(&rm, sigs + 64 * i);
+        mont_to(&rm, &rm, n);
+        mont_mul(&t, &rm, &w, n);
+        mont_mul(&t, &t, &zm, n);
+        mont_sub(&t, &zero, &t, n);
+        mont_from(&k, &t, n);
+
+        apoint *q = &MsmBase[3 * i + 1], *lq = &MsmBase[3 * i + 2];
+        int neg1, neg2;
+        split_lambda(&MsmScalar[3 * i + 1], &neg1, &MsmScalar[3 * i + 2], &neg2, &k, n);
+        MUL(&lq->x, &q->x, &Glv.beta);
+        lq->y = q->y;
+        if (neg2)
+            SUB(&lq->y, &zero, &q->y);
+        if (neg1)
+            SUB(&q->y, &zero, &q->y);
+    }
+
+    /* -sum z e / s against G and lambda G. */
+    u256d k;
+    mont_sub(&gsum, &zero, &gsum, n);
+    mont_from(&k, &gsum, n);
+    uint32_t g = 3 * count;
+    int neg1, neg2;
+    split_lambda(&MsmScalar[g], &neg1, &MsmScalar[g + 1], &neg2, &k, n);
+    MsmBase[g] = neg1 ? Glv.neg_g[0] : Glv.g[0];
+    MsmBase[g + 1] = neg2 ? Glv.neg_lambda_g[0] : Glv.lambda_g[0];
+
+    return msm_is_infinity(3 * count + 2, cv);
+}
+
+int airbender_secp256k1_verify_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                                     const uint8_t *keys, const uint8_t *rys, const uint8_t *weights, uint32_t count)
+{
+    for (uint32_t done = 0; done < count; done += VerifyBatch)
+    {
+        uint32_t now = count - done < VerifyBatch ? count - done : VerifyBatch;
+        if (!verify_chunk(msgs + 32 * done, sigs + 64 * done, recids + done, keys + 64 * done, rys + 32 * done,
+                          weights + 16 * done, now))
+            return 0;
+    }
+    return 1;
+}
+
 zkvm_status zkvm_secp256r1_verify(const uint8_t msg[32], const uint8_t sig[64], const uint8_t pubkey[64],
                                   bool *verified)
 {
