@@ -28,6 +28,8 @@ __attribute__((noreturn)) void airbender_fail(uint32_t code);
 void keccak_f1600(uint64_t state[25]);
 #ifdef AIRBENDER
 void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32]);
+/* Keccak-256 of len bytes laid out as the guest's EVM memory is, from an aligned group: byte k at data[k ^ 3]. */
+void airbender_keccak256_laid_out(const uint8_t *data, size_t len, uint8_t out[32]);
 #endif
 void keccak_f1600_soft(uint64_t state[25]);
 
