@@ -354,7 +354,7 @@ static const uint32_t HalfN[8] = {0x681b20a0, 0xdfe92f46, 0x57a4501d, 0x5d576e73
 
 static struct
 {
-    int ready;
+    int ready, constants_ready;
     u256d g1, g2, half_n;                       /* plain */
     u256d minus_b1, minus_b2, minus_lambda;     /* Montgomery form mod n */
     u256d beta;                                 /* Montgomery form mod p */
@@ -533,6 +533,57 @@ static __attribute__((noinline)) int jadd_zr(jpoint *r, const apoint *q, u256d *
     return jadd_affine(r, q, NULL, zr, f);
 }
 
+/* r += q for Jacobian r and q, either at infinity, as libsecp256k1's gej_add_var: 12M + 4S, in place on r and through
+   the scratch, where jadd takes copies and compares words. q must not be r. */
+static __attribute__((noinline)) void jadd_jacobian(jpoint *r, const jpoint *q, const mont_ctx *f)
+{
+    if (is_zero(&q->z))
+        return;
+    if (is_zero(&r->z))
+    {
+        *r = *q;
+        return;
+    }
+    ec_scratch *k = ec_scratch_base();
+    u256d *z22 = &k->s, *z12 = &k->z12, *h = &k->h, *rr = &k->rr, *h2 = &k->h2, *h3 = &k->h3;
+    MUL(z22, &q->z, &q->z);
+    MUL(z12, &r->z, &r->z);
+    /* u1 and s1 replace x and y: (u1, s1, z1 z2) is the same point as r. */
+    MUL(&r->x, &r->x, z22);
+    MUL(h, &q->x, z12);
+    MUL(&r->y, &r->y, z22);
+    MUL(&r->y, &r->y, &q->z);
+    MUL(rr, &q->y, z12);
+    MUL(rr, rr, &r->z);
+    MUL(&r->z, &r->z, &q->z);
+    SUB(h, h, &r->x);
+    SUB(rr, rr, &r->y);
+    if (u256_op(h, &k->zero, U256_EQ))
+    {
+        if (is_zero(rr))
+            jdouble0(r, r, f);
+        else
+            r->z = (u256d){{0}};
+        return;
+    }
+    MUL(&r->z, &r->z, h);
+    MUL(h2, h, h);
+    MUL(h3, h2, h);
+    /* t = u1 h^2 replaces x. */
+    MUL(&r->x, &r->x, h2);
+    /* x3 = rr^2 - h^3 - 2t, formed in h2. */
+    MUL(h2, rr, rr);
+    SUB(h2, h2, h3);
+    SUB(h2, h2, &r->x);
+    SUB(h2, h2, &r->x);
+    /* y3 = rr (t - x3) - s1 h^3. */
+    SUB(&r->x, &r->x, h2);
+    MUL(&r->x, &r->x, rr);
+    MUL(h3, h3, &r->y);
+    SUB(&r->y, &r->x, h3);
+    u256_op(&r->x, h2, U256_MEMCOPY);
+}
+
 /* r = a^(2^k). */
 static void sqr_n(u256d *r, const u256d *a, int k, const mont_ctx *f)
 {
@@ -597,15 +648,15 @@ static void field_inverse(u256d *r, const u256d *a, const mont_ctx *f)
     MUL(r, r, a);
 }
 
-/* The odd multiples of G (1G, 3G, ..., (2 EntriesG - 1)G) in affine form, by one inversion. */
-static void glv_init(const curve *cv)
+/* The split's constants, beta and the doubling's (p + 1) / 2: all that split_lambda and the point operations need,
+   without the tables, which only recovery reads. */
+static void glv_init_constants(const curve *cv)
 {
+    if (Glv.constants_ready)
+        return;
     const mont_ctx *f = &cv->p;
     const mont_ctx *n = &cv->n;
-    static jpoint pts[EntriesG];
-    static u256d prefix[EntriesG];
-    u256d u, inv, zinv, zinv2, zinv3;
-    jpoint twice;
+    u256d u;
 
     load_words(&Glv.g1, GlvG1);
     load_words(&Glv.g2, GlvG2);
@@ -622,7 +673,19 @@ static void glv_init(const curve *cv)
     EcScratch.half_p1 = f->n;
     u256_op(&EcScratch.half_p1, &EcScratch.bit255, U256_MUL_HIGH);
     EcScratch.half_p1.w[0] += 1; /* p is odd: (p >> 1) + 1 = (p + 1) / 2, with no carry out of the low word */
+    Glv.constants_ready = 1;
+}
 
+/* The odd multiples of G (1G, 3G, ..., (2 EntriesG - 1)G) in affine form, by one inversion. */
+static void glv_init(const curve *cv)
+{
+    const mont_ctx *f = &cv->p;
+    static jpoint pts[EntriesG];
+    static u256d prefix[EntriesG];
+    u256d inv, zinv, zinv2, zinv3;
+    jpoint twice;
+
+    glv_init_constants(cv);
     pts[0].x = cv->gx;
     pts[0].y = cv->gy;
     pts[0].z = f->one;
@@ -1124,10 +1187,10 @@ static int msm_is_infinity(uint32_t terms, const curve *cv)
         total.z = zero;
         for (int b = buckets - 1; b >= 0; b--)
         {
-            jadd(&running, &running, &MsmBuckets[b], cv);
-            jadd(&total, &total, &running, cv);
+            jadd_jacobian(&running, &MsmBuckets[b], f);
+            jadd_jacobian(&total, &running, f);
         }
-        jadd(&acc, &acc, &total, cv);
+        jadd_jacobian(&acc, &total, f);
     }
     return is_zero(&acc.z);
 }
@@ -1174,8 +1237,7 @@ static int verify_chunk(const uint8_t *msgs, const uint8_t *sigs, const uint8_t 
     const curve *cv = get_curve(&CurveK1, &CurveK1Ready, &K1);
     const mont_ctx *f = &cv->p;
     const mont_ctx *n = &cv->n;
-    if (!Glv.ready)
-        glv_init(cv);
+    glv_init_constants(cv);
     u256d zero = {{0}};
 
     u256d product = n->one;
@@ -1237,8 +1299,15 @@ static int verify_chunk(const uint8_t *msgs, const uint8_t *sigs, const uint8_t 
     uint32_t g = 3 * count;
     int neg1, neg2;
     split_lambda(&MsmScalar[g], &neg1, &MsmScalar[g + 1], &neg2, &k, n);
-    MsmBase[g] = neg1 ? Glv.neg_g[0] : Glv.g[0];
-    MsmBase[g + 1] = neg2 ? Glv.neg_lambda_g[0] : Glv.lambda_g[0];
+    apoint *gp = &MsmBase[g], *lgp = &MsmBase[g + 1];
+    gp->x = cv->gx;
+    gp->y = cv->gy;
+    MUL(&lgp->x, &gp->x, &Glv.beta);
+    lgp->y = gp->y;
+    if (neg2)
+        SUB(&lgp->y, &zero, &gp->y);
+    if (neg1)
+        SUB(&gp->y, &zero, &gp->y);
 
     return msm_is_infinity(3 * count + 2, cv);
 }
