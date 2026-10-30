@@ -2,8 +2,10 @@
 # Builds libairbender.a for rv32im/ilp32 into output/<platform>/, where <platform> is
 #   airbender - the bare-metal zkVM guest (CSR input, register output);
 #   linux     - a Linux process under qemu-riscv32, for testing the guest off the zkVM.
-# Needs clang with the riscv32 target and llvm-ar; SYSROOT is the rv32 musl sysroot the
-# linux platform compiles against.
+# The linux platform also builds output/linux/harness, the test harness of tests/run.py.
+# Needs clang with the riscv32 target, ld.lld and the LLVM tools; SYSROOT is the rv32 musl sysroot
+# (with the compiler-rt builtins) the linux platform compiles and links against. The image of
+# the Dockerfile has them all: build/ci.sh.
 set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -43,6 +45,36 @@ if [ "$platform" = airbender ]; then
 }
 EOF
 fi
+# The archive holds one object, in which only the entry points stay global: the guest links the library with musl,
+# uGC and its own native code, and the names of the helpers (fp_mul, pt_add, C, ...) would clash with theirs. The
+# entry points are the zkvm_ accelerators, the I/O of Nethermind.Zkvm.Abstractions, the airbender_ calls of bflat
+# and of the guest, and the __wrap_ targets of the manifest.
+exports='^(zkvm_|airbender_|syscall_|__wrap_)|^(read_input|write_output|sys_write)$'
+ld.lld -r -o "$obj/libairbender.o" "${objects[@]}"
+llvm-nm --defined-only -g --format=just-symbols "$obj/libairbender.o" | grep -E "$exports" > "$obj/exports.txt" || true
+llvm-objcopy --keep-global-symbols="$obj/exports.txt" "$obj/libairbender.o"
 rm -f "$out/libairbender.a"
-llvm-ar rcs "$out/libairbender.a" "${objects[@]}"
-echo "built $out/libairbender.a"
+llvm-ar rcs "$out/libairbender.a" "$obj/libairbender.o"
+
+# What bflat and the guest call must be there; on Airbender, what the library calls must be what the link of
+# bflat provides: the memory functions of musl and the compiler-rt builtins.
+required=(read_input write_output sys_write zkvm_keccak256 zkvm_sha256 zkvm_secp256k1_ecrecover)
+[ "$platform" = airbender ] && required+=(airbender_exit airbender_uart_write airbender_fail)
+for s in "${required[@]}"; do
+    grep -qx "$s" "$obj/exports.txt" || { echo "libairbender.a does not define $s" >&2; exit 1; }
+done
+if [ "$platform" = airbender ]; then
+    unexpected=$(llvm-nm -u --format=just-symbols "$obj/libairbender.o" \
+        | grep -vxE '(malloc|calloc|realloc|free|memcpy|memmove|memset|memcmp|__real_memcpy)|__[a-z]+[dst]i[0-9]' || true)
+    [ -z "$unexpected" ] || { echo "libairbender.a needs what the guest link does not provide:" $unexpected >&2; exit 1; }
+fi
+echo "built $out/libairbender.a: $(wc -l < "$obj/exports.txt") entry points"
+
+# The test harness of tests/run.py, a static Linux executable for qemu-riscv32.
+if [ "$platform" = linux ]; then
+    clang "${flags[@]}" -c "$TOP/tests/harness.c" -o "$obj/harness.o"
+    lib="$SYSROOT/usr/lib"
+    ld.lld -static -o "$out/harness" "$lib/crt1.o" "$lib/crti.o" "$obj/harness.o" "$out/libairbender.a" \
+        "$lib/libc.a" "$lib/libclang_rt.builtins-riscv32.a" "$lib/crtn.o"
+    echo "built $out/harness"
+fi
