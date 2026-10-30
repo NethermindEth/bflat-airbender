@@ -8,8 +8,8 @@ image=bflat-airbender-build
 
 docker build --platform linux/amd64 -t "$image" "$TOP"
 docker run --platform linux/amd64 --rm -v "$TOP:$TOP" -w "$TOP" "$image" bash -euc '
-    build/build.sh airbender
-    build/build.sh linux
-    build/check.sh airbender linux
+    bash build/build.sh airbender
+    bash build/build.sh linux
+    bash build/check.sh airbender linux
     chmod -R a+rwX output'
 python3 "$TOP/tests/run.py" "${QEMU:-qemu-riscv32}" "$TOP/output/linux/harness"
