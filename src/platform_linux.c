@@ -39,6 +39,11 @@ void sys_write(uint32_t fd, const uint8_t *ptr, size_t len)
     (void)write((int)fd, ptr, len);
 }
 
+void keccak_f1600(uint64_t state[25])
+{
+    keccak_f1600_soft(state);
+}
+
 void airbender_fail(uint32_t code)
 {
     fprintf(stderr, "airbender_fail 0x%x\n", code);

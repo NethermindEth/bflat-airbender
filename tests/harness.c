@@ -96,6 +96,22 @@ int main(void)
             else
                 printf("fail");
         }
+        else if (!strcmp(op, "ecrecoverbatch"))
+        {
+            /* Hashes, signatures and recovery ids, concatenated; each key or "fail", comma-separated. */
+            static uint8_t keys[64 * 1024], ok[1024];
+            uint32_t n = (uint32_t)ArgLen[2];
+            airbender_secp256k1_ecrecover_batch(Args[0], Args[1], Args[2], keys, ok, n);
+            for (uint32_t i = 0; i < n; i++)
+            {
+                if (i)
+                    printf(",");
+                if (ok[i])
+                    print_hex(keys + 64 * i, 64);
+                else
+                    printf("fail");
+            }
+        }
         else if (!strcmp(op, "p256"))
         {
             bool ok;

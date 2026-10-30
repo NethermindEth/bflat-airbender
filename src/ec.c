@@ -4,6 +4,7 @@
  */
 
 #include "ec.h"
+#include "u256.h"
 
 /* Composite operations stay out of line: inlined, the arithmetic would double the code. */
 #define NOINLINE __attribute__((noinline))
@@ -20,84 +21,253 @@ static int limbs_cmp(const uint32_t *a, const uint32_t *b, uint32_t n)
     return 0;
 }
 
-static uint32_t limbs_sub(uint32_t *r, const uint32_t *a, const uint32_t *b, uint32_t n)
+/*
+ * The field operations run on the u256 delegation, which takes its operands from RAM, 32-byte aligned
+ * and distinct, and writes its result over the first. An element is two 256-bit digits (ec.h), only
+ * the first in use for BN254, and the curve tables are in RAM, so the operands are read in place.
+ */
+static u256d M, X, T[4], Zero, Pinv, PInverse, P0, P1;
+static fp Scratch;
+static const curve *Prepared;
+
+static inline u256d *digit(const fp *a, int i)
 {
-    int64_t borrow = 0;
-    for (uint32_t i = 0; i < n; i++)
+    return (u256d *)(uintptr_t)&a->l[8 * i];
+}
+
+/* Pinv = -p^-1 mod 2^256, PInverse = p^-1 mod 2^256 and p as digits, once per curve. */
+static __attribute__((noinline)) void prepare(void)
+{
+    static u256d x, t, two;
+    for (int i = 0; i < 8; i++)
     {
-        borrow += (int64_t)a[i] - b[i];
-        r[i] = (uint32_t)borrow;
-        borrow >>= 32;
+        P0.w[i] = C->p.l[i];
+        P1.w[i] = C->p.l[i + 8];
     }
-    return borrow != 0;
+    /* p^-1 mod 2^256 by Newton: p is its own inverse mod 8, and each step doubles the bits. */
+    x = P0;
+    for (int step = 0; step < 7; step++)
+    {
+        u256_op(&t, &P0, U256_MEMCOPY);
+        u256_op(&t, &x, U256_MUL_LOW);
+        two = (u256d){{2}};
+        u256_op(&two, &t, U256_SUB);
+        u256_op(&x, &two, U256_MUL_LOW);
+    }
+    PInverse = x;
+    Pinv = (u256d){{0}};
+    u256_op(&Pinv, &x, U256_SUB);
+    Prepared = C;
+}
+
+void ec_prepare(void)
+{
+    if (Prepared != C)
+        prepare();
+}
+
+/* r = a, digit by digit; r and a may be the same. */
+static inline void fp_copy(fp *r, const fp *a, uint32_t n)
+{
+    if (r == a)
+        return;
+    u256_op(digit(r, 0), digit(a, 0), U256_MEMCOPY);
+    if (n > 8)
+        u256_op(digit(r, 1), digit(a, 1), U256_MEMCOPY);
+}
+
+/* r -= p when r >= p, for r below 2p. */
+static inline __attribute__((always_inline)) void fp_reduce(fp *r, uint32_t n)
+{
+    /* A top limb below p's settles it without the trial subtraction, and one above makes r > p, so p comes off in
+       place; only an equal top limb needs the trial. */
+    if (r->l[n - 1] < C->p.l[n - 1])
+        return;
+    if (r->l[n - 1] > C->p.l[n - 1])
+    {
+        uint32_t below = u256_op(digit(r, 0), &P0, U256_SUB);
+        if (n > 8)
+            u256_op(digit(r, 1), &P1, U256_SUB | (below ? U256_CARRY : 0));
+        return;
+    }
+    u256_op(&T[0], digit(r, 0), U256_MEMCOPY);
+    uint32_t borrow = u256_op(&T[0], &P0, U256_SUB);
+    if (n > 8)
+    {
+        u256_op(&T[1], digit(r, 1), U256_MEMCOPY);
+        borrow = u256_op(&T[1], &P1, U256_SUB | (borrow ? U256_CARRY : 0));
+    }
+    if (borrow)
+        return;
+    u256_op(digit(r, 0), &T[0], U256_MEMCOPY);
+    if (n > 8)
+        u256_op(digit(r, 1), &T[1], U256_MEMCOPY);
 }
 
 /* Both primes leave the top bit of their last limb clear, so a sum of two reduced elements
-   never carries out of n limbs. */
+   never carries out of n limbs. Inline for the Fp2 operations, which pass a literal n. */
+static inline __attribute__((always_inline)) void fp_add_n(fp *r, const fp *a, const fp *b, uint32_t n)
+{
+    if (r == b)
+    {
+        const fp *t = a;
+        a = b;
+        b = t;
+    }
+    if (r == b)
+    {
+        /* a, b and r are one element: double a copy of it. */
+        fp_copy(&Scratch, b, n);
+        b = &Scratch;
+    }
+    fp_copy(r, a, n);
+    uint32_t carry = u256_op(digit(r, 0), digit(b, 0), U256_ADD);
+    if (n > 8)
+        u256_op(digit(r, 1), digit(b, 1), U256_ADD | (carry ? U256_CARRY : 0));
+    fp_reduce(r, n);
+}
+
 void fp_add(fp *r, const fp *a, const fp *b)
 {
-    uint32_t n = C->n;
-    uint64_t carry = 0;
-    for (uint32_t i = 0; i < n; i++)
+    fp_add_n(r, a, b, C->n);
+}
+
+static inline __attribute__((always_inline)) void fp_sub_n(fp *r, const fp *a, const fp *b, uint32_t n)
+{
+    if (r == b)
     {
-        carry += (uint64_t)a->l[i] + b->l[i];
-        r->l[i] = (uint32_t)carry;
-        carry >>= 32;
+        fp_copy(&Scratch, b, n);
+        b = &Scratch;
     }
-    if (limbs_cmp(r->l, C->p.l, n) >= 0)
-        limbs_sub(r->l, r->l, C->p.l, n);
+    fp_copy(r, a, n);
+    uint32_t borrow = u256_op(digit(r, 0), digit(b, 0), U256_SUB);
+    if (n > 8)
+        borrow = u256_op(digit(r, 1), digit(b, 1), U256_SUB | (borrow ? U256_CARRY : 0));
+    if (!borrow)
+        return;
+    /* Below zero: add p back, the wrap past 2^(256 * digits) undoing the borrow. The borrow is 1, U256_ADD. */
+    uint32_t carry = u256_op(digit(r, 0), &P0, borrow);
+    if (n > 8)
+        u256_op(digit(r, 1), &P1, U256_ADD | (carry ? U256_CARRY : 0));
 }
 
 void fp_sub(fp *r, const fp *a, const fp *b)
 {
-    uint32_t n = C->n;
-    if (limbs_sub(r->l, a->l, b->l, n))
-    {
-        uint64_t carry = 0;
-        for (uint32_t i = 0; i < n; i++)
-        {
-            carry += (uint64_t)r->l[i] + C->p.l[i];
-            r->l[i] = (uint32_t)carry;
-            carry >>= 32;
-        }
-    }
+    fp_sub_n(r, a, b, C->n);
 }
 
-/* Montgomery product a*b/R mod p, coarsely integrated operand scanning. */
+/*
+ * Montgomery product a*b/R mod p. BN254 (R = 2^256) takes the 512-bit product and one 256-bit
+ * reduction step, all in place. BLS12-381 (R = 2^384) splits an element into a 256-bit digit and one
+ * below 2^128: the product accumulates in T, three digits, and the reduction adds multiples of p
+ * that clear T from the bottom, one 256-bit step and one of 128 bits.
+ */
+static void fp_mul_wide(fp *r, const fp *a, const fp *b);
+
+static inline __attribute__((always_inline)) void fp_mul_n(fp *r, const fp *a, const fp *b, uint32_t n)
+{
+    const u256d *a0 = digit(a, 0), *b0 = digit(b, 0);
+    if (n == 8)
+    {
+        /* With m = lo(ab) p^-1, m p has the low half of ab, so (ab - m p) / R = hi(ab) - hi(m p): a difference in
+           (-p, p) that needs no carry from the low halves. hi(ab) is formed in r itself, unless r is b alone. */
+        u256d *rd = digit(r, 0);
+        if (rd == b0 && rd != a0)
+        {
+            const u256d *t = a0;
+            a0 = b0;
+            b0 = t;
+        }
+        if (b0 == rd)
+        {
+            u256_op(&T[1], b0, U256_MEMCOPY);
+            b0 = &T[1];
+        }
+        u256_op(&T[0], a0, U256_MEMCOPY);
+        u256_op(&T[0], b0, U256_MUL_LOW);
+        u256_op(&T[0], &PInverse, U256_MUL_LOW);
+        u256_op(&T[0], &P0, U256_MUL_HIGH);
+        if (rd != a0)
+            u256_op(rd, a0, U256_MEMCOPY);
+        u256_op(rd, b0, U256_MUL_HIGH);
+        /* A borrow leaves 1 in x12, which is U256_ADD. */
+        uint32_t borrow = u256_op(rd, &T[0], U256_SUB);
+        if (borrow)
+            u256_op(rd, &P0, borrow);
+        return;
+    }
+    fp_mul_wide(r, a, b);
+}
+
 void fp_mul(fp *r, const fp *a, const fp *b)
 {
-    uint32_t n = C->n;
-    uint32_t t[FpMaxLimbs + 2] = {0};
-    for (uint32_t i = 0; i < n; i++)
-    {
-        uint64_t c = 0;
-        for (uint32_t j = 0; j < n; j++)
-        {
-            c += (uint64_t)a->l[j] * b->l[i] + t[j];
-            t[j] = (uint32_t)c;
-            c >>= 32;
-        }
-        c += t[n];
-        t[n] = (uint32_t)c;
-        t[n + 1] = (uint32_t)(c >> 32);
+    fp_mul_n(r, a, b, C->n);
+}
 
-        uint32_t m = t[0] * C->inv;
-        c = ((uint64_t)m * C->p.l[0] + t[0]) >> 32;
-        for (uint32_t j = 1; j < n; j++)
-        {
-            c += (uint64_t)m * C->p.l[j] + t[j];
-            t[j - 1] = (uint32_t)c;
-            c >>= 32;
-        }
-        c += t[n];
-        t[n - 1] = (uint32_t)c;
-        t[n] = t[n + 1] + (uint32_t)(c >> 32);
-    }
-    fp res = {{0}};
-    memcpy(res.l, t, n * sizeof(uint32_t));
-    if (t[n] || limbs_cmp(res.l, C->p.l, n) >= 0)
-        limbs_sub(res.l, res.l, C->p.l, n);
-    *r = res;
+/* The BLS12-381 product of fp_mul. */
+static NOINLINE void fp_mul_wide(fp *r, const fp *a, const fp *b)
+{
+    const u256d *a0 = digit(a, 0), *b0 = digit(b, 0);
+    /* The product lands in three digits, T0 + T1 W + T2 W^2 (W = 2^256), each carry passed on as the next
+       addition's carry in. a1 and b1 are below 2^128, so a1 b1 fits a digit and T2 never carries out. */
+    const u256d *a1 = digit(a, 1), *b1 = digit(b, 1);
+    u256d *t0 = &T[0], *t1 = &T[1], *t2 = &T[2];
+    u256_op(t0, a0, U256_MEMCOPY);
+    u256_op(t0, b0, U256_MUL_LOW);
+    u256_op(t1, a0, U256_MEMCOPY);
+    u256_op(t1, b0, U256_MUL_HIGH);
+    u256_op(t2, a0, U256_MEMCOPY);
+    u256_op(t2, b1, U256_MUL_HIGH);
+    u256_op(&X, a0, U256_MEMCOPY);
+    u256_op(&X, b1, U256_MUL_LOW);
+    uint32_t c1 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b0, U256_MUL_LOW);
+    uint32_t c2 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b0, U256_MUL_HIGH);
+    u256_op(t2, &X, U256_ADD | (c1 ? U256_CARRY : 0));
+    u256_op(&X, a1, U256_MEMCOPY);
+    u256_op(&X, b1, U256_MUL_LOW);
+    u256_op(t2, &X, U256_ADD | (c2 ? U256_CARRY : 0));
+
+    /* A 256-bit step: m = T0 Pinv, made in T0 itself, and T0 + lo(m P0) is W exactly when T0 != 0. p = P0 + P1 W
+       with P1 below 2^128. */
+    uint32_t low = u256_op(t0, &Zero, U256_EQ) ? 0 : U256_CARRY;
+    u256_op(t0, &Pinv, U256_MUL_LOW);
+    u256_op(&X, t0, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_HIGH);
+    c1 = u256_op(t1, &X, U256_ADD | low);
+    u256_op(&X, t0, U256_MEMCOPY);
+    u256_op(&X, &P1, U256_MUL_LOW);
+    c2 = u256_op(t1, &X, U256_ADD);
+    u256_op(t0, &P1, U256_MUL_HIGH);
+    u256_op(t2, t0, U256_ADD | (c1 ? U256_CARRY : 0));
+    if (c2)
+        u256_op(t2, &Zero, U256_ADD | U256_CARRY);
+
+    /* A 128-bit step: m = T1 Pinv mod 2^128 clears the low half of T1; m P1 is below 2^253. */
+    u256_op(&M, t1, U256_MEMCOPY);
+    u256_op(&M, &Pinv, U256_MUL_LOW);
+    for (int i = 4; i < 8; i++)
+        M.w[i] = 0;
+    u256_op(&X, &M, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_LOW);
+    c1 = u256_op(t1, &X, U256_ADD);
+    u256_op(&X, &M, U256_MEMCOPY);
+    u256_op(&X, &P0, U256_MUL_HIGH);
+    u256_op(&M, &P1, U256_MUL_LOW);
+    u256_op(t2, &X, U256_ADD | (c1 ? U256_CARRY : 0));
+    u256_op(t2, &M, U256_ADD);
+
+    /* The product over R = 2^384 is T from bit 384 on: words 4-7 of T1, then T2; below 2p. */
+    for (int i = 0; i < 4; i++)
+        r->l[i] = t1->w[4 + i];
+    for (int i = 0; i < 8; i++)
+        r->l[4 + i] = t2->w[i];
+    for (int i = 12; i < FpMaxLimbs; i++)
+        r->l[i] = 0;
+    fp_reduce(r, 12);
 }
 
 bool fp_is_zero(const fp *a)
@@ -164,14 +334,30 @@ static void p_exp(fp *e, int32_t add, unsigned shift)
 
 NOINLINE void fq_add(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
-    for (int i = 0; i < d; i++)
-        fp_add(&r->c[i], &a->c[i], &b->c[i]);
+    if (C->n == 8)
+    {
+        fp_add_n(&r->c[0], &a->c[0], &b->c[0], 8);
+        if (d == 2)
+            fp_add_n(&r->c[1], &a->c[1], &b->c[1], 8);
+        return;
+    }
+    fp_add_n(&r->c[0], &a->c[0], &b->c[0], 12);
+    if (d == 2)
+        fp_add_n(&r->c[1], &a->c[1], &b->c[1], 12);
 }
 
 NOINLINE void fq_sub(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
-    for (int i = 0; i < d; i++)
-        fp_sub(&r->c[i], &a->c[i], &b->c[i]);
+    if (C->n == 8)
+    {
+        fp_sub_n(&r->c[0], &a->c[0], &b->c[0], 8);
+        if (d == 2)
+            fp_sub_n(&r->c[1], &a->c[1], &b->c[1], 8);
+        return;
+    }
+    fp_sub_n(&r->c[0], &a->c[0], &b->c[0], 12);
+    if (d == 2)
+        fp_sub_n(&r->c[1], &a->c[1], &b->c[1], 12);
 }
 
 NOINLINE void fq_neg(fp2 *r, const fp2 *a, int d)
@@ -182,6 +368,30 @@ NOINLINE void fq_neg(fp2 *r, const fp2 *a, int d)
 }
 
 /* Fp2 by Karatsuba: (a0 + a1 u)(b0 + b1 u) = a0 b0 - a1 b1 + ((a0 + a1)(b0 + b1) - a0 b0 - a1 b1) u. */
+static inline __attribute__((always_inline)) void fq_mul_n(fp2 *r, const fp2 *a, const fp2 *b, uint32_t n)
+{
+    fp t0, t1, t2, t3;
+    if (a == b)
+    {
+        /* A square by the complex method, u^2 = -1: (a0 + a1)(a0 - a1) + 2 a0 a1 u, two products for three. */
+        fp_add_n(&t0, &a->c[0], &a->c[1], n);
+        fp_sub_n(&t1, &a->c[0], &a->c[1], n);
+        fp_mul_n(&t2, &a->c[0], &a->c[1], n);
+        fp_mul_n(&r->c[0], &t0, &t1, n);
+        fp_add_n(&r->c[1], &t2, &t2, n);
+        return;
+    }
+    fp_mul_n(&t0, &a->c[0], &b->c[0], n);
+    fp_mul_n(&t1, &a->c[1], &b->c[1], n);
+    fp_add_n(&t2, &a->c[0], &a->c[1], n);
+    fp_add_n(&t3, &b->c[0], &b->c[1], n);
+    fp_mul_n(&t2, &t2, &t3, n);
+    fp_sub_n(&r->c[0], &t0, &t1, n);
+    fp_sub_n(&t2, &t2, &t0, n);
+    fp_sub_n(&r->c[1], &t2, &t1, n);
+}
+
+/* The field operations inline, each with the limb count as a constant. */
 NOINLINE void fq_mul(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
     if (d == 1)
@@ -189,15 +399,10 @@ NOINLINE void fq_mul(fp2 *r, const fp2 *a, const fp2 *b, int d)
         fp_mul(&r->c[0], &a->c[0], &b->c[0]);
         return;
     }
-    fp t0, t1, t2, t3;
-    fp_mul(&t0, &a->c[0], &b->c[0]);
-    fp_mul(&t1, &a->c[1], &b->c[1]);
-    fp_add(&t2, &a->c[0], &a->c[1]);
-    fp_add(&t3, &b->c[0], &b->c[1]);
-    fp_mul(&t2, &t2, &t3);
-    fp_sub(&r->c[0], &t0, &t1);
-    fp_sub(&t2, &t2, &t0);
-    fp_sub(&r->c[1], &t2, &t1);
+    if (C->n == 8)
+        fq_mul_n(r, a, b, 8);
+    else
+        fq_mul_n(r, a, b, 12);
 }
 
 NOINLINE bool fq_is_zero(const fp2 *a, int d)
@@ -221,15 +426,26 @@ static void fq_set_one(fp2 *r)
     r->c[0] = C->one;
 }
 
+/* a^e by 4-bit windows from the top non-zero one: 14 products for the table, then one per window. */
 NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
 {
-    fp2 acc, base = *a;
-    fq_set_one(&acc);
-    for (int i = 32 * (int)C->n - 1; i >= 0; i--)
+    fp2 table[16], acc;
+    fq_set_one(&table[0]);
+    table[1] = *a;
+    for (int i = 2; i < 16; i++)
+        fq_mul(&table[i], &table[i - 1], a, d);
+
+    int window = 8 * (int)C->n - 1;
+    while (window > 0 && ((e->l[window / 8] >> (4 * (window % 8))) & 15) == 0)
+        window--;
+    acc = table[(e->l[window / 8] >> (4 * (window % 8))) & 15];
+    for (window--; window >= 0; window--)
     {
-        fq_mul(&acc, &acc, &acc, d);
-        if ((e->l[i / 32] >> (i % 32)) & 1)
-            fq_mul(&acc, &acc, &base, d);
+        for (int s = 0; s < 4; s++)
+            fq_mul(&acc, &acc, &acc, d);
+        uint32_t bits = (e->l[window / 8] >> (4 * (window % 8))) & 15;
+        if (bits)
+            fq_mul(&acc, &acc, &table[bits], d);
     }
     *r = acc;
 }
@@ -263,45 +479,105 @@ NOINLINE void fp2_conj(fp2 *r, const fp2 *a)
     fp_sub(&r->c[1], &zero, &a->c[1]);
 }
 
+/* 1/2 in Montgomery form, formed once per curve: half of R mod p, which is C->one. */
+static const fp *fp_half(void)
+{
+    static fp half;
+    static const curve *formed_for;
+    if (formed_for != C)
+    {
+        uint32_t n = C->n;
+        fp t = C->one;
+        uint64_t carry = 0;
+        if (t.l[0] & 1)
+        {
+            for (uint32_t i = 0; i < n; i++)
+            {
+                carry += (uint64_t)t.l[i] + C->p.l[i];
+                t.l[i] = (uint32_t)carry;
+                carry >>= 32;
+            }
+        }
+        for (uint32_t i = 0; i < n; i++)
+            t.l[i] = (t.l[i] >> 1) | (i + 1 < n ? t.l[i + 1] << 31 : (uint32_t)carry << 31);
+        half = t;
+        formed_for = C;
+    }
+    return &half;
+}
+
+/* r = a^((p+1)/4) in Fp, held in an Fp2's first coefficient; true when it squares back to a. */
+static bool fp_sqrt_in(fp2 *r, const fp2 *a)
+{
+    fp e;
+    fp2 t;
+    p_exp(&e, 1, 2);
+    fq_pow(r, a, &e, 1);
+    fq_mul(&t, r, r, 1);
+    return fq_eq(&t, a, 1);
+}
+
 /*
  * A square root, false when there is none. Both primes are 3 mod 4: in Fp the root is
- * a^((p+1)/4); in Fp2 it is Algorithm 9 of Adj and Rodriguez-Henriquez, "Square root computation
- * over even extension fields" (2012). Either candidate is checked by squaring.
+ * a^((p+1)/4). In Fp2 = Fp(u), u^2 = -1, a = a0 + a1 u with a1 != 0 is a square exactly when its
+ * norm a0^2 + a1^2 is one in Fp, with root alpha; then one of delta = (a0 +- alpha) / 2 is a square
+ * in Fp, and with t = delta^((p-3)/4), gamma = t delta is its root and 1/gamma is t, so the root of a
+ * is gamma + (a1 t / 2) u. Two or three exponentiations in Fp, and one for a non-square, where the
+ * powers in Fp2 took two. Either candidate is checked by squaring.
  */
 NOINLINE bool fq_sqrt(fp2 *r, const fp2 *a, int d)
 {
-    fp e;
     fp2 x, t;
     if (d == 1)
     {
-        p_exp(&e, 1, 2);
-        fq_pow(&x, a, &e, 1);
+        fp_sqrt_in(&x, a);
+    }
+    else if (fp_is_zero(&a->c[1]))
+    {
+        /* a0 or -a0 is a square in Fp, as -1 is not: the root is sqrt(a0) or sqrt(-a0) u. */
+        fp2 b;
+        memset(&b, 0, sizeof(b));
+        b.c[0] = a->c[0];
+        memset(&x, 0, sizeof(x));
+        if (!fp_sqrt_in(&t, &b))
+        {
+            fq_neg(&b, &b, 1);
+            fp_sqrt_in(&t, &b);
+            x.c[1] = t.c[0];
+        }
+        else
+            x.c[0] = t.c[0];
     }
     else
     {
-        fp2 a1, alpha, minus_one;
+        fp2 n, alpha, delta, power, gamma;
+        fp s, e;
+        memset(&n, 0, sizeof(n));
+        fp_mul(&n.c[0], &a->c[0], &a->c[0]);
+        fp_mul(&s, &a->c[1], &a->c[1]);
+        fp_add(&n.c[0], &n.c[0], &s);
+        if (!fp_sqrt_in(&alpha, &n))
+        {
+            *r = *a;
+            return false;
+        }
         p_exp(&e, -3, 2);
-        fq_pow(&a1, a, &e, 2);
-        fq_mul(&alpha, &a1, &a1, 2);
-        fq_mul(&alpha, &alpha, a, 2);
-        fq_mul(&x, &a1, a, 2);
-        fq_set_one(&t);
-        fq_neg(&minus_one, &t, 2);
-        if (fq_eq(&alpha, &minus_one, 2))
+        memset(&delta, 0, sizeof(delta));
+        fp_add(&delta.c[0], &a->c[0], &alpha.c[0]);
+        fp_mul(&delta.c[0], &delta.c[0], fp_half());
+        fq_pow(&power, &delta, &e, 1);
+        fq_mul(&gamma, &power, &delta, 1);
+        fq_mul(&t, &gamma, &gamma, 1);
+        if (!fq_eq(&t, &delta, 1))
         {
-            /* x = u x0 = -x0.c1 + x0.c0 u */
-            fq_neg(&t, &x, 2);
-            t.c[0] = t.c[1];
-            t.c[1] = x.c[0];
-            x = t;
+            fp_sub(&delta.c[0], &a->c[0], &alpha.c[0]);
+            fp_mul(&delta.c[0], &delta.c[0], fp_half());
+            fq_pow(&power, &delta, &e, 1);
+            fq_mul(&gamma, &power, &delta, 1);
         }
-        else
-        {
-            fq_add(&alpha, &alpha, &t, 2);
-            p_exp(&e, -1, 1);
-            fq_pow(&alpha, &alpha, &e, 2);
-            fq_mul(&x, &alpha, &x, 2);
-        }
+        x.c[0] = gamma.c[0];
+        fp_mul(&x.c[1], &a->c[1], &power.c[0]);
+        fp_mul(&x.c[1], &x.c[1], fp_half());
     }
     fq_mul(&t, &x, &x, d);
     bool ok = fq_eq(&t, a, d);
@@ -309,15 +585,39 @@ NOINLINE bool fq_sqrt(fp2 *r, const fp2 *a, int d)
     return ok;
 }
 
-/* a * xi with xi = k + u: (a0 k - a1) + (a0 + a1 k) u. */
+/* (a0 k - a1) + (a1 k + a0) u, with ka the products by k, or a itself for k = 1. r may be a. */
+static inline __attribute__((always_inline)) void fp2_mul_xi_n(fp2 *r, const fp2 *a, const fp2 *ka, uint32_t n)
+{
+    fp t;
+    fp_sub_n(&t, &ka->c[0], &a->c[1], n);
+    fp_add_n(&r->c[1], &ka->c[1], &a->c[0], n);
+    fp_copy(&r->c[0], &t, n);
+}
+
+/* a * xi with xi = k + u: (a0 k - a1) + (a0 + a1 k) u. r may be a. */
 NOINLINE static void fp2_mul_xi(fp2 *r, const fp2 *a)
 {
-    fp2 k = *a, t;
-    for (uint32_t i = 1; i < C->xi; i++)
-        fq_add(&k, &k, a, 2);
-    fp_sub(&t.c[0], &k.c[0], &a->c[1]);
-    fp_add(&t.c[1], &k.c[1], &a->c[0]);
-    *r = t;
+    if (C->xi == 1)
+    {
+        fp2_mul_xi_n(r, a, a, 12);
+        return;
+    }
+    /* k a as two products by k in Montgomery form, formed once per curve: an addition costs a third of a
+       product, and 9 a takes four of them per coefficient. Only BN254 has k > 1. */
+    static fp k_mont;
+    static const curve *k_for;
+    if (k_for != C)
+    {
+        fp plain;
+        memset(&plain, 0, sizeof(plain));
+        plain.l[0] = C->xi;
+        fp_mul(&k_mont, &plain, &C->r2);
+        k_for = C;
+    }
+    fp2 k;
+    fp_mul_n(&k.c[0], &a->c[0], &k_mont, 8);
+    fp_mul_n(&k.c[1], &a->c[1], &k_mont, 8);
+    fp2_mul_xi_n(r, a, &k, 8);
 }
 
 /* ---- points --------------------------------------------------------------------------------- */
@@ -481,6 +781,10 @@ void pt_set_affine(point *p, int d)
 {
     if (pt_is_inf(p, d))
         return;
+    fp2 one;
+    fq_set_one(&one);
+    if (fq_eq(&p->z, &one, d))
+        return;
     fp2 zi, zi2;
     fq_inv(&zi, &p->z, d);
     fq_mul(&zi2, &zi, &zi, d);
@@ -547,17 +851,27 @@ void pt_store(uint8_t *out, const point *p, int d, bool swap)
  */
 void pt_frob(point *r, const point *p, bool inverse)
 {
-    fp2 g, g2, g3;
-    g = C->gamma;
-    if (inverse)
-        fq_inv(&g, &g, 2);
-    fq_mul(&g2, &g, &g, 2);
-    fq_mul(&g3, &g2, &g, 2);
+    /* g^2 and g^3 per curve and direction, formed once: 1/gamma is an exponentiation. */
+    static struct
+    {
+        const curve *cv;
+        fp2 g2, g3;
+    } factors[2][2];
+    __typeof__(factors[0][0]) *k = &factors[C->mtwist][inverse];
+    if (k->cv != C)
+    {
+        fp2 g = C->gamma;
+        if (inverse)
+            fq_inv(&g, &g, 2);
+        fq_mul(&k->g2, &g, &g, 2);
+        fq_mul(&k->g3, &k->g2, &g, 2);
+        k->cv = C;
+    }
     fp2_conj(&r->x, &p->x);
     fp2_conj(&r->y, &p->y);
     fp2_conj(&r->z, &p->z);
-    fq_mul(&r->x, &r->x, &g2, 2);
-    fq_mul(&r->y, &r->y, &g3, 2);
+    fq_mul(&r->x, &r->x, &k->g2, 2);
+    fq_mul(&r->y, &r->y, &k->g3, 2);
 }
 
 /* ---- Fp12 ----------------------------------------------------------------------------------- */
@@ -568,39 +882,204 @@ void fp12_one(fp12 *r)
     r->c[0].c[0] = C->one;
 }
 
-/* Schoolbook product modulo w^6 - xi. Zero coefficients of b are skipped, which makes the
-   product by a line (three non-zero coefficients) half the cost; a square (a == b) takes each
-   cross product once, doubled, for 21 Fp2 products instead of 36. */
+/*
+ * Fp12 as Fp6[w]/(w^2 - v) over Fp6 = Fp2[v]/(v^3 - xi), v = w^2: the even coefficients of the flat
+ * form are the Fp6 element A and the odd ones B, for A + B w. Karatsuba at both levels takes 18 Fp2
+ * products for a product and 12 for a square, against 36 and 21 for the flat schoolbook. An fp12
+ * stores A then B, so the coefficient of w^i is at W(i), and the halves are read in place.
+ */
+typedef struct
+{
+    fp2 c[3]; /* c[0] + c[1] v + c[2] v^2 */
+} fp6;
+
+#define W(i) ((i) % 2 ? 3 + (i) / 2 : (i) / 2)
+
+static inline fp6 *fp12_even(const fp12 *a)
+{
+    return (fp6 *)(uintptr_t)&a->c[0];
+}
+
+static inline fp6 *fp12_odd(const fp12 *a)
+{
+    return (fp6 *)(uintptr_t)&a->c[3];
+}
+
+static void fp6_add(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    for (int i = 0; i < 3; i++)
+        fq_add(&r->c[i], &a->c[i], &b->c[i], 2);
+}
+
+static void fp6_sub(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    for (int i = 0; i < 3; i++)
+        fq_sub(&r->c[i], &a->c[i], &b->c[i], 2);
+}
+
+/* r = a v: (a0 + a1 v + a2 v^2) v = xi a2 + a0 v + a1 v^2. */
+static void fp6_mul_v(fp6 *r, const fp6 *a)
+{
+    fp2 t;
+    fp2_mul_xi(&t, &a->c[2]);
+    r->c[2] = a->c[1];
+    r->c[1] = a->c[0];
+    r->c[0] = t;
+}
+
+NOINLINE static void fp6_mul(fp6 *r, const fp6 *a, const fp6 *b)
+{
+    fp2 t0, t1, t2, s, u;
+    fp6 out;
+    fq_mul(&t0, &a->c[0], &b->c[0], 2);
+    fq_mul(&t1, &a->c[1], &b->c[1], 2);
+    fq_mul(&t2, &a->c[2], &b->c[2], 2);
+
+    /* c0 = t0 + xi ((a1 + a2)(b1 + b2) - t1 - t2) */
+    fq_add(&s, &a->c[1], &a->c[2], 2);
+    fq_add(&u, &b->c[1], &b->c[2], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t1, 2);
+    fq_sub(&s, &s, &t2, 2);
+    fp2_mul_xi(&s, &s);
+    fq_add(&out.c[0], &t0, &s, 2);
+
+    /* c1 = (a0 + a1)(b0 + b1) - t0 - t1 + xi t2 */
+    fq_add(&s, &a->c[0], &a->c[1], 2);
+    fq_add(&u, &b->c[0], &b->c[1], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t0, 2);
+    fq_sub(&s, &s, &t1, 2);
+    fp2_mul_xi(&u, &t2);
+    fq_add(&out.c[1], &s, &u, 2);
+
+    /* c2 = (a0 + a2)(b0 + b2) - t0 - t2 + t1 */
+    fq_add(&s, &a->c[0], &a->c[2], 2);
+    fq_add(&u, &b->c[0], &b->c[2], 2);
+    fq_mul(&s, &s, &u, 2);
+    fq_sub(&s, &s, &t0, 2);
+    fq_sub(&s, &s, &t2, 2);
+    fq_add(&out.c[2], &s, &t1, 2);
+    *r = out;
+}
+
 NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
 {
-    fp2 t[11], m;
-    memset(t, 0, sizeof(t));
-    for (int j = 0; j < 6; j++)
+    const fp6 *x = fp12_even(a), *y = fp12_odd(a);
+    fp6 s, t, u;
+    if (a == b)
     {
-        if (fq_is_zero(&b->c[j], 2))
-            continue;
-        for (int i = a == b ? j : 0; i < 6; i++)
-        {
-            fq_mul(&m, &a->c[i], &b->c[j], 2);
-            if (a == b && i != j)
-                fq_add(&m, &m, &m, 2);
-            fq_add(&t[i + j], &t[i + j], &m, 2);
-        }
+        /* (A + B w)^2 = (A^2 + v B^2) + 2 A B w, where (A + B)(A + v B) = A^2 + v B^2 + (1 + v) A B. */
+        fp6_mul(&u, x, y);
+        fp6_mul_v(&t, y);
+        fp6_add(&t, &t, x);
+        fp6_add(&s, x, y);
+        fp6_mul(&s, &s, &t);
+        fp6_sub(&s, &s, &u);
+        fp6_mul_v(&t, &u);
+        fp6_sub(fp12_even(r), &s, &t);
+        fp6_add(fp12_odd(r), &u, &u);
+        return;
     }
-    for (int k = 10; k >= 6; k--)
-    {
-        fp2_mul_xi(&m, &t[k]);
-        fq_add(&t[k - 6], &t[k - 6], &m, 2);
-    }
-    memcpy(r->c, t, sizeof(r->c));
+
+    /* (A + B w)(C + D w) = (A C + v B D) + ((A + B)(C + D) - A C - B D) w */
+    const fp6 *c = fp12_even(b), *d = fp12_odd(b);
+    fp6 ac, bd;
+    fp6_mul(&ac, x, c);
+    fp6_mul(&bd, y, d);
+    fp6_add(&s, x, y);
+    fp6_add(&t, c, d);
+    fp6_mul(&s, &s, &t);
+    fp6_sub(&s, &s, &ac);
+    fp6_sub(fp12_odd(r), &s, &bd);
+    fp6_mul_v(&t, &bd);
+    fp6_add(fp12_even(r), &t, &ac);
 }
 
 /* The p^6-power Frobenius, w -> -w; it inverts elements of the cyclotomic subgroup. */
+/* r = a (b0 + b1 v): 5 Fp2 products by Karatsuba. r may be a. */
+static void fp6_mul_01(fp6 *r, const fp6 *a, const fp2 *b0, const fp2 *b1)
+{
+    fp2 t0, t1, c0, c1, c2;
+    fq_mul(&t0, &a->c[0], b0, 2);
+    fq_mul(&t1, &a->c[1], b1, 2);
+    fq_add(&c1, &a->c[0], &a->c[1], 2);
+    fq_add(&c2, b0, b1, 2);
+    fq_mul(&c1, &c1, &c2, 2);
+    fq_sub(&c1, &c1, &t0, 2);
+    fq_sub(&c1, &c1, &t1, 2);
+    fq_mul(&c0, &a->c[2], b1, 2);
+    fp2_mul_xi(&c0, &c0);
+    fq_add(&c0, &c0, &t0, 2);
+    fq_mul(&c2, &a->c[2], b0, 2);
+    fq_add(&c2, &c2, &t1, 2);
+    r->c[0] = c0;
+    r->c[1] = c1;
+    r->c[2] = c2;
+}
+
+/* r = a b1 v: 3 Fp2 products. r may be a. */
+static void fp6_mul_1(fp6 *r, const fp6 *a, const fp2 *b1)
+{
+    fp2 c0, c1, c2;
+    fq_mul(&c0, &a->c[2], b1, 2);
+    fp2_mul_xi(&c0, &c0);
+    fq_mul(&c1, &a->c[0], b1, 2);
+    fq_mul(&c2, &a->c[1], b1, 2);
+    r->c[0] = c0;
+    r->c[1] = c1;
+    r->c[2] = c2;
+}
+
+/*
+ * A line through points of the twist, evaluated at the G1 point p: cy y_P + cx x_P w + c0 w^3 on a D-type twist and
+ * c0 + cx x_P w^2 + cy y_P w^3 on an M-type one, up to factors in Fp2 and powers of w, which the final exponentiation
+ * sends to 1. y holds cy y_P and x holds cx x_P.
+ */
+typedef struct
+{
+    fp2 y, x, c0;
+} line;
+
+/*
+ * f *= l. As L0 + L1 w over Fp6, one of L0 and L1 is a single Fp2 term and the other has two, so Karatsuba takes 13
+ * Fp2 products where a dense product takes 18.
+ */
+NOINLINE static void fp12_mul_line(fp12 *f, const line *l)
+{
+    fp6 *x = fp12_even(f), *y = fp12_odd(f);
+    fp6 a, b, s;
+    fp2 sum;
+    fp6_add(&s, x, y);
+    if (C->mtwist)
+    {
+        /* L0 = c0 + (cx x_P) v, L1 = (cy y_P) v */
+        fp6_mul_01(&a, x, &l->c0, &l->x);
+        fp6_mul_1(&b, y, &l->y);
+        fq_add(&sum, &l->x, &l->y, 2);
+        fp6_mul_01(&s, &s, &l->c0, &sum);
+    }
+    else
+    {
+        /* L0 = cy y_P, L1 = cx x_P + c0 v */
+        for (int i = 0; i < 3; i++)
+            fq_mul(&a.c[i], &x->c[i], &l->y, 2);
+        fp6_mul_01(&b, y, &l->x, &l->c0);
+        fq_add(&sum, &l->y, &l->x, 2);
+        fp6_mul_01(&s, &s, &sum, &l->c0);
+    }
+    /* (F0 + F1 w)(L0 + L1 w) = (F0 L0 + v F1 L1) + ((F0 + F1)(L0 + L1) - F0 L0 - F1 L1) w */
+    fp6_sub(&s, &s, &a);
+    fp6_sub(y, &s, &b);
+    fp6_mul_v(&b, &b);
+    fp6_add(x, &a, &b);
+}
+
 NOINLINE static void fp12_conj(fp12 *r, const fp12 *a)
 {
     *r = *a;
     for (int i = 1; i < 6; i += 2)
-        fq_neg(&r->c[i], &a->c[i], 2);
+        fq_neg(&r->c[W(i)], &a->c[W(i)], 2);
 }
 
 /* The p-power Frobenius: c_i w^i -> conj(c_i) gamma^i w^i. */
@@ -610,8 +1089,8 @@ NOINLINE static void fp12_frob(fp12 *r, const fp12 *a)
     fq_set_one(&g);
     for (int i = 0; i < 6; i++)
     {
-        fp2_conj(&r->c[i], &a->c[i]);
-        fq_mul(&r->c[i], &r->c[i], &g, 2);
+        fp2_conj(&r->c[W(i)], &a->c[W(i)]);
+        fq_mul(&r->c[W(i)], &r->c[W(i)], &g, 2);
         fq_mul(&g, &g, &C->gamma, 2);
     }
 }
@@ -625,7 +1104,7 @@ NOINLINE static void fp12_inv(fp12 *r, const fp12 *a)
     fp12 c, t;
     fp12_conj(&c, a);
     fp12_mul(&t, a, &c);
-    fp2 b0 = t.c[0], b1 = t.c[2], b2 = t.c[4], s0, s1, s2, n, m;
+    fp2 b0 = t.c[W(0)], b1 = t.c[W(2)], b2 = t.c[W(4)], s0, s1, s2, n, m;
 
     fq_mul(&s0, &b0, &b0, 2);
     fq_mul(&m, &b1, &b2, 2);
@@ -650,20 +1129,73 @@ NOINLINE static void fp12_inv(fp12 *r, const fp12 *a)
     fq_inv(&n, &n, 2);
 
     memset(&t, 0, sizeof(t));
-    fq_mul(&t.c[0], &s0, &n, 2);
-    fq_mul(&t.c[2], &s1, &n, 2);
-    fq_mul(&t.c[4], &s2, &n, 2);
+    fq_mul(&t.c[W(0)], &s0, &n, 2);
+    fq_mul(&t.c[W(2)], &s1, &n, 2);
+    fq_mul(&t.c[W(4)], &s2, &n, 2);
     fp12_mul(r, &c, &t);
 }
 
-/* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup when x < 0. */
+/* (z + y v)^2 in Fp4 = Fp2[v]/(v^2 - xi), as t + s v. */
+static void fp4_sqr(fp2 *t, fp2 *s, const fp2 *z, const fp2 *y)
+{
+    fp2 product, sum, shifted;
+    fq_mul(&product, z, y, 2);
+    fq_add(&sum, z, y, 2);
+    fp2_mul_xi(&shifted, y);
+    fq_add(&shifted, &shifted, z, 2);
+    fq_mul(t, &sum, &shifted, 2);
+    fq_sub(t, t, &product, 2);
+    fp2_mul_xi(&shifted, &product);
+    fq_sub(t, t, &shifted, 2);
+    fq_add(s, &product, &product, 2);
+}
+
+/* *z = 3 t + 2 z when plus, else 3 t - 2 z. */
+static void cyclotomic_part(fp2 *z, const fp2 *t, bool plus)
+{
+    if (plus)
+        fq_add(z, t, z, 2);
+    else
+        fq_sub(z, t, z, 2);
+    fq_add(z, z, z, 2);
+    fq_add(z, z, t, 2);
+}
+
+/*
+ * r = a^2 for a in the cyclotomic subgroup, by Granger and Scott (ePrint 2009/565): three Fp4 squarings, 18 Fp
+ * products where a general square takes 36. The arrangement follows arkworks' cyclotomic_square, whose Fp6 parts
+ * are the even and the odd coefficients of w here.
+ */
+NOINLINE static void fp12_cyclotomic_sqr(fp12 *r, const fp12 *a)
+{
+    fp2 z0 = a->c[W(0)], z4 = a->c[W(2)], z3 = a->c[W(4)], z2 = a->c[W(1)], z1 = a->c[W(3)], z5 = a->c[W(5)];
+    fp2 t0, t1, t2, t3, t4, t5, x;
+    fp4_sqr(&t0, &t1, &z0, &z1);
+    fp4_sqr(&t2, &t3, &z2, &z3);
+    fp4_sqr(&t4, &t5, &z4, &z5);
+    cyclotomic_part(&z0, &t0, false);
+    cyclotomic_part(&z1, &t1, true);
+    fp2_mul_xi(&x, &t5);
+    cyclotomic_part(&z2, &x, true);
+    cyclotomic_part(&z3, &t4, false);
+    cyclotomic_part(&z4, &t2, false);
+    cyclotomic_part(&z5, &t3, true);
+    r->c[W(0)] = z0;
+    r->c[W(2)] = z4;
+    r->c[W(4)] = z3;
+    r->c[W(1)] = z2;
+    r->c[W(3)] = z1;
+    r->c[W(5)] = z5;
+}
+
+/* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper. */
 NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 {
     fp12 acc, base = *a;
     fp12_one(&acc);
     for (int i = 63; i >= 0; i--)
     {
-        fp12_mul(&acc, &acc, &acc);
+        fp12_cyclotomic_sqr(&acc, &acc);
         if ((C->x >> i) & 1)
             fp12_mul(&acc, &acc, &base);
     }
@@ -674,130 +1206,159 @@ NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 
 /* ---- pairing -------------------------------------------------------------------------------- */
 
-/*
- * A line through points of the twist, evaluated at the G1 point p, is cy*y_P + cx*x_P*w + c0*w^3
- * on a D-type twist and c0 + cx*x_P*w^2 + cy*y_P*w^3 on an M-type one, up to factors in Fp2 and
- * powers of w, which the final exponentiation sends to 1.
- */
-NOINLINE static void line_place(fp12 *l, const fp2 *cy, const fp2 *cx, const fp2 *c0, const point *p)
+/* Evaluates the line with coefficients cy, cx and c0 at the G1 point p. */
+static void line_eval(line *l, const fp2 *cy, const fp2 *cx, const fp2 *c0, const point *p)
 {
-    fp2 a, b;
     for (int i = 0; i < 2; i++)
     {
-        fp_mul(&a.c[i], &cy->c[i], &p->y.c[0]);
-        fp_mul(&b.c[i], &cx->c[i], &p->x.c[0]);
+        fp_mul(&l->y.c[i], &cy->c[i], &p->y.c[0]);
+        fp_mul(&l->x.c[i], &cx->c[i], &p->x.c[0]);
     }
-    memset(l, 0, sizeof(*l));
-    if (C->mtwist)
-    {
-        l->c[0] = *c0;
-        l->c[2] = b;
-        l->c[3] = a;
-    }
-    else
-    {
-        l->c[0] = a;
-        l->c[1] = b;
-        l->c[3] = *c0;
-    }
+    l->c0 = *c0;
 }
 
-/* The tangent at t = (X, Y, Z): with slope 3x^2/2y, scaled by 2y Z^6, cy = 2 Y Z^3,
-   cx = -3 X^2 Z^2 and c0 = 3 X^3 - 2 Y^2. */
-NOINLINE static void line_dbl(fp12 *l, const point *t, const point *p)
+static void fq_half(fp2 *r, const fp2 *a)
 {
-    fp2 x2, z2, cy, cx, c0, s;
-    fq_mul(&x2, &t->x, &t->x, 2);
-    fq_mul(&z2, &t->z, &t->z, 2);
-
-    fq_mul(&cy, &t->y, &z2, 2);
-    fq_mul(&cy, &cy, &t->z, 2);
-    fq_add(&cy, &cy, &cy, 2);
-
-    fq_mul(&s, &x2, &z2, 2);
-    fq_add(&cx, &s, &s, 2);
-    fq_add(&cx, &cx, &s, 2);
-    fq_neg(&cx, &cx, 2);
-
-    fq_mul(&s, &x2, &t->x, 2);
-    fq_add(&c0, &s, &s, 2);
-    fq_add(&c0, &c0, &s, 2);
-    fq_mul(&s, &t->y, &t->y, 2);
-    fq_add(&s, &s, &s, 2);
-    fq_sub(&c0, &c0, &s, 2);
-
-    line_place(l, &cy, &cx, &c0, p);
-}
-
-/* The chord through t and the affine q: with A = X Z - x_Q Z^3 and B = Y - y_Q Z^3 (the slope
-   is B/A), cy = A, cx = -B and c0 = B x_Q - A y_Q. */
-NOINLINE static void line_add(fp12 *l, const point *t, const point *q, const point *p)
-{
-    fp2 z3, a, b, c0, s;
-    fq_mul(&z3, &t->z, &t->z, 2);
-    fq_mul(&z3, &z3, &t->z, 2);
-
-    fq_mul(&a, &t->x, &t->z, 2);
-    fq_mul(&s, &q->x, &z3, 2);
-    fq_sub(&a, &a, &s, 2);
-
-    fq_mul(&s, &q->y, &z3, 2);
-    fq_sub(&b, &t->y, &s, 2);
-
-    fq_mul(&c0, &b, &q->x, 2);
-    fq_mul(&s, &q->y, &a, 2);
-    fq_sub(&c0, &c0, &s, 2);
-
-    fq_neg(&b, &b, 2);
-    line_place(l, &a, &b, &c0, p);
-}
-
-NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *p)
-{
-    fp12 l;
-    line_add(&l, t, q, p);
-    fp12_mul(f, f, &l);
-    pt_add(t, t, q, 2);
+    fp_mul(&r->c[0], &a->c[0], fp_half());
+    fp_mul(&r->c[1], &a->c[1], fp_half());
 }
 
 /*
- * Multiplies f by the Miller function of the optimal ate pairing of p (G1) and q (G2); a pair
- * with a point at infinity pairs to 1 and leaves f alone. BN254 loops over 6x + 2 and closes
- * with the lines to pi(q) and -pi^2(q). BLS12-381 loops over |x| = -x; the function of x itself
- * is the inverse of that one up to a vertical line, so every pair's value is inverted alike and
- * a product of pairings is 1 either both ways or neither.
+ * t = 2t, and the tangent at t evaluated at p, for t in homogeneous projective coordinates (x = X/Z, y = Y/Z) on the
+ * twist y^2 = x^3 + b' (Costello, Lange and Naehrig, ePrint 2009/615, as arkworks doubles): with B = Y^2, C = Z^2,
+ * E = 3 b' C, F = 3E, H = 2 Y Z, I = E - B and J = X^2, 2t = (X Y (B - F) / 2, ((B + F) / 2)^2 - 3 E^2, B H), and the
+ * tangent, scaled by -Z^2, has cy = -H, cx = 3J and c0 = I (y^2 - 3b' = 3x^3 - 2y^2 on the curve).
  */
-void pairing_add(fp12 *f, const point *g1, const point *g2)
+NOINLINE static void miller_dbl(line *l, point *t, const point *p)
 {
-    if (pt_is_inf(g1, 1) || pt_is_inf(g2, 2))
+    fp2 a, b, c, e, f, g, h, i, j, s;
+    fq_mul(&a, &t->x, &t->y, 2);
+    fq_half(&a, &a);
+    fq_mul(&b, &t->y, &t->y, 2);
+    fq_mul(&c, &t->z, &t->z, 2);
+    fq_add(&e, &c, &c, 2);
+    fq_add(&e, &e, &c, 2);
+    fq_mul(&e, &e, &C->b2, 2);
+    fq_add(&f, &e, &e, 2);
+    fq_add(&f, &f, &e, 2);
+    fq_add(&g, &b, &f, 2);
+    fq_half(&g, &g);
+    fq_add(&h, &t->y, &t->z, 2);
+    fq_mul(&h, &h, &h, 2);
+    fq_sub(&h, &h, &b, 2);
+    fq_sub(&h, &h, &c, 2);
+    fq_sub(&i, &e, &b, 2);
+    fq_mul(&j, &t->x, &t->x, 2);
+
+    fq_sub(&s, &b, &f, 2);
+    fq_mul(&t->x, &a, &s, 2);
+    fq_mul(&s, &e, &e, 2);
+    fq_mul(&t->y, &g, &g, 2);
+    fq_sub(&t->y, &t->y, &s, 2);
+    fq_sub(&t->y, &t->y, &s, 2);
+    fq_sub(&t->y, &t->y, &s, 2);
+    fq_mul(&t->z, &b, &h, 2);
+
+    fq_neg(&h, &h, 2);
+    fq_add(&s, &j, &j, 2);
+    fq_add(&s, &s, &j, 2);
+    line_eval(l, &h, &s, &i, p);
+}
+
+/*
+ * f *= the chord through t and the affine q evaluated at p, and t += q, t projective as in miller_dbl (arkworks'
+ * mixed addition): with O = Y - y_Q Z and L = X - x_Q Z (the slope is O/L), E = L^3, F = Z O^2, G = X L^2 and
+ * H = E + F - 2G, t + q = (L H, O (G - H) - E Y, Z E), and the chord, scaled by L Z, has cy = L, cx = -O and
+ * c0 = O x_Q - L y_Q. t is neither q nor -q: the loop reaches no such multiple of a point of order r.
+ */
+NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *p)
+{
+    fp2 o, el, c, d, e, g, h, s;
+    line l;
+    fq_mul(&s, &q->y, &t->z, 2);
+    fq_sub(&o, &t->y, &s, 2);
+    fq_mul(&s, &q->x, &t->z, 2);
+    fq_sub(&el, &t->x, &s, 2);
+    fq_mul(&c, &o, &o, 2);
+    fq_mul(&d, &el, &el, 2);
+    fq_mul(&e, &el, &d, 2);
+    fq_mul(&c, &t->z, &c, 2);
+    fq_mul(&g, &t->x, &d, 2);
+    fq_add(&h, &e, &c, 2);
+    fq_sub(&h, &h, &g, 2);
+    fq_sub(&h, &h, &g, 2);
+
+    fq_mul(&t->x, &el, &h, 2);
+    fq_sub(&s, &g, &h, 2);
+    fq_mul(&s, &s, &o, 2);
+    fq_mul(&g, &e, &t->y, 2);
+    fq_sub(&t->y, &s, &g, 2);
+    fq_mul(&t->z, &t->z, &e, 2);
+
+    fq_mul(&s, &o, &q->x, 2);
+    fq_mul(&g, &el, &q->y, 2);
+    fq_sub(&s, &s, &g, 2);
+    fq_neg(&o, &o, 2);
+    line_eval(&l, &el, &o, &s, p);
+    fp12_mul_line(f, &l);
+}
+
+/*
+ * Multiplies f by the Miller functions of the optimal ate pairing of each pair g1[i] (G1) and
+ * g2[i] (G2), at most PairingBatch of them, in one loop that squares its accumulator once a step
+ * for all; a pair with a point at infinity pairs to 1 and leaves f alone. BN254 loops over 6x + 2
+ * and closes with the lines to pi(q) and -pi^2(q). BLS12-381 loops over |x| = -x; the function of
+ * x itself is the inverse of that one up to a vertical line, so every pair's value is inverted
+ * alike and a product of pairings is 1 either both ways or neither.
+ */
+void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
+{
+    point pa[PairingBatch], qa[PairingBatch], t[PairingBatch];
+    int k = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (pt_is_inf(&g1[i], 1) || pt_is_inf(&g2[i], 2))
+            continue;
+        pa[k] = g1[i];
+        qa[k] = g2[i];
+        pt_set_affine(&pa[k], 1);
+        pt_set_affine(&qa[k], 2);
+        t[k] = qa[k];
+        k++;
+    }
+    if (k == 0)
         return;
-    fp12 acc, l;
-    point pa = *g1, qa = *g2;
-    pt_set_affine(&pa, 1);
-    pt_set_affine(&qa, 2);
-    const point *p = &pa, *q = &qa;
-    point t = qa;
+    fp12 acc;
+    line l;
     fp12_one(&acc);
     int top = 8 * (int)sizeof(C->loop) - 1;
     while (!((C->loop[sizeof(C->loop) - 1 - top / 8] >> (top % 8)) & 1))
         top--;
     for (int i = top - 1; i >= 0; i--)
     {
-        fp12_mul(&acc, &acc, &acc);
-        line_dbl(&l, &t, p);
-        fp12_mul(&acc, &acc, &l);
-        pt_dbl(&t, &t, 2);
+        /* The first square is of 1. */
+        if (i != top - 1)
+            fp12_mul(&acc, &acc, &acc);
+        for (int j = 0; j < k; j++)
+        {
+            miller_dbl(&l, &t[j], &pa[j]);
+            fp12_mul_line(&acc, &l);
+        }
         if ((C->loop[sizeof(C->loop) - 1 - i / 8] >> (i % 8)) & 1)
-            miller_add(&acc, &t, q, p);
+            for (int j = 0; j < k; j++)
+                miller_add(&acc, &t[j], &qa[j], &pa[j]);
     }
     if (!C->mtwist)
     {
-        point q1, q2;
-        pt_frob(&q1, q, false);
-        pt_frob(&q2, &q1, false);
-        pt_neg(&q2, &q2, 2);
-        miller_add(&acc, &t, &q1, p);
-        miller_add(&acc, &t, &q2, p);
+        for (int j = 0; j < k; j++)
+        {
+            point q1, q2;
+            pt_frob(&q1, &qa[j], false);
+            pt_frob(&q2, &q1, false);
+            pt_neg(&q2, &q2, 2);
+            miller_add(&acc, &t[j], &q1, &pa[j]);
+            miller_add(&acc, &t[j], &q2, &pa[j]);
+        }
     }
     fp12_mul(f, f, &acc);
 }
@@ -811,12 +1372,12 @@ NOINLINE static void bn_hard(fp12 *r, const fp12 *f)
     fp12 y1, y3, y4, y8, y9, t;
     fp12_pow_x(&t, f);
     fp12_conj(&t, &t);
-    fp12_mul(&y1, &t, &t);
-    fp12_mul(&y3, &y1, &y1);
+    fp12_cyclotomic_sqr(&y1, &t);
+    fp12_cyclotomic_sqr(&y3, &y1);
     fp12_mul(&y3, &y3, &y1);
     fp12_pow_x(&y4, &y3);
     fp12_conj(&y4, &y4);
-    fp12_mul(&t, &y4, &y4);
+    fp12_cyclotomic_sqr(&t, &y4);
     fp12_pow_x(&t, &t);
     fp12_mul(&y8, &t, &y4);
     fp12_conj(&t, &y3);
@@ -860,7 +1421,7 @@ NOINLINE static void bls_hard(fp12 *r, const fp12 *f)
     fp12_mul(&t, &t, &a);
     fp12_conj(&b, &b);
     fp12_mul(&t, &t, &b);
-    fp12_mul(&a, f, f);
+    fp12_cyclotomic_sqr(&a, f);
     fp12_mul(&a, &a, f);
     fp12_mul(r, &t, &a);
 }

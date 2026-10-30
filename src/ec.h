@@ -3,7 +3,7 @@
  *
  * Both curves are y^2 = x^3 + b over a prime field with a pairing-friendly sextic twist, so one
  * implementation serves both, parameterised by the curve table in use (ec_use):
- *   - Fp: Montgomery arithmetic on 32-bit limbs, 8 limbs for BN254 and 12 for BLS12-381;
+ *   - Fp: Montgomery arithmetic on the u256 delegation, 8 limbs for BN254 and 12 for BLS12-381;
  *   - Fp2 = Fp[u]/(u^2 + 1), the same for both;
  *   - Fp12 = Fp2[w]/(w^6 - xi), flat rather than towered, with xi = 9 + u (BN254) or 1 + u
  *     (BLS12-381), so one schoolbook product covers both;
@@ -19,13 +19,15 @@
 
 enum
 {
-    FpMaxLimbs = 12
+    FpMaxLimbs = 16
 };
 
+/* Little-endian limbs in Montgomery form, as two 256-bit digits aligned for the u256 delegation; for
+   BN254 only the first is in use, and for BLS12-381 the limbs past the twelfth are zero. */
 typedef struct
 {
-    uint32_t l[FpMaxLimbs]; /* little-endian limbs, Montgomery form; limbs past n are zero */
-} fp;
+    uint32_t l[FpMaxLimbs];
+} __attribute__((aligned(32))) fp;
 
 typedef struct
 {
@@ -61,9 +63,13 @@ typedef struct
 
 extern const curve *C;
 
+/* Readies the field constants of the curve in use; ec_use calls it, so the field operations need not. */
+void ec_prepare(void);
+
 static inline void ec_use(const curve *cv)
 {
     C = cv;
+    ec_prepare();
 }
 
 void fp_add(fp *r, const fp *a, const fp *b);
@@ -98,7 +104,13 @@ bool pt_load(point *p, const uint8_t *in, int d, bool swap);
 void pt_store(uint8_t *out, const point *p, int d, bool swap);
 void pt_frob(point *r, const point *p, bool inverse);
 
-void pairing_add(fp12 *f, const point *p, const point *q);
+/* The most pairs pairing_add_batch takes. */
+enum
+{
+    PairingBatch = 4
+};
+
+void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count);
 bool pairing_is_one(fp12 *f);
 void fp12_one(fp12 *r);
 

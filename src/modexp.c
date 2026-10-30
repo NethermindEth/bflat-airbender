@@ -6,6 +6,7 @@
  * buffer static: the runtime has no allocator to lend. Larger operands fail.
  */
 
+#include "u256.h"
 #include "zkvm.h"
 
 enum
@@ -126,6 +127,146 @@ static void mul_mod(uint32_t *r, const uint32_t *a, const uint32_t *b, const uin
     reduce(r, Product, 2 * mLen, m, mLen);
 }
 
+/*
+ * An odd modulus of at most 1024 bits: Montgomery exponentiation on the u256 delegation, R = 2^(256 k)
+ * for k 256-bit digits, by 4-bit windows. A product accumulates digit by digit in T, 2k + 1 digits, and
+ * every row adds the multiple of the modulus that clears its lowest digit (CIOS on 256-bit words). R mod m
+ * and R^2 mod m come from the division above.
+ */
+enum
+{
+    MaxDigits = 4
+};
+
+static u256d MontN[MaxDigits], MontNPrime, MontZero2, MontX, MontM2, MontT[2 * MaxDigits + 1], MontD[MaxDigits + 1];
+static u256d MontTable[16][MaxDigits], MontValue[MaxDigits], MontR2[MaxDigits], MontOne[MaxDigits];
+
+/* T[d..] += *v. */
+static void accumulate_digit(int d, const u256d *v)
+{
+    uint32_t carry = u256_op(&MontT[d], v, U256_ADD);
+    while (carry)
+        carry = u256_op(&MontT[++d], &MontZero2, U256_ADD | U256_CARRY);
+}
+
+/* r = a b / R mod N, for a, b < N; r may alias a or b. */
+static void mont_mul_k(u256d *r, const u256d *a, const u256d *b, int k)
+{
+    for (int d = 0; d <= 2 * k; d++)
+        u256_op(&MontT[d], &MontZero2, U256_MEMCOPY);
+    for (int i = 0; i < k; i++)
+    {
+        for (int j = 0; j < k; j++)
+        {
+            u256_op(&MontX, &a[j], U256_MEMCOPY);
+            u256_op(&MontX, &b[i], U256_MUL_LOW);
+            accumulate_digit(i + j, &MontX);
+            u256_op(&MontX, &a[j], U256_MEMCOPY);
+            u256_op(&MontX, &b[i], U256_MUL_HIGH);
+            accumulate_digit(i + j + 1, &MontX);
+        }
+        u256_op(&MontM2, &MontT[i], U256_MEMCOPY);
+        u256_op(&MontM2, &MontNPrime, U256_MUL_LOW);
+        for (int j = 0; j < k; j++)
+        {
+            u256_op(&MontX, &MontM2, U256_MEMCOPY);
+            u256_op(&MontX, &MontN[j], U256_MUL_LOW);
+            accumulate_digit(i + j, &MontX);
+            u256_op(&MontX, &MontM2, U256_MEMCOPY);
+            u256_op(&MontX, &MontN[j], U256_MUL_HIGH);
+            accumulate_digit(i + j + 1, &MontX);
+        }
+    }
+
+    /* The result, T[k..2k], is below 2N: subtract N once when that does not borrow. */
+    uint32_t borrow = 0;
+    for (int d = 0; d < k; d++)
+    {
+        u256_op(&MontD[d], &MontT[k + d], U256_MEMCOPY);
+        borrow = u256_op(&MontD[d], &MontN[d], U256_SUB | (borrow ? U256_CARRY : 0));
+    }
+    const u256d *src = (borrow && u256_op(&MontT[2 * k], &MontZero2, U256_EQ)) ? &MontT[k] : MontD;
+    for (int d = 0; d < k; d++)
+        u256_op(&r[d], &src[d], U256_MEMCOPY);
+}
+
+static void load_digits(u256d *r, const uint32_t *limbs, size_t len, int k)
+{
+    for (int d = 0; d < k; d++)
+        for (int w = 0; w < 8; w++)
+        {
+            size_t i = (size_t)(8 * d + w);
+            r[d].w[w] = i < len ? limbs[i] : 0;
+        }
+}
+
+static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp, size_t exp_len, size_t mLen)
+{
+    int k = (int)((mLen + 7) / 8);
+    load_digits(MontN, ModLimbs, mLen, k);
+
+    /* -N^-1 mod 2^256 by Newton on the low digit: it is its own inverse mod 8, and each step doubles the bits. */
+    static u256d x, t, two;
+    x = MontN[0];
+    for (int step = 0; step < 7; step++)
+    {
+        t = MontN[0];
+        u256_op(&t, &x, U256_MUL_LOW);
+        two = (u256d){{2}};
+        u256_op(&two, &t, U256_SUB);
+        u256_op(&x, &two, U256_MUL_LOW);
+    }
+    MontNPrime = (u256d){{0}};
+    u256_op(&MontNPrime, &x, U256_SUB);
+
+    /* R and R^2 mod N. */
+    size_t rLimbs = (size_t)(8 * k);
+    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
+    Product[rLimbs] = 1;
+    reduce(Acc, Product, rLimbs + 1, ModLimbs, mLen);
+    load_digits(MontOne, Acc, mLen, k);
+    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
+    Product[2 * rLimbs] = 1;
+    reduce(Acc, Product, 2 * rLimbs + 1, ModLimbs, mLen);
+    load_digits(MontR2, Acc, mLen, k);
+
+    load_digits(MontValue, base, mLen, k);
+    for (int d = 0; d < k; d++)
+        MontTable[0][d] = MontOne[d];
+    mont_mul_k(MontTable[1], MontValue, MontR2, k);
+    for (int i = 2; i < 16; i++)
+        mont_mul_k(MontTable[i], MontTable[i - 1], MontTable[1], k);
+
+    for (int d = 0; d < k; d++)
+        MontValue[d] = MontOne[d];
+    int started = 0;
+    for (size_t i = 0; i < exp_len; i++)
+    {
+        for (int half = 1; half >= 0; half--)
+        {
+            uint32_t bits = (exp[i] >> (4 * half)) & 15;
+            if (started)
+            {
+                for (int s = 0; s < 4; s++)
+                    mont_mul_k(MontValue, MontValue, MontValue, k);
+            }
+            if (bits)
+            {
+                mont_mul_k(MontValue, MontValue, MontTable[bits], k);
+                started = 1;
+            }
+        }
+    }
+
+    /* Out of the domain: times 1. */
+    static u256d one[MaxDigits];
+    for (int d = 0; d < k; d++)
+        one[d] = (u256d){{d == 0 ? 1u : 0u}};
+    mont_mul_k(MontValue, MontValue, one, k);
+    for (size_t i = 0; i < mLen; i++)
+        acc[i] = MontValue[i / 8].w[i % 8];
+}
+
 zkvm_status zkvm_modexp(const uint8_t *base, size_t base_len, const uint8_t *exp, size_t exp_len,
                         const uint8_t *modulus, size_t mod_len, uint8_t *output)
 {
@@ -140,17 +281,24 @@ zkvm_status zkvm_modexp(const uint8_t *base, size_t base_len, const uint8_t *exp
     size_t baseLen = load(Product, 2 * MaxLimbs + 1, base, base_len);
     reduce(Base, Product, baseLen, ModLimbs, mLen);
 
-    /* 1 mod m: zero when m is 1. */
-    memset(Acc, 0, mLen * sizeof(uint32_t));
-    Acc[0] = (mLen == 1 && ModLimbs[0] == 1) ? 0 : 1;
-
-    for (size_t i = 0; i < exp_len; i++)
+    if (mLen <= 8 * MaxDigits && (ModLimbs[0] & 1) && !(mLen == 1 && ModLimbs[0] == 1))
     {
-        for (int bit = 7; bit >= 0; bit--)
+        modexp_mont(Acc, Base, exp, exp_len, mLen);
+    }
+    else
+    {
+        /* 1 mod m: zero when m is 1. */
+        memset(Acc, 0, mLen * sizeof(uint32_t));
+        Acc[0] = (mLen == 1 && ModLimbs[0] == 1) ? 0 : 1;
+
+        for (size_t i = 0; i < exp_len; i++)
         {
-            mul_mod(Acc, Acc, Acc, ModLimbs, mLen);
-            if ((exp[i] >> bit) & 1)
-                mul_mod(Acc, Acc, Base, ModLimbs, mLen);
+            for (int bit = 7; bit >= 0; bit--)
+            {
+                mul_mod(Acc, Acc, Acc, ModLimbs, mLen);
+                if ((exp[i] >> bit) & 1)
+                    mul_mod(Acc, Acc, Base, ModLimbs, mLen);
+            }
         }
     }
 

@@ -14,8 +14,9 @@ static const uint64_t RoundConstants[24] = {
 #define ROL(v, n) (((v) << (n)) | ((v) >> (64 - (n))))
 
 /* One round body unrolled over named lanes (lane i = x + 5y), the round loop kept: with no rotate
- * instruction and 32-bit registers, indexed loops over the state cost several times the work. */
-void keccak_f1600(uint64_t s[25])
+ * instruction and 32-bit registers, indexed loops over the state cost several times the work.
+ * The permutation where the platform has no Keccak delegation (keccak_f1600 is the platform's). */
+void keccak_f1600_soft(uint64_t s[25])
 {
     uint64_t a00 = s[0], a01 = s[1], a02 = s[2], a03 = s[3], a04 = s[4];
     uint64_t a05 = s[5], a06 = s[6], a07 = s[7], a08 = s[8], a09 = s[9];
@@ -113,6 +114,10 @@ void syscall_keccak_f(uint64_t state[25])
 
 zkvm_status zkvm_keccak256(const uint8_t *data, size_t len, uint8_t output[32])
 {
+#ifdef AIRBENDER
+    airbender_keccak256(data, len, output);
+    return ZKVM_EOK;
+#else
     enum { Rate = 136 };
     uint64_t state[25] = {0};
     uint8_t block[Rate];
@@ -145,4 +150,5 @@ zkvm_status zkvm_keccak256(const uint8_t *data, size_t len, uint8_t output[32])
         for (int b = 0; b < 8; b++)
             output[i * 8 + b] = (uint8_t)(state[i] >> (8 * b));
     return ZKVM_EOK;
+#endif
 }

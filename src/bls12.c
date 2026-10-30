@@ -16,7 +16,8 @@
 
 #include "ec.h"
 
-static const curve Bls12 = {
+/* In RAM, where the delegation reads its operands. */
+static curve Bls12 = {
     .n = 12,
     .inv = 0xfffcfffd,
     .p = {{0xffffaaab, 0xb9feffff, 0xb153ffff, 0x1eabfffe, 0xf6b0f624, 0x6730d2a0, 0xf38512bf, 0x64774b84, 0x434bacd7, 0x4b1ba7b6, 0x397fe69a, 0x1a0111ea}},
@@ -39,7 +40,7 @@ enum
 };
 
 /* A primitive cube root of unity: (x, y) -> (beta x, y) acts on G1 as multiplication by -x^2. */
-static const fp Beta = {{0x798a64e8, 0x30f1361b, 0x7ece5a2a, 0xf3b8ddab, 0xc61577f7, 0x16a8ca3a, 0x74fd029b, 0xc26a2ff8, 0x60701c6e, 0x3636b766, 0x241b6160, 0x051ba4ab}};
+static fp Beta = {{0x798a64e8, 0x30f1361b, 0x7ece5a2a, 0xf3b8ddab, 0xc61577f7, 0x16a8ca3a, 0x74fd029b, 0xc26a2ff8, 0x60701c6e, 0x3636b766, 0x241b6160, 0x051ba4ab}};
 
 static bool g1_in_group(const point *p)
 {
@@ -134,13 +135,17 @@ zkvm_status zkvm_bls12_pairing(const uint8_t *pairs, size_t num_pairs, bool *ver
     fp12 f;
     fp12_one(&f);
     *verified = false;
-    for (size_t i = 0; i < num_pairs; i++)
+    for (size_t i = 0; i < num_pairs; i += PairingBatch)
     {
-        point p, q;
-        const uint8_t *in = pairs + 288 * i;
-        if (!load(&p, in, 1, true) || !load(&q, in + 96, 2, true))
-            return ZKVM_EFAIL;
-        pairing_add(&f, &p, &q);
+        point p[PairingBatch], q[PairingBatch];
+        int count = num_pairs - i < PairingBatch ? (int)(num_pairs - i) : PairingBatch;
+        for (int j = 0; j < count; j++)
+        {
+            const uint8_t *in = pairs + 288 * (i + j);
+            if (!load(&p[j], in, 1, true) || !load(&q[j], in + 96, 2, true))
+                return ZKVM_EFAIL;
+        }
+        pairing_add_batch(&f, p, q, count);
     }
     *verified = pairing_is_one(&f);
     return ZKVM_EOK;
@@ -314,7 +319,8 @@ static void poly(fp2 *r, const fp *table, int len, const fp2 *x, int d)
 }
 
 /* map_to_curve: the simplified SWU map (RFC 9380 section 6.6.2, not constant time) followed by
-   the isogeny; an exceptional input mapping to a zero denominator gives the point at infinity. */
+   the isogeny, as a Jacobian point; an exceptional input mapping to a zero denominator gives the point
+   at infinity. */
 static void map_to_curve(point *r, const fp2 *u, int d)
 {
     const isogeny *m = &Maps[d - 1];
@@ -324,6 +330,17 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     coef(&z, m->abz, 2, d);
     memset(&one, 0, sizeof(one));
     one.c[0] = C->one;
+
+    /* -b/a of each map, formed once: an inverse is an exponentiation. */
+    static fp2 minus_b_over_a[2];
+    static bool have_minus_b_over_a[2];
+    if (!have_minus_b_over_a[d - 1])
+    {
+        fq_inv(&minus_b_over_a[d - 1], &a, d);
+        fq_mul(&minus_b_over_a[d - 1], &minus_b_over_a[d - 1], &b, d);
+        fq_neg(&minus_b_over_a[d - 1], &minus_b_over_a[d - 1], d);
+        have_minus_b_over_a[d - 1] = true;
+    }
 
     fq_mul(&t, u, u, d);
     fq_mul(&t, &t, &z, d);
@@ -339,10 +356,7 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     {
         fq_inv(&tv, &tv, d);
         fq_add(&tv, &tv, &one, d);
-        fq_inv(&x, &a, d);
-        fq_mul(&x, &x, &b, d);
-        fq_neg(&x, &x, d);
-        fq_mul(&x, &x, &tv, d);
+        fq_mul(&x, &minus_b_over_a[d - 1], &tv, d);
     }
     sswu_g(&gx, &x, &a, &b, d);
     if (!fq_sqrt(&y, &gx, d))
@@ -354,29 +368,31 @@ static void map_to_curve(point *r, const fp2 *u, int d)
     if (sgn0(u, d) != sgn0(&y, d))
         fq_neg(&y, &y, d);
 
-    fp2 num, den;
+    /* The isogeny gives x = xn / xd and y = y yn / yd; with Z = xd yd that is the Jacobian point
+       (xn xd yd^2, y yn xd^3 yd^2, Z), which no inverse forms. */
+    fp2 xn, xd, yn, yd, yd2, xd3;
     const fp *k = m->iso;
-    memset(r, 0, sizeof(*r));
-    poly(&num, k, m->len[0], &x, d);
+    poly(&xn, k, m->len[0], &x, d);
     k += m->len[0] * d;
-    poly(&den, k, m->len[1], &x, d);
+    poly(&xd, k, m->len[1], &x, d);
     k += m->len[1] * d;
-    if (fq_is_zero(&den, d))
-        return;
-    fq_inv(&den, &den, d);
-    fq_mul(&r->x, &num, &den, d);
-    poly(&num, k, m->len[2], &x, d);
+    poly(&yn, k, m->len[2], &x, d);
     k += m->len[2] * d;
-    poly(&den, k, m->len[3], &x, d);
-    if (fq_is_zero(&den, d))
+    poly(&yd, k, m->len[3], &x, d);
+    fq_mul(&r->z, &xd, &yd, d);
+    if (fq_is_zero(&r->z, d))
     {
         memset(r, 0, sizeof(*r));
         return;
     }
-    fq_inv(&den, &den, d);
-    fq_mul(&r->y, &num, &den, d);
-    fq_mul(&r->y, &r->y, &y, d);
-    r->z = one;
+    fq_mul(&yd2, &yd, &yd, d);
+    fq_mul(&r->x, &xn, &xd, d);
+    fq_mul(&r->x, &r->x, &yd2, d);
+    fq_mul(&xd3, &xd, &xd, d);
+    fq_mul(&xd3, &xd3, &xd, d);
+    fq_mul(&r->y, &y, &yn, d);
+    fq_mul(&r->y, &r->y, &xd3, d);
+    fq_mul(&r->y, &r->y, &yd2, d);
 }
 
 zkvm_status zkvm_bls12_map_fp_to_g1(const uint8_t field_element[48], uint8_t result[96])
@@ -545,8 +561,8 @@ zkvm_status zkvm_kzg_point_eval(const uint8_t commitment[48], const uint8_t z[32
 
     fp12 f;
     fp12_one(&f);
-    pairing_add(&f, &c, &g);
-    pairing_add(&f, &pi, &q);
+    point g1s[2] = {c, pi}, g2s[2] = {g, q};
+    pairing_add_batch(&f, g1s, g2s, 2);
     *verified = pairing_is_one(&f);
     return ZKVM_EOK;
 }

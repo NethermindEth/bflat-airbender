@@ -1,4 +1,4 @@
-/* RIPEMD-160. The 20-byte digest is returned left-aligned in a 32-byte buffer, the rest zero. */
+/* RIPEMD-160. The 20-byte digest is returned right-aligned in a 32-byte buffer, as the EVM precompile returns it. */
 
 #include "zkvm.h"
 
@@ -99,6 +99,6 @@ zkvm_status zkvm_ripemd160(const uint8_t *data, size_t len, uint8_t output[32])
     memset(output, 0, 32);
     for (int i = 0; i < 5; i++)
         for (int b = 0; b < 4; b++)
-            output[4 * i + b] = (uint8_t)(h[i] >> (8 * b));
+            output[12 + 4 * i + b] = (uint8_t)(h[i] >> (8 * b));
     return ZKVM_EOK;
 }

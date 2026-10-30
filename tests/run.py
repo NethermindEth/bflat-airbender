@@ -101,16 +101,16 @@ h32 = lambda v: v.to_bytes(32, "big").hex()
 
 cases = []  # (line, expected)
 
-for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range(40)] + [bytes(136), bytes(272)]:
+for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 400)) for _ in range(40)] + [rng.randbytes(n) for n in (55, 56, 63, 64, 64, 65, 119, 120, 128)] + [bytes(64), bytes(136), bytes(272)]:
     arg = data.hex() or "-"
     cases.append((f"keccak {arg}", keccak256(data).hex()))
     cases.append((f"sha256 {arg}", hashlib.sha256(data).hexdigest()))
 try:
     for data in [b"", b"abc"] + [rng.randbytes(rng.randrange(0, 300)) for _ in range(20)]:
-        cases.append((f"ripemd {data.hex() or '-'}", hashlib.new("ripemd160", data).hexdigest() + "00" * 12))
+        cases.append((f"ripemd {data.hex() or '-'}", "00" * 12 + hashlib.new("ripemd160", data).hexdigest()))
 except ValueError:
-    cases.append(("ripemd -", "9c1185a5c5e9fc54612808977ee8f548b2258d31" + "00" * 12))
-    cases.append(("ripemd 616263", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc" + "00" * 12))
+    cases.append(("ripemd -", "00" * 12 + "9c1185a5c5e9fc54612808977ee8f548b2258d31"))
+    cases.append(("ripemd 616263", "00" * 12 + "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"))
 
 # blake2b("abc") is one F call with the final flag, rounds 12, over the parameter-xored IV.
 iv = [0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
@@ -122,9 +122,12 @@ for msg in [b"abc", b"", rng.randbytes(100)]:
     inp += msg.ljust(128, b"\x00") + len(msg).to_bytes(8, "little") + bytes(8) + b"\x01"
     cases.append((f"blake2f {inp.hex()}", hashlib.blake2b(msg).hexdigest()))
 
-for _ in range(12):
-    d = rng.randrange(1, K1.n)
-    h = rng.randrange(0, 2**256)
+# Random keys and hashes, then the edge keys and hashes: the GLV split and the wNAF tables see
+# every shape of scalar, including u1 = 0 (hash 0 or n).
+k1_cases = [(rng.randrange(1, K1.n), rng.randrange(0, 2**256)) for _ in range(200)]
+k1_cases += [(d, rng.randrange(0, 2**256)) for d in (1, 2, 3, K1.n - 1, K1.n - 2)]
+k1_cases += [(rng.randrange(1, K1.n), h) for h in (0, K1.n, 2**256 - 1)]
+for d, h in k1_cases:
     r, s, recid = sign(K1, d, h % K1.n)
     Q = K1.mul(d, K1.g)
     cases.append((f"ecrecover {h32(h)} {h32(r)}{h32(s)} {recid:02x}", h32(Q[0]) + h32(Q[1])))
@@ -136,6 +139,30 @@ cases.append((f"ecrecover {h32(1)} {h32(1)}{h32(1)} 04", "fail"))
 # x = 5 is not on secp256k1 (5^3 + 7 = 132 is a non-residue mod p).
 cases.append((f"ecrecover {h32(1)} {h32(5)}{h32(1)} 00",
               "fail" if pow(132, (K1.p - 1) // 2, K1.p) != 1 else None))
+
+
+# The same recoveries in batches, the failing signatures among them: each item gives what its own call gives.
+# 600 items cross the native side's 512-signature chunk.
+def ecrecover_batch(items):
+    msgs = "".join(m for m, _, _, _ in items)
+    sigs = "".join(sg for _, sg, _, _ in items)
+    recids = "".join(rc for _, _, rc, _ in items)
+    return (f"ecrecoverbatch {msgs} {sigs} {recids}", ",".join(e for _, _, _, e in items))
+
+
+k1_items = [tuple(line.split()[1:4]) + (expected,) for line, expected in cases if line.startswith("ecrecover ") and expected]
+bad = [item for item in k1_items if item[3] == "fail"]
+good = [item for item in k1_items if item[3] != "fail"]
+cases.append(ecrecover_batch(good[:1]))
+cases.append(ecrecover_batch(bad[:1] + good[:1]))
+cases.append(ecrecover_batch(bad[:2]))
+mixed = []
+for i, item in enumerate(good):
+    mixed.append(item)
+    if i % 50 == 7:
+        mixed.append(bad[i % len(bad)])
+cases.append(ecrecover_batch(mixed))
+cases.append(ecrecover_batch((mixed * 2)[:600]))
 
 for _ in range(6):
     d = rng.randrange(1, R1.n)
@@ -159,6 +186,18 @@ for ml in (128, 256, 512):
     b, e, m = rng.randbytes(ml), rng.randbytes(8), rng.randbytes(ml)
     exp = pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), int.from_bytes(m, "big")).to_bytes(ml, "big").hex()
     cases.append((f"modexp {b.hex()} {e.hex()} {m.hex()}", exp))
+# Odd moduli of up to 1024 bits take the Montgomery path: every length, exponents with leading zeros and of
+# one bit, bases above the modulus.
+for mbytes in list(range(1, 33)) + [32, 32, 33, 48, 63, 64, 64, 65, 96, 127, 128, 128]:
+    m = rng.randrange(1, 256 ** mbytes) | 1
+    if m == 1:
+        m = 3
+    for b, e in [(rng.randrange(0, 256 ** 40), rng.randrange(0, 256 ** 32)), (rng.randrange(0, m), 1),
+                 (rng.randrange(0, m), 0), (m + 5, rng.randrange(0, 256 ** 3))]:
+        bb = b.to_bytes(max(1, (b.bit_length() + 7) // 8), "big")
+        eb = e.to_bytes(32, "big")
+        mb = m.to_bytes(mbytes, "big")
+        cases.append((f"modexp {bb.hex()} {eb.hex()} {mb.hex()}", pow(b, e, m).to_bytes(mbytes, "big").hex()))
 
 # BN254, BLS12-381 and KZG: precompile vectors and py_ecc cases built by gen_vectors.py.
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors", "ec.txt")) as f:

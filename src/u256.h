@@ -30,6 +30,18 @@ enum
     U256_MEMCOPY = 1u << 7 /* a = b */
 };
 
+#ifdef AIRBENDER
+/* Inline, as the delegation itself is one instruction: a call would cost several times it. */
+static inline uint32_t u256_op(u256d *a, const u256d *b, uint32_t op)
+{
+    register uint32_t x10 __asm__("a0") = (uint32_t)a;
+    register uint32_t x11 __asm__("a1") = (uint32_t)b;
+    register uint32_t x12 __asm__("a2") = op;
+    __asm__ volatile("csrrw x0, 0x7ca, x0" : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
+    return x12;
+}
+#else
 uint32_t u256_op(u256d *a, const u256d *b, uint32_t op);
+#endif
 
 #endif

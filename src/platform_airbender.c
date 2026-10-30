@@ -31,20 +31,356 @@ static inline void csr_write(uint32_t value)
     __asm__ volatile("csrrw x0, 0x7c0, %0" : : "r"(value));
 }
 
-uint32_t u256_op(u256d *a, const u256d *b, uint32_t op)
+/* Airbender v3's Keccak-f[1600] delegation (common_constants delegation_types/keccak_f1600.rs): per
+ * round five column-parity (CSR 0x7cd), five theta/rho (0x7cc) and five chi (0x7ce) calls, then one
+ * column-parity call for the delayed final iota. x10 carries the call's control word, 0 at the
+ * start, and x11 the state: the 25 lanes, the five column parities and scratch, 256-byte aligned
+ * in RAM. The transpiler recognizes the run by its first CSR and its length, so it is one asm
+ * block. */
+#define KECCAK_COLUMN_PARITY "csrrw x0, 0x7cd, x0\n"
+#define KECCAK_THETA_RHO "csrrw x0, 0x7cc, x0\n"
+#define KECCAK_CHI "csrrw x0, 0x7ce, x0\n"
+#define KECCAK_FIVE(call) call call call call call
+#define KECCAK_ROUND KECCAK_FIVE(KECCAK_COLUMN_PARITY) KECCAK_FIVE(KECCAK_THETA_RHO) KECCAK_FIVE(KECCAK_CHI)
+#define KECCAK_FOUR_ROUNDS KECCAK_ROUND KECCAK_ROUND KECCAK_ROUND KECCAK_ROUND
+
+static uint64_t KeccakState[32] __attribute__((aligned(256)));
+
+/* 25 lanes as 50 word moves: the state is at least word aligned, and a call to memcpy costs
+ * half as much again in its loop. */
+static inline __attribute__((always_inline)) void copy_lanes(uint64_t *to, const uint64_t *from)
 {
-    register uint32_t x10 __asm__("a0") = (uint32_t)a;
-    register uint32_t x11 __asm__("a1") = (uint32_t)b;
-    register uint32_t x12 __asm__("a2") = op;
-    __asm__ volatile("csrrw x0, 0x7ca, x0" : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
-    return x12;
+    uint32_t *t = (uint32_t *)to;
+    const uint32_t *f = (const uint32_t *)from;
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 50; i++)
+        t[i] = f[i];
+}
+
+/* Keccak-f[1600] in place on the delegation's state at `state`. */
+static inline __attribute__((always_inline)) void permute_at(uint64_t *state)
+{
+    register uint32_t x11 __asm__("a1") = (uint32_t)state;
+    __asm__ volatile("add x10, x0, x0\n"
+                     KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
+                     KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
+                     KECCAK_COLUMN_PARITY
+                     :
+                     : "r"(x11)
+                     : "a0", "memory");
+}
+
+static inline __attribute__((always_inline)) void permute(void)
+{
+    permute_at(KeccakState);
+}
+
+void keccak_f1600(uint64_t state[25])
+{
+    copy_lanes(KeccakState, state);
+    permute();
+    copy_lanes(state, KeccakState);
+}
+
+/* Keccak-f[1600] on a caller's state in place, with no copies: 256-byte aligned in RAM, its lanes 25-31
+ * left to the delegation's column parities and scratch. */
+void airbender_keccak_f1600_in_place(uint64_t state[32])
+{
+    permute_at(state);
+}
+
+enum
+{
+    RateWords = 34 /* 136 bytes */
+};
+
+/* XORs the `words` words at data into the rate. Misaligned data is read as the aligned words that
+ * cover it, each output word merged from two of them; the last of those words may run up to three bytes
+ * past the data, within its own aligned word. */
+static inline __attribute__((always_inline)) void absorb_words(const uint8_t *data, int words, int overwrite)
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+    uint32_t misalignment = (uintptr_t)data & 3;
+    /* A loop each for writing and XORing: the compiler keeps the test of `overwrite` in the loop. */
+    if (misalignment == 0)
+    {
+        const uint32_t *w = (const uint32_t *)data;
+        if (overwrite)
+        {
+#pragma clang loop unroll_count(8)
+            for (int i = 0; i < words; i++)
+                s[i] = w[i];
+        }
+        else
+        {
+#pragma clang loop unroll_count(8)
+            for (int i = 0; i < words; i++)
+                s[i] ^= w[i];
+        }
+        return;
+    }
+    const uint32_t *w = (const uint32_t *)(data - misalignment);
+    uint32_t low = 8 * misalignment, high = 32 - low;
+    uint32_t current = w[0];
+    if (overwrite)
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = 0; i < words; i++)
+        {
+            uint32_t next = w[i + 1];
+            s[i] = (current >> low) | (next << high);
+            current = next;
+        }
+    }
+    else
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = 0; i < words; i++)
+        {
+            uint32_t next = w[i + 1];
+            s[i] ^= (current >> low) | (next << high);
+            current = next;
+        }
+    }
+}
+
+/* Keccak-256 of the len bytes at data into out, absorbed straight into the delegation's state. The first
+ * block is written over the rate rather than XORed into zeros, so only the capacity, and any rate word a
+ * short input leaves, starts at zero. */
+__attribute__((noinline)) static void keccak256_long(const uint8_t *data, size_t len, uint8_t out[32])
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+#pragma clang loop unroll(full)
+    for (int i = RateWords; i < 50; i++)
+        s[i] = 0;
+    int first = 1;
+    while (len >= 4 * RateWords)
+    {
+        absorb_words(data, RateWords, first);
+        first = 0;
+        permute();
+        data += 4 * RateWords;
+        len -= 4 * RateWords;
+    }
+
+    /* The tail's whole words, then its last bytes with the 0x01 pad byte above them, and the final 0x80. */
+    int words = (int)(len >> 2);
+    absorb_words(data, words, first);
+    if (first)
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = words; i < RateWords; i++)
+            s[i] = 0;
+    }
+    uint32_t rest = len & 3, last = 0;
+    for (uint32_t b = 0; b < rest; b++)
+        last |= (uint32_t)data[4 * words + b] << (8 * b);
+    s[words] ^= last ^ (1u << (8 * rest));
+    s[RateWords - 1] ^= 0x80000000u;
+    permute();
+
+    if (((uintptr_t)out & 3) == 0)
+    {
+        for (int i = 0; i < 8; i++)
+            ((uint32_t *)out)[i] = s[i];
+    }
+    else
+    {
+        memcpy(out, s, 32);
+    }
+}
+
+/* One block from aligned input and output, most calls, by a path small enough to need no frame; the rest by
+ * keccak256_long. The last word of the input may be read past its end, within its own aligned word. */
+void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
+{
+    if (len >= 4 * RateWords || (((uintptr_t)data | (uintptr_t)out) & 3) != 0)
+    {
+        keccak256_long(data, len, out);
+        return;
+    }
+    uint32_t *s = (uint32_t *)KeccakState;
+    const uint32_t *w = (const uint32_t *)data;
+    uint32_t words = (uint32_t)(len >> 2), rest = (uint32_t)(len & 3);
+    uint32_t i = 0;
+#pragma clang loop unroll_count(8)
+    for (; i < words; i++)
+        s[i] = w[i];
+    s[i] = (rest ? w[i] & ((1u << (8 * rest)) - 1) : 0) | (1u << (8 * rest));
+#pragma clang loop unroll_count(8)
+    for (i++; i < 50; i++)
+        s[i] = 0;
+    s[RateWords - 1] ^= 0x80000000u;
+    permute();
+    uint32_t *o = (uint32_t *)out;
+    for (i = 0; i < 8; i++)
+        o[i] = s[i];
+}
+
+/* memcpy, by --wrap (the manifest's wrap_symbols): the guest copies megabytes of witness nodes from
+ * misaligned input positions. 32 bytes a round; a misaligned source is read as the aligned words that
+ * cover it, each output word merged from two of them, and the last may run up to three bytes past the
+ * source within its own aligned word. no_builtin keeps the byte loops from becoming memcpy calls. */
+/* 2^(256 - 8m) for m = 1..31, in RAM for the delegation: a product by it shifts a word right by m bytes (MUL_HIGH)
+   or left by 32 - m bytes (MUL_LOW). */
+static u256d FunnelFactor[32];
+/* The delegation reads only RAM, which starts at 64 MiB (the linker script's ram region); a source in ROM takes the
+   word loop. */
+static const uintptr_t RamStart = 64u << 20;
+static u256d FunnelScratch;
+static int FunnelReady;
+
+/* Copies the 32-byte blocks of d (32-byte aligned) from s (any alignment), each merged by the delegation from the
+   two aligned source words that cover it: two copies, two products by the funnel factor and an addition, where the
+   word loop takes forty instructions a block. Both regions are in RAM, and the source words may extend up to 31
+   bytes past either end of the source, which only reads them. Returns how many bytes it copied. */
+static size_t funnel_copy(uint8_t *d, const uint8_t *s, size_t n)
+{
+    uint32_t m = (uintptr_t)s & 31;
+    const u256d *a = (const u256d *)(s - m);
+    u256d *out = (u256d *)d;
+    size_t blocks = n >> 5;
+    if (m == 0)
+    {
+        for (size_t i = 0; i < blocks; i++)
+            u256_op(&out[i], &a[i], U256_MEMCOPY);
+        return blocks << 5;
+    }
+    if (!FunnelReady)
+    {
+        for (uint32_t k = 1; k < 32; k++)
+        {
+            uint32_t bit = 256 - 8 * k;
+            FunnelFactor[k].w[bit >> 5] = 1u << (bit & 31);
+        }
+        FunnelReady = 1;
+    }
+    const u256d *factor = &FunnelFactor[m];
+    for (size_t i = 0; i < blocks; i++)
+    {
+        u256_op(&out[i], &a[i], U256_MEMCOPY);
+        u256_op(&out[i], factor, U256_MUL_HIGH);
+        u256_op(&FunnelScratch, &a[i + 1], U256_MEMCOPY);
+        u256_op(&FunnelScratch, factor, U256_MUL_LOW);
+        u256_op(&out[i], &FunnelScratch, U256_ADD);
+    }
+    return blocks << 5;
+}
+
+/* The word loops: a misaligned source is read as the aligned words that cover it, each output word merged from two
+   of them, and the last may run up to three bytes past the source within its own aligned word. */
+__attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_words(uint8_t *d, const uint8_t *s, size_t n)
+{
+    if (n < 16)
+    {
+        while (n--)
+            *d++ = *s++;
+        return;
+    }
+    while ((uintptr_t)d & 3)
+    {
+        *d++ = *s++;
+        n--;
+    }
+    uint32_t *dw = (uint32_t *)d;
+    uint32_t misalignment = (uintptr_t)s & 3;
+    if (misalignment == 0)
+    {
+        const uint32_t *sw = (const uint32_t *)s;
+        for (; n >= 32; n -= 32, dw += 8, sw += 8)
+        {
+            uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
+            dw[0] = w0;
+            dw[1] = w1;
+            dw[2] = w2;
+            dw[3] = w3;
+            dw[4] = w4;
+            dw[5] = w5;
+            dw[6] = w6;
+            dw[7] = w7;
+        }
+        for (; n >= 4; n -= 4)
+            *dw++ = *sw++;
+        s = (const uint8_t *)sw;
+    }
+    else
+    {
+        const uint32_t *sw = (const uint32_t *)(s - misalignment);
+        uint32_t low = 8 * misalignment, high = 32 - low;
+        uint32_t current = *sw++;
+        for (; n >= 32; n -= 32, dw += 8, sw += 8)
+        {
+            uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
+            dw[0] = (current >> low) | (w0 << high);
+            dw[1] = (w0 >> low) | (w1 << high);
+            dw[2] = (w1 >> low) | (w2 << high);
+            dw[3] = (w2 >> low) | (w3 << high);
+            dw[4] = (w3 >> low) | (w4 << high);
+            dw[5] = (w4 >> low) | (w5 << high);
+            dw[6] = (w5 >> low) | (w6 << high);
+            dw[7] = (w6 >> low) | (w7 << high);
+            current = w7;
+        }
+        for (; n >= 4; n -= 4)
+        {
+            uint32_t next = *sw++;
+            *dw++ = (current >> low) | (next << high);
+            current = next;
+        }
+        s = (const uint8_t *)sw - 4 + misalignment;
+    }
+    d = (uint8_t *)dw;
+    while (n--)
+        *d++ = *s++;
+}
+
+__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+{
+    uint8_t *d = dest;
+    const uint8_t *s = src;
+    /* Long enough to pay for aligning the destination to a block: the delegation copies a block in one operation when
+       source and destination share their alignment within it, and merges it in five when they differ within a word;
+       sharing a word's alignment only, the word loop is as quick. A copy onto itself, which callers make, would hand
+       the delegation one operand twice. */
+    uintptr_t apart = (uintptr_t)d ^ (uintptr_t)s;
+    if (n >= 128 && (uintptr_t)s >= RamStart + 32 && d != s && ((apart & 31) == 0 || (apart & 3) != 0))
+    {
+        size_t head = -(uintptr_t)d & 31;
+        copy_words(d, s, head);
+        d += head;
+        s += head;
+        n -= head;
+        size_t done = funnel_copy(d, s, n);
+        d += done;
+        s += done;
+        n -= done;
+    }
+    copy_words(d, s, n);
+    return dest;
+}
+
+/* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR
+ * access in place of a call to this. */
+uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
+{
+    return u256_op(a, b, op);
 }
 
 void read_input(const uint8_t **buf_ptr, size_t *buf_size)
 {
     uint32_t len = csr_read();
-    uint32_t *words = malloc(((size_t)len + 3) & ~(size_t)3);
-    for (uint32_t i = 0; i < (len + 3) / 4; i++)
+    uint32_t count = (len + 3) / 4;
+    uint32_t *words = malloc((size_t)count * 4);
+    /* Thirty-two words a round: the input is megabytes, and the loop's own instructions would be a third of
+     * each word's cost. Nothing past the input is read: the source has no more words to give. */
+    uint32_t i = 0;
+    for (; i + 32 <= count; i += 32)
+    {
+#pragma clang loop unroll(full)
+        for (int k = 0; k < 32; k++)
+            words[i + k] = csr_read();
+    }
+    for (; i < count; i++)
         words[i] = csr_read();
     *buf_ptr = (const uint8_t *)words;
     *buf_size = len;

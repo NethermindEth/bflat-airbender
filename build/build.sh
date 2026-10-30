@@ -13,7 +13,7 @@ SYSROOT="${SYSROOT:-/rv32}"
 common=(--target=riscv32-unknown-elf -march=rv32im -mabi=ilp32 -mno-relax -O2 -ffunction-sections -fdata-sections
         -fno-stack-protector -Wall -Wextra -Werror)
 case "$platform" in
-    airbender) flags=("${common[@]}" -ffreestanding -nostdinc -isystem "$(clang -print-resource-dir)/include") ;;
+    airbender) flags=("${common[@]}" -DAIRBENDER -ffreestanding -nostdinc -isystem "$(clang -print-resource-dir)/include") ;;
     linux) flags=("${common[@]/--target=riscv32-unknown-elf/--target=riscv32-unknown-linux-musl}" --sysroot="$SYSROOT") ;;
     *) echo "unknown platform $platform" >&2; exit 1 ;;
 esac
@@ -38,7 +38,7 @@ if [ "$platform" = airbender ]; then
 {
   "name": "libairbender",
   "builds": [
-    { "arch": "riscv32", "os": "linux", "libc": "airbender", "static_lib": "libairbender.a" }
+    { "arch": "riscv32", "os": "linux", "libc": "airbender", "static_lib": "libairbender.a", "wrap_symbols": ["memcpy"] }
   ]
 }
 EOF
