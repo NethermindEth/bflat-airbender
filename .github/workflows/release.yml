@@ -62,7 +62,9 @@ jobs:
       - name: Create archive
         run: |
           mkdir archive_tmp
-          cp output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest LICENSE archive_tmp/
+          cp output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest \
+             output/airbender/airbender_entry.o output/airbender/airbender.ld output/airbender/airbender.bflat.manifest \
+             LICENSE archive_tmp/
           tar -czf libairbender-riscv32.tar.gz -C archive_tmp .
           rm -rf archive_tmp
           ls -lh libairbender-riscv32.tar.gz
@@ -73,7 +75,9 @@ jobs:
       # its base name, and list-files refuses two files with one name.
       - name: List the release assets
         run: |
-          files=(output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest libairbender-riscv32.tar.gz)
+          files=(output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest
+                 output/airbender/airbender_entry.o output/airbender/airbender.ld output/airbender/airbender.bflat.manifest
+                 libairbender-riscv32.tar.gz)
           python3 tools/sign_package.py list-files signature "${files[@]}"
           mkdir release
           cp "${files[@]}" release/
@@ -149,15 +153,18 @@ jobs:
           body: |
             ## libairbender ${{ needs.build.outputs.version }}
 
-            The zkVM runtime library of bflat guests for ZKsync Airbender (RV32IM, ilp32).
+            The ZKsync Airbender platform of bflat (RV32IM, ilp32) and its runtime library.
 
             ### Files
-            - `libairbender.a` - The static library: Airbender I/O and the accelerators
-            - `libairbender.bflat.manifest` - What `bflat build --extlib` reads
-            - `libairbender-riscv32.tar.gz` - Both, with the license
+            - `airbender_entry.o`, `airbender.ld`, `airbender.bflat.manifest` - The platform: the entry point, the memory map and the platform manifest
+            - `libairbender.a` - The static library: Airbender I/O, the delegations and the accelerators
+            - `libairbender.bflat.manifest` - The manifest of the library
+            - `libairbender-riscv32.tar.gz` - All of them, with the license
             - `bflat-signature.sha256`, `bflat-signature.sha256.sig` - The signed SHA-256 list of the other files, which bflat checks
 
             ### Usage
-            `bflat build --arch riscv32 --libc airbender --extlib <dir>/libairbender.bflat.manifest`
+            Unpack `libairbender-riscv32.tar.gz` into a directory and build with
+            `bflat build --arch riscv32 --libc airbender --no-pie --extlib <dir>/libairbender.bflat.manifest`:
+            bflat reads every `.bflat.manifest` of the directory, the platform among them.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

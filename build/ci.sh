@@ -11,5 +11,6 @@ docker run --platform linux/amd64 --rm -v "$TOP:$TOP" -w "$TOP" "$image" bash -e
     bash build/build.sh airbender
     bash build/build.sh linux
     bash build/check.sh airbender linux
+    bash tests/platform/run-tls.sh
     chmod -R a+rwX output'
 python3 "$TOP/tests/run.py" "${QEMU:-qemu-riscv32}" "$TOP/output/linux/harness"
