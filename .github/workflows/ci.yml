@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, gates and tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install qemu-riscv32
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-user
+
+      # Both platforms and the gates in the build image, then tests/run.py
+      # under qemu-riscv32.
+      - name: Build and test
+        run: build/ci.sh
+
+      - name: Upload libairbender
+        uses: actions/upload-artifact@v4
+        with:
+          name: libairbender-riscv32
+          path: |
+            output/airbender/libairbender.a
+            output/airbender/libairbender.bflat.manifest
+          if-no-files-found: error
