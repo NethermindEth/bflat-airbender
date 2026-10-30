@@ -72,9 +72,11 @@ echo "built $out/libairbender.a: $(wc -l < "$obj/exports.txt") entry points"
 
 # The test harness of tests/run.py, a static Linux executable for qemu-riscv32.
 if [ "$platform" = linux ]; then
+    # stdio_noldbl replaces musl's formatted I/O, which needs quad-precision helpers riscv32 has none of.
     clang "${flags[@]}" -c "$TOP/tests/harness.c" -o "$obj/harness.o"
+    clang "${flags[@]}" -c "$TOP/tests/stdio_noldbl.c" -o "$obj/stdio_noldbl.o"
     lib="$SYSROOT/usr/lib"
-    ld.lld -static -o "$out/harness" "$lib/crt1.o" "$lib/crti.o" "$obj/harness.o" "$out/libairbender.a" \
+    ld.lld -static -o "$out/harness" "$lib/crt1.o" "$lib/crti.o" "$obj/harness.o" "$obj/stdio_noldbl.o" "$out/libairbender.a" \
         "$lib/libc.a" "$lib/libclang_rt.builtins-riscv32.a" "$lib/crtn.o"
     echo "built $out/harness"
 fi
