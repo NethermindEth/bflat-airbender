@@ -415,6 +415,12 @@ void sys_write(uint32_t fd, const uint8_t *ptr, size_t len)
     }
 }
 
+/* What bflat's pal prints the guest's console output through (zkvm_console_write). */
+void airbender_uart_write(const char *buf, unsigned long len)
+{
+    sys_write(1, (const uint8_t *)buf, len);
+}
+
 /* The end of a run: success publishes Output, anything else proves nothing. */
 void airbender_exit(int status)
 {
