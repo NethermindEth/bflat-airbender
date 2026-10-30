@@ -206,7 +206,13 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors", "e
         cases.append((" ".join(args), want))
 
 cases = [c for c in cases if c[1] is not None]
-out = subprocess.run(sys.argv[1:], input="\n".join(c[0] for c in cases) + "\n", capture_output=True, text=True).stdout.split("\n")
+proc = subprocess.run(sys.argv[1:], input="\n".join(c[0] for c in cases) + "\n", capture_output=True, text=True)
+out = proc.stdout.split("\n")
+# A harness that stops early answers fewer cases than it was given: the rest must not pass by default.
+if proc.returncode != 0 or len(out) < len(cases):
+    print(f"harness exited with {proc.returncode} after {min(len(out), len(cases))}/{len(cases)} answers")
+    print(proc.stderr[-2000:], end="")
+    sys.exit(1)
 bad = 0
 for (line, want), got in zip(cases, out):
     if got != want:
