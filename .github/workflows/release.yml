@@ -1,0 +1,163 @@
+name: Release
+
+# The workflow makes the tag: v<version>.<run>, as the zkVM packages of
+# bflat make their versions (bflat-libziskos, bflat-sp1, bflat-openvm, uGC).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: libairbender version (major.minor); the release is v<version>.<run>
+        type: string
+        default: "1.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect version
+        id: version
+        env:
+          BASE: ${{ inputs.version }}
+        run: |
+          if [[ ! "$BASE" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the version must be major.minor, not '$BASE'"
+            exit 1
+          fi
+          version="v${BASE}.${GITHUB_RUN_NUMBER}"
+          echo "Detected version $version"
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      # A run that is run again keeps its run number, and with it the
+      # version. Its release job would replace the files of the release
+      # that has the version already. Start a new run instead.
+      - name: Check that the release does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ; then
+            echo "::error::the release $VERSION exists already: start a new run"
+            exit 1
+          fi
+
+      - name: Install qemu-riscv32
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-user
+
+      # What CI runs: a release is only made of a build that passed the gates
+      # and the tests.
+      - name: Build and test
+        run: build/ci.sh
+
+      - name: Create archive
+        run: |
+          mkdir archive_tmp
+          cp output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest LICENSE archive_tmp/
+          tar -czf libairbender-riscv32.tar.gz -C archive_tmp .
+          rm -rf archive_tmp
+          ls -lh libairbender-riscv32.tar.gz
+
+      # The release assets, and the list of their SHA-256 hashes for the
+      # sign job (docs/signing.md in bflat-riscv64). This job has no key.
+      # The release flattens the asset paths, so the list names each file by
+      # its base name, and list-files refuses two files with one name.
+      - name: List the release assets
+        run: |
+          files=(output/airbender/libairbender.a output/airbender/libairbender.bflat.manifest libairbender-riscv32.tar.gz)
+          python3 tools/sign_package.py list-files signature "${files[@]}"
+          mkdir release
+          cp "${files[@]}" release/
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/
+          if-no-files-found: error
+
+      - name: Upload the list
+        uses: actions/upload-artifact@v4
+        with:
+          name: bflat-signature-lists
+          path: signature/bflat-signature.sha256
+          if-no-files-found: error
+
+  # The private key is only in the sign job, which runs no build
+  # (docs/signing.md in bflat-riscv64).
+  sign:
+    name: Sign the release assets
+    needs: build
+    permissions: {}
+    uses: NethermindEth/bflat-riscv64/.github/workflows/sign.yml@34a3e73ad5b2f34a868f5793172dc4a3a97bf382 # master
+    with:
+      lists: bflat-signature-lists
+    secrets:
+      BFLAT_SIGNING_KEY: ${{ secrets.BFLAT_SIGNING_KEY }}
+
+  release:
+    name: Release
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download the release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      - name: Download the signature
+        uses: actions/download-artifact@v4
+        with:
+          name: bflat-signatures
+          path: signature
+
+      # The assets must agree with the list that was signed, and the
+      # signature must be valid for the public key, before the release.
+      - name: Check the signature
+        env:
+          BFLAT_SIGNING_PUBLIC_KEY: ${{ vars.BFLAT_SIGNING_PUBLIC_KEY }}
+        run: python3 tools/sign_package.py check-files signature release/*
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          # The commit that was built; the default is the head of the default branch.
+          target_commitish: ${{ github.sha }}
+          tag_name: ${{ needs.build.outputs.version }}
+          name: Release ${{ needs.build.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            release/*
+            signature/bflat-signature.sha256
+            signature/bflat-signature.sha256.sig
+          body: |
+            ## libairbender ${{ needs.build.outputs.version }}
+
+            The zkVM runtime library of bflat guests for ZKsync Airbender (RV32IM, ilp32).
+
+            ### Files
+            - `libairbender.a` - The static library: Airbender I/O and the accelerators
+            - `libairbender.bflat.manifest` - What `bflat build --extlib` reads
+            - `libairbender-riscv32.tar.gz` - Both, with the license
+            - `bflat-signature.sha256`, `bflat-signature.sha256.sig` - The signed SHA-256 list of the other files, which bflat checks
+
+            ### Usage
+            `bflat build --arch riscv32 --libc airbender --extlib <dir>/libairbender.bflat.manifest`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
