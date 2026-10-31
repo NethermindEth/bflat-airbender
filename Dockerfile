@@ -8,7 +8,7 @@
 # build/check.sh (DOTNET_RISCV).
 FROM mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-net11.0-cross-amd64@sha256:ca817af24ff68c801a3e31f16a0fbf6bb7ba57764b0aeae5be260dbc70ae25cb
 
-ARG DOTNET_RISCV_REF=57af2904b5dfa86900065b12f5d0ece0d7664024
+ARG DOTNET_RISCV_REF=69b95a916c60473ac73cdd67ca938ca017e7febd
 
 RUN git init -q /dotnet-riscv && cd /dotnet-riscv \
     && git fetch -q --depth 1 https://github.com/NethermindEth/dotnet-riscv "${DOTNET_RISCV_REF}" \
