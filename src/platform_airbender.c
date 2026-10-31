@@ -2,33 +2,28 @@
  * The I/O half for the Airbender zkVM. Everything goes through the non-determinism CSR 0x7c0:
  *   - a read pops the next input word; the input is one word of byte length, then the bytes
  *     packed little-endian into words;
- *   - a write feeds the simulator's quasi-UART: 0xffffffff, the number of words that follow,
- *     the byte length, then the bytes packed little-endian into words. Debug output only; the
- *     prover ignores it.
- * The public output is the eight words left in x10-x17 at the end of the run, which
- * airbender_finish_success (platform_airbender.S) loads in the exact sequence the Airbender
- * tooling looks for in the binary.
+ *   - a write feeds the simulator's quasi-UART, which the platform's zkvm_platform_write speaks.
+ * The public output is the eight words left in x10-x17 at the end of the run: write_output puts
+ * them into airbender_output, which the platform's zkvm_platform_exit(0) loads in the exact
+ * sequence the Airbender tooling looks for in the binary. The platform is the entry object of
+ * the airbender platform of bflat (platform/entry.S); every guest links it.
  */
 #include "u256.h"
 #include "zkvm.h"
 
 void *malloc(size_t size);
-__attribute__((noreturn)) void airbender_finish_success(const uint32_t words[16]);
-__attribute__((noreturn)) void airbender_finish_error(uint32_t code);
 
-/* x10-x17 the output, x18-x25 zero, as the recursion convention expects. */
-static uint32_t Output[16];
+/* The platform (platform/entry.S): the output words, x10-x25, and the ends of a run. */
+extern uint32_t airbender_output[16];
+__attribute__((noreturn)) void zkvm_platform_exit(long code);
+__attribute__((noreturn)) void airbender_finish_error(uint32_t code);
+void zkvm_platform_write(int fd, const char *buf, int len);
 
 static inline uint32_t csr_read(void)
 {
     uint32_t value;
     __asm__ volatile("csrrw %0, 0x7c0, x0" : "=r"(value));
     return value;
-}
-
-static inline void csr_write(uint32_t value)
-{
-    __asm__ volatile("csrrw x0, 0x7c0, %0" : : "r"(value));
 }
 
 /* Airbender v3's Keccak-f[1600] delegation (common_constants delegation_types/keccak_f1600.rs): per
@@ -396,37 +391,19 @@ void write_output(const uint8_t *output, size_t size)
         for (size_t b = 0; b < 4; b++)
             if (4 * i + b < size)
                 w |= (uint32_t)output[4 * i + b] << (8 * b);
-        Output[i] = w;
+        airbender_output[i] = w;
     }
 }
 
 void sys_write(uint32_t fd, const uint8_t *ptr, size_t len)
 {
-    (void)fd;
-    csr_write(0xffffffff);
-    csr_write((uint32_t)(1 + (len + 3) / 4));
-    csr_write((uint32_t)len);
-    for (size_t i = 0; i < len; i += 4)
-    {
-        uint32_t w = 0;
-        for (size_t b = 0; b < 4 && i + b < len; b++)
-            w |= (uint32_t)ptr[i + b] << (8 * b);
-        csr_write(w);
-    }
+    zkvm_platform_write((int)fd, (const char *)ptr, (int)len);
 }
 
-/* What bflat's pal prints the guest's console output through (zkvm_console_write). */
-void airbender_uart_write(const char *buf, unsigned long len)
-{
-    sys_write(1, (const uint8_t *)buf, len);
-}
-
-/* The end of a run: success publishes Output, anything else proves nothing. */
+/* The end of a run: success publishes airbender_output, anything else proves nothing. */
 void airbender_exit(int status)
 {
-    if (status == 0)
-        airbender_finish_success(Output);
-    airbender_finish_error((uint32_t)status);
+    zkvm_platform_exit(status);
 }
 
 void airbender_fail(uint32_t code)

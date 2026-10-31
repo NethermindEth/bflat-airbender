@@ -38,4 +38,7 @@ jobs:
           path: |
             output/airbender/libairbender.a
             output/airbender/libairbender.bflat.manifest
+            output/airbender/airbender_entry.o
+            output/airbender/airbender.ld
+            output/airbender/airbender.bflat.manifest
           if-no-files-found: error

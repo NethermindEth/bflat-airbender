@@ -1,18 +1,49 @@
 # bflat-airbender
 
-The zkVM runtime library for guests that bflat builds for ZKsync Airbender
-(`bflat build --arch riscv32 --libc airbender`): `libairbender.a`, for RV32IM
-with the ilp32 ABI.
+The ZKsync Airbender platform of bflat, and the zkVM runtime library of its
+guests, for RV32IM with the ilp32 ABI
+(`bflat build --arch riscv32 --libc airbender`).
 
-It supplies what the guest reaches through `__Internal` P/Invokes
-(Nethermind.Zkvm.Abstractions):
+The platform (`platform/`, see the manifest format in bflat-riscv64's
+`docs/manifest.md`) is what bflat links every Airbender guest with:
+
+- `airbender_entry.o` (`entry.S`): `_start`, which copies the initialized
+  data from ROM to RAM and enters the runtime, and the platform interface of
+  bflat's pal: `zkvm_platform_exit` (success publishes the 16 output words in
+  x10-x25 through the EXIT_SEQUENCE the Airbender tooling looks for; failure
+  writes the cycle CSR, which no circuit satisfies) and `zkvm_platform_write`
+  (the quasi-UART of the non-determinism CSR).
+- `airbender.ld`: the memory map. The ROM at address 0 holds the image, 4 MiB
+  in v3; the link fails if it does not fit.
+- `airbender.bflat.manifest`: the platform manifest. The modules of bflat it
+  requires, the ISA (no C, A, F or D), the RyuJIT options (unsigned RV32M only,
+  no unaligned access, the zkVM tuning measured on the Nethermind guest), no
+  unwind tables, and the post-link steps: the FENCE and signed RV32M rewrites
+  of the native code, and the flat images `<output>.bin` and `<output>.text`
+  that Airbender loads.
+
+`libairbender.a`, with its manifest `libairbender.bflat.manifest`, supplies
+what the guest reaches through `__Internal` P/Invokes
+(Nethermind.Zkvm.Abstractions, and the `airbender_` calls of the Nethermind
+guest):
 
 - Input and output over Airbender's non-determinism CSR (0x7c0): the input
-  words, the UART, and the finish and error sequences Airbender recognizes.
+  words and the output words (`read_input`, `write_output`), and the console
+  through the platform.
 - The precompiles in C: Keccak-256, SHA-256, RIPEMD-160, BLAKE2 F,
   secp256k1 and P-256 signatures, modexp, BN254, BLS12-381 and KZG point
   evaluation. The field arithmetic runs on Airbender's u256 delegation
-  (CSR 0x7ca).
+  (CSR 0x7ca), Keccak on its Keccak-f delegation.
+
+A guest that uses no accelerator links with the platform alone.
+
+The Keccak-f delegation that libairbender calls (CSRs 0x7cc, 0x7cd and
+0x7ce) is the one of the zksync-airbender branch
+`mb/keccak-03-read-ts-packed-memory-borrows` (7a147da32e0c); the `dev`
+branch and v3 have the older `keccak_special5` (0x7cb) only, and their
+transpiler rejects an image with the newer CSRs. Run and prove a guest that
+calls `zkvm_keccak256`, `keccak_f1600` or `airbender_keccak*` with that
+revision. The rest of the platform and libairbender run on `dev` too.
 
 ## Build
 
@@ -28,7 +59,7 @@ musl sysroot and the gates come from dotnet-riscv at `DOTNET_RISCV_REF`.
 In the image, or with clang, ld.lld and the LLVM tools at hand:
 
 ```bash
-build/build.sh airbender   # output/airbender/libairbender.a and libairbender.bflat.manifest
+build/build.sh airbender   # output/airbender: the platform, libairbender.a and libairbender.bflat.manifest
 build/build.sh linux       # output/linux/libairbender.a and harness, for tests under qemu-riscv32
 build/check.sh airbender linux
 ```
@@ -37,7 +68,9 @@ build/check.sh airbender linux
 linux platform compiles and links against. The airbender platform is
 freestanding: bflat links it with musl's memory functions and the builtins,
 and the build fails if it needs anything else. bflat takes the library with
-`--extlib output/airbender/libairbender.bflat.manifest`.
+`--extlib output/airbender/libairbender.bflat.manifest`: it reads every
+`.bflat.manifest` of the directory, the platform among them.
+`platform/build.sh <dir>` builds the platform alone, with clang only.
 
 The archive holds one object, in which only the entry points are global: the
 `zkvm_` accelerators, the I/O of Nethermind.Zkvm.Abstractions (`read_input`,
@@ -58,11 +91,16 @@ output/linux/harness`). That build has no u256 delegation, so `u256_soft.c`
 computes its results. It fails if the harness answers fewer cases than it was
 given.
 
+`tests/platform/run-tls.sh` checks that the memory map keeps the initialized
+TLS in the ROM copy of the RAM block.
+
 ## Release
 
 The Release workflow (run by hand, with the major.minor version) builds and
-tests as CI does and releases `v<version>.<run>`: `libairbender.a`,
-`libairbender.bflat.manifest`, and `libairbender-riscv32.tar.gz` with both.
+tests as CI does and releases `v<version>.<run>`: the platform
+(`airbender_entry.o`, `airbender.ld`, `airbender.bflat.manifest`),
+`libairbender.a` and `libairbender.bflat.manifest`, and
+`libairbender-riscv32.tar.gz` with all of them.
 Two more assets are `bflat-signature.sha256`, the SHA-256 of each other
 asset, and `bflat-signature.sha256.sig`, its signature. The sign job, the
 reusable workflow `sign.yml` of bflat-riscv64, signs the list with the secret

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindEth/bflat-riscv64/master/src/bflat/bflat-manifest.schema.json",
+  "schema": 2,
+  "name": "libairbender",
+  "version": "1.0.0",
+  "description": "Airbender I/O, delegations and accelerators (libairbender) for bflat guests",
+  "when": {"platform": "airbender"},
+  "objects": [
+    {
+      "file": "libairbender.a",
+      "group": "pre-entry",
+      "note": "In front of the linker script, where bflat linked --extlib static libraries before schema 2."
+    }
+  ],
+  "link": {
+    "wrap": [
+      {
+        "symbol": "memcpy",
+        "note": "libairbender's __wrap_memcpy: long copies through the u256 delegation, word loops otherwise."
+      }
+    ]
+  },
+  "codegen": {
+    "options": [
+      {
+        "value": "JitZkDelegationPInvokes=airbender_u256_op:7ca",
+        "note": "The u256 delegation emitted in place of the call to libairbender's airbender_u256_op: the operands are in x10-x12 by the calling convention and the circuit writes its flag back to x12. A JIT without the knob keeps the call, which libairbender answers with the same delegation."
+      }
+    ]
+  }
+}

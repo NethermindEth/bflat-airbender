@@ -1,0 +1,131 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindEth/bflat-riscv64/master/src/bflat/bflat-manifest.schema.json",
+  "schema": 2,
+  "name": "airbender",
+  "version": "1.0.0",
+  "description": "The ZKsync Airbender v3 platform: an RV32IM guest in a 4 MiB ROM",
+  "note": "Airbender proves RV32IM (no A, no C, no F or D), traps on any misaligned access, and v3 proves only the unsigned RV32M instructions. Every value below was measured on the Nethermind stateless guest (NethermindEth/bflat-riscv64#66), cycles on the heaviest mainnet block 26118845.",
+  "ilc": {"defines": ["ZKVM_AIRBENDER"]},
+  "codegen": {
+    "abi": "ilp32",
+    "isa": {"disable": ["c", "a", "f", "d", "zba", "zbb", "zbs", "zicond"]},
+    "options": [
+      {
+        "value": "EnableRiscV64Compressed=0",
+        "note": "The decoder has no C extension, and a single-hart guest needs no atomics (dotnet-riscv fixups 24/25)."
+      },
+      "EnableRiscV64Atomic=0",
+      {
+        "value": "JitRiscVUnsignedMulDiv=1",
+        "note": "Airbender v3 proves only the unsigned RV32M instructions: the JIT builds mulh, mulhsu, div and rem from unsigned ones. The native code gets the same in post-link (patch_elf --unsigned-muldiv)."
+      },
+      {
+        "value": "JitNoUnalignedAccess=1",
+        "note": "Airbender traps on any misaligned load or store, but testing every access as SP1 does (JitRiscV64StrictAlign) doubles the code, which the 4 MiB ROM cannot hold. The JIT instead expands byte-wise the accesses flagged unaligned and those whose constant offset alone breaks the alignment, and trusts the alignment of every base."
+      },
+      "JitRiscV64StrictAlign=0",
+      {"value": "JitObjectStackAllocation=1", "when": {"optimize": true}},
+      {
+        "value": "JitForceInlineMaxIL=200",
+        "when": {"optimize": true},
+        "note": "A callee marked AggressiveInlining with more than 0x200 (512) bytes of IL is judged like any other: -1.4% cycles over 0xC0, for 165 KB of the ROM; 0x300 buys nothing more. The ZisK caps of JitObjectStackAllocationSize and JitExtDefaultPolicyMax* stay at their defaults: on rv32 every inlined 64-bit operation takes twice the code."
+      },
+      {
+        "value": "JitInlineAdditionalMultiplier=4",
+        "when": {"optimize": true},
+        "note": "The inliner's profitability multiplier, raised as for ZisK (perf-57): -1.6% cycles for 270 KB of the ROM at 3; 4 takes 0.1% more, 6 loses it again."
+      },
+      {
+        "value": "RiscV64ElideLeafRaSave=1",
+        "when": {"optimize": true},
+        "note": "Elide the RA spill/reload and frame in leaf methods (dotnet-riscv patches 23 and 31). Sound only on a single-threaded deterministic guest with no GC thread suspension and no return-address hijacking."
+      },
+      {
+        "value": "JitZkNoPinning=1",
+        "when": {"optimize": true},
+        "note": "The zkVM register tuning of ZisK (perf-61/62/63, patches 23 and 31): every callee-saved register a method touches costs its save and restore, and the guest links the non-moving, non-collecting uGC."
+      },
+      {"value": "JitZkSynthesizeCounts=1", "when": {"optimize": true}},
+      {"value": "JitZkSpillKeepReg=1", "when": {"optimize": true}},
+      {"value": "JitZkColdCallSpill=7d", "when": {"optimize": true}},
+      {
+        "value": "JitZkHandlerConv=1",
+        "when": {"optimize": true},
+        "note": "The EVM guest's handlers take their arguments in s1-s8, which no call or delegation in them clobbers: -3.3% cycles."
+      },
+      {
+        "value": "JitZkInlineCloneCheapArgs=1",
+        "when": {"optimize": true},
+        "note": "An inline argument that is a local plus constants is recomputed at each use rather than held in a register the delegations' operand moves go through: -0.5% cycles."
+      },
+      {
+        "value": "JitZkNoCheapAddCSE=1",
+        "when": {"optimize": true},
+        "note": "For the same reason a local plus a constant is not CSEd outside loops: -0.15% cycles."
+      },
+      {
+        "value": "JitZkNoCastAwayGcTemp=1",
+        "when": {"optimize": true},
+        "note": "uGC never scans stacks (JitZkNoGcMustInit), so a byref cast to a pointer needs no non-GC temp: the operands of a delegation go straight to their registers. -0.7% cycles."
+      },
+      {
+        "value": "JitZkForwardSubCheap=1",
+        "when": {"optimize": true},
+        "note": "A temp the importer spilled for such a value is cloned into its uses in the block too: -0.2% cycles."
+      },
+      {
+        "value": "JitZkNoNullChecks=1",
+        "when": {"optimize": true},
+        "note": "The ROM sits at address 0 and reading it never faults, so a null check probe checks nothing: -0.2% cycles."
+      },
+      {
+        "value": "JitZkInitLocallocOnly=1",
+        "when": {"optimize": true},
+        "note": "A method marked to initialize its locals zeroes only its stackalloc, as SkipLocalsInit would zero nothing: C# writes a local before it reads it. -0.26% cycles."
+      }
+    ]
+  },
+  "postlink": [
+    {
+      "tool": "patch_elf",
+      "args": ["--nop-fences", "--unsigned-muldiv", "--unimp-system", "--unimp-csr", "0xc22"],
+      "note": "The native code carries what Airbender cannot run: FENCE, which it rejects (a single hart has nothing to order), and the signed RV32M instructions, which v3 does not prove; the JIT emits neither for managed code. Airbender's transpiler also decodes the whole .text before the run and rejects any SYSTEM encoding it does not know: the ebreak with which the JIT ends a call to a noreturn helper, musl's ecalls, and the read of vlenb (0xc22) in the runtime's libunwind become UNIMP (csrrw x0, cycle, x0), which it takes as an illegal instruction. The guest reaches none of them."
+    },
+    {
+      "tool": "flat_image",
+      "args": ["--suffix", ".bin"],
+      "note": "The flat ROM image that Airbender loads, beside the ELF."
+    },
+    {
+      "tool": "flat_image",
+      "args": ["--suffix", ".text", "--section", ".text"],
+      "note": "The instructions that Airbender decodes ahead of the run."
+    }
+  ],
+  "platform": {
+    "aliases": {"libc": "airbender"},
+    "base": {"os": "linux", "arch": "riscv32", "libc": "musl"},
+    "requires": [
+      "nofp",
+      "ubootstrap",
+      "stdcppshim",
+      "rhp",
+      "gs_cookie",
+      "rhp_native",
+      "pal",
+      "eh",
+      "tls",
+      "rng_stupid",
+      "rust_sys",
+      "ugc-zero",
+      "nothread",
+      "noos",
+      "guest_subst"
+    ],
+    "flags": ["no-atomics", "noos", "no-console"],
+    "unwind": false,
+    "note": "No unwind tables: they would take about half a MiB of the ROM, so every exception goes to the guest's ZkvmThrow handler (bflat builds as with --remove-eh). No JitZkBumpAddr: the rv32 guest keeps the allocation helper call, which it was validated with.",
+    "linker_script": "airbender.ld",
+    "entry": "airbender_entry.o"
+  }
+}

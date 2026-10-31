@@ -17,6 +17,7 @@ for platform in "$@"; do
     dirs+=("$out")
     files+=("$out/libairbender.a")
     [ ! -f "$out/harness" ] || files+=("$out/harness")
+    [ ! -f "$out/airbender_entry.o" ] || files+=("$out/airbender_entry.o")
 done
 "$DOTNET_RISCV/check_ilp32.sh" "${dirs[@]}"
 OBJDUMP=llvm-objdump ISA_SCAN_FENCE=1 python3 "$DOTNET_RISCV/tools/isa_scan.py" "${files[@]}"
