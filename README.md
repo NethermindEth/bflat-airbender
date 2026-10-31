@@ -18,9 +18,11 @@ The platform (`platform/`, see the manifest format in bflat-riscv64's
 - `airbender.bflat.manifest`: the platform manifest. The modules of bflat it
   requires, the ISA (no C, A, F or D), the RyuJIT options (unsigned RV32M only,
   no unaligned access, the zkVM tuning measured on the Nethermind guest), no
-  unwind tables, and the post-link steps: the FENCE and signed RV32M rewrites
+  unwind tables, the post-link steps (the FENCE and signed RV32M rewrites
   of the native code, and the flat images `<output>.bin` and `<output>.text`
-  that Airbender loads.
+  that Airbender loads), and the ISA checks of the linked image, which fail
+  the build on an F, D, C or A instruction. The checks need a bflat that reads
+  ELF32 images (bflat-riscv64 #69).
 
 `libairbender.a`, with its manifest `libairbender.bflat.manifest`, supplies
 what the guest reaches through `__Internal` P/Invokes
