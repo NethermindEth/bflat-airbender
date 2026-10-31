@@ -164,6 +164,42 @@ for i, item in enumerate(good):
 cases.append(ecrecover_batch(mixed))
 cases.append(ecrecover_batch((mixed * 2)[:600]))
 
+
+# Batch verification of the recovered keys: R's y from r and the recovery id, as a host gives it. Any key, y,
+# signature or hash out of place fails the whole batch; 600 items cross the 512-signature chunk.
+def r_y(sig, recid):
+    x = int(sig[:64], 16) + (K1.n if recid & 2 else 0)
+    y = pow((x ** 3 + 7) % K1.p, (K1.p + 1) // 4, K1.p)
+    return y if (y & 1) == (recid & 1) else K1.p - y
+
+
+def verify_batch(items, keys=None, ys=None):
+    msgs = "".join(m for m, _, _, _ in items)
+    sigs = "".join(sg for _, sg, _, _ in items)
+    recids = "".join(rc for _, _, rc, _ in items)
+    keys = keys or [e for _, _, _, e in items]
+    ys = ys or [h32(r_y(sg, int(rc, 16))) for _, sg, rc, _ in items]
+    weights = rng.randbytes(16 * len(items)).hex()
+    return f"verifybatch {msgs} {sigs} {recids} {''.join(keys)} {''.join(ys)} {weights}"
+
+
+for items in (good[:1], good[:2], good[:40], good, (good * 3)[:600]):
+    cases.append((verify_batch(items), "1"))
+    keys = [e for _, _, _, e in items]
+    ys = [h32(r_y(sg, int(rc, 16))) for _, sg, rc, _ in items]
+    i = rng.randrange(len(items))
+    # A key that differs (the high-s twins share theirs), the key negated, then R's y negated: each a point on the curve.
+    other = next((k for k in keys if k != keys[i]), keys[i][:64] + h32(K1.p - int(keys[i][64:], 16)))
+    cases.append((verify_batch(items, keys[:i] + [other] + keys[i + 1:], ys), "0"))
+    cases.append((verify_batch(items, keys[:i] + [keys[i][:64] + h32(K1.p - int(keys[i][64:], 16))] + keys[i + 1:], ys), "0"))
+    cases.append((verify_batch(items, keys, ys[:i] + [h32(K1.p - int(ys[i], 16))] + ys[i + 1:]), "0"))
+    tampered = list(items)
+    m, sg, rc, e = tampered[i]
+    tampered[i] = (h32(int(m, 16) ^ 1), sg, rc, e)
+    cases.append((verify_batch(tampered, keys, ys), "0"))
+cases.append((verify_batch(good[:3] + bad[:1], [e for _, _, _, e in good[:3]] + [good[0][3]],
+                           [h32(r_y(sg, int(rc, 16))) for _, sg, rc, _ in good[:3]] + [h32(1)]), "0"))
+
 for _ in range(6):
     d = rng.randrange(1, R1.n)
     h = rng.randrange(0, 2**256)

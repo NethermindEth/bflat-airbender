@@ -185,6 +185,71 @@ __attribute__((noinline)) static void keccak256_long(const uint8_t *data, size_t
     }
 }
 
+/* The words of the rate from input laid out as EVM memory is on Airbender: each aligned group of four bytes
+ * reversed, so a group loads as its bytes big-endian and a byte swap gives the lane's little-endian word. */
+static inline __attribute__((always_inline)) void absorb_laid_out_words(const uint32_t *w, int words, int overwrite)
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+    if (overwrite)
+    {
+#pragma clang loop unroll_count(4)
+        for (int i = 0; i < words; i++)
+            s[i] = __builtin_bswap32(w[i]);
+    }
+    else
+    {
+#pragma clang loop unroll_count(4)
+        for (int i = 0; i < words; i++)
+            s[i] ^= __builtin_bswap32(w[i]);
+    }
+}
+
+/* Keccak-256 of the len bytes at data, which start on an aligned group and are laid out as EVM memory: see
+ * absorb_laid_out_words. Byte k of the input lies at data[k ^ 3]. */
+void airbender_keccak256_laid_out(const uint8_t *data, size_t len, uint8_t out[32])
+{
+    uint32_t *s = (uint32_t *)KeccakState;
+    const uint32_t *w = (const uint32_t *)data;
+#pragma clang loop unroll(full)
+    for (int i = RateWords; i < 50; i++)
+        s[i] = 0;
+    int first = 1;
+    while (len >= 4 * RateWords)
+    {
+        absorb_laid_out_words(w, RateWords, first);
+        first = 0;
+        permute();
+        w += RateWords;
+        len -= 4 * RateWords;
+    }
+
+    int words = (int)(len >> 2);
+    absorb_laid_out_words(w, words, first);
+    if (first)
+    {
+#pragma clang loop unroll_count(8)
+        for (int i = words; i < RateWords; i++)
+            s[i] = 0;
+    }
+    uint32_t rest = len & 3, last = 0;
+    const uint8_t *tail = (const uint8_t *)(w + words);
+    for (uint32_t b = 0; b < rest; b++)
+        last |= (uint32_t)tail[b ^ 3] << (8 * b);
+    s[words] ^= last ^ (1u << (8 * rest));
+    s[RateWords - 1] ^= 0x80000000u;
+    permute();
+
+    if (((uintptr_t)out & 3) == 0)
+    {
+        for (int i = 0; i < 8; i++)
+            ((uint32_t *)out)[i] = s[i];
+    }
+    else
+    {
+        memcpy(out, s, 32);
+    }
+}
+
 /* One block from aligned input and output, most calls, by a path small enough to need no frame; the rest by
  * keccak256_long. The last word of the input may be read past its end, within its own aligned word. */
 void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])

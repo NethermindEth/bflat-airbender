@@ -640,7 +640,7 @@ NOINLINE void pt_dbl(point *r, const point *p, int d)
         pt_set_inf(r);
         return;
     }
-    fp2 xx, yy, yyyy, s, m, t, x3, y3, z3;
+    fp2 xx, yy, yyyy, s, m, t;
     fq_mul(&xx, &p->x, &p->x, d);
     fq_mul(&yy, &p->y, &p->y, d);
     fq_mul(&yyyy, &yy, &yy, d);
@@ -652,23 +652,20 @@ NOINLINE void pt_dbl(point *r, const point *p, int d)
     fq_add(&m, &xx, &xx, d);
     fq_add(&m, &m, &xx, d);
 
-    fq_mul(&x3, &m, &m, d);
-    fq_sub(&x3, &x3, &s, d);
-    fq_sub(&x3, &x3, &s, d);
+    /* Each coordinate is written once nothing reads its input any more, so r may be p with no copies. */
+    fq_mul(&r->z, &p->y, &p->z, d);
+    fq_add(&r->z, &r->z, &r->z, d);
 
-    fq_sub(&t, &s, &x3, d);
-    fq_mul(&y3, &m, &t, d);
+    fq_mul(&r->x, &m, &m, d);
+    fq_sub(&r->x, &r->x, &s, d);
+    fq_sub(&r->x, &r->x, &s, d);
+
+    fq_sub(&t, &s, &r->x, d);
+    fq_mul(&r->y, &m, &t, d);
     fq_add(&t, &yyyy, &yyyy, d);
     fq_add(&t, &t, &t, d);
     fq_add(&t, &t, &t, d);
-    fq_sub(&y3, &y3, &t, d);
-
-    fq_mul(&z3, &p->y, &p->z, d);
-    fq_add(&z3, &z3, &z3, d);
-
-    r->x = x3;
-    r->y = y3;
-    r->z = z3;
+    fq_sub(&r->y, &r->y, &t, d);
 }
 
 /* General addition (add-2007-bl without the doubling shortcut), falling back to doubling. */
@@ -1150,42 +1147,38 @@ static void fp4_sqr(fp2 *t, fp2 *s, const fp2 *z, const fp2 *y)
     fq_add(s, &product, &product, 2);
 }
 
-/* *z = 3 t + 2 z when plus, else 3 t - 2 z. */
-static void cyclotomic_part(fp2 *z, const fp2 *t, bool plus)
+/* *r = 3 t + 2 z when plus, else 3 t - 2 z; r may be z. */
+static void cyclotomic_part(fp2 *r, const fp2 *t, const fp2 *z, bool plus)
 {
     if (plus)
-        fq_add(z, t, z, 2);
+        fq_add(r, t, z, 2);
     else
-        fq_sub(z, t, z, 2);
-    fq_add(z, z, z, 2);
-    fq_add(z, z, t, 2);
+        fq_sub(r, t, z, 2);
+    fq_add(r, r, r, 2);
+    fq_add(r, r, t, 2);
 }
 
 /*
  * r = a^2 for a in the cyclotomic subgroup, by Granger and Scott (ePrint 2009/565): three Fp4 squarings, 18 Fp
  * products where a general square takes 36. The arrangement follows arkworks' cyclotomic_square, whose Fp6 parts
- * are the even and the odd coefficients of w here.
+ * are the even and the odd coefficients of w here. The squarings read every coefficient before any is written, and
+ * each result takes only its own coefficient after them, so r may be a with no copies of either.
  */
 NOINLINE static void fp12_cyclotomic_sqr(fp12 *r, const fp12 *a)
 {
-    fp2 z0 = a->c[W(0)], z4 = a->c[W(2)], z3 = a->c[W(4)], z2 = a->c[W(1)], z1 = a->c[W(3)], z5 = a->c[W(5)];
+    const fp2 *z0 = &a->c[W(0)], *z4 = &a->c[W(2)], *z3 = &a->c[W(4)], *z2 = &a->c[W(1)], *z1 = &a->c[W(3)],
+              *z5 = &a->c[W(5)];
     fp2 t0, t1, t2, t3, t4, t5, x;
-    fp4_sqr(&t0, &t1, &z0, &z1);
-    fp4_sqr(&t2, &t3, &z2, &z3);
-    fp4_sqr(&t4, &t5, &z4, &z5);
-    cyclotomic_part(&z0, &t0, false);
-    cyclotomic_part(&z1, &t1, true);
+    fp4_sqr(&t0, &t1, z0, z1);
+    fp4_sqr(&t2, &t3, z2, z3);
+    fp4_sqr(&t4, &t5, z4, z5);
+    cyclotomic_part(&r->c[W(0)], &t0, z0, false);
+    cyclotomic_part(&r->c[W(3)], &t1, z1, true);
     fp2_mul_xi(&x, &t5);
-    cyclotomic_part(&z2, &x, true);
-    cyclotomic_part(&z3, &t4, false);
-    cyclotomic_part(&z4, &t2, false);
-    cyclotomic_part(&z5, &t3, true);
-    r->c[W(0)] = z0;
-    r->c[W(2)] = z4;
-    r->c[W(4)] = z3;
-    r->c[W(1)] = z2;
-    r->c[W(3)] = z1;
-    r->c[W(5)] = z5;
+    cyclotomic_part(&r->c[W(1)], &x, z2, true);
+    cyclotomic_part(&r->c[W(4)], &t4, z3, false);
+    cyclotomic_part(&r->c[W(2)], &t2, z4, false);
+    cyclotomic_part(&r->c[W(5)], &t3, z5, true);
 }
 
 /* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper. */

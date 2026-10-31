@@ -28,6 +28,8 @@ __attribute__((noreturn)) void airbender_fail(uint32_t code);
 void keccak_f1600(uint64_t state[25]);
 #ifdef AIRBENDER
 void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32]);
+/* Keccak-256 of len bytes laid out as the guest's EVM memory is, from an aligned group: byte k at data[k ^ 3]. */
+void airbender_keccak256_laid_out(const uint8_t *data, size_t len, uint8_t out[32]);
 #endif
 void keccak_f1600_soft(uint64_t state[25]);
 
@@ -37,5 +39,12 @@ void keccak_f1600_soft(uint64_t state[25]);
    recovered z are taken together, an exponentiation each for the whole batch rather than per signature. */
 void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
                                          uint8_t *outputs, uint8_t *ok, uint32_t count);
+
+/* Returns 1 when airbender_secp256k1_ecrecover_batch would recover keys[i] (x || y, big-endian) from every
+   signature i, given rys[i], the big-endian y of the signature's R, and 0 otherwise, with a false 1 at a chance of
+   about 2^-127. weights holds 16 random little-endian bytes per signature, which must be drawn after the keys and
+   the ys are fixed. The checks are one multi-scalar product for the whole batch rather than a recovery each. */
+int airbender_secp256k1_verify_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
+                                     const uint8_t *keys, const uint8_t *rys, const uint8_t *weights, uint32_t count);
 
 #endif
