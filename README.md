@@ -37,6 +37,14 @@ guest):
 
 A guest that uses no accelerator links with the platform alone.
 
+The Keccak-f delegation that libairbender calls (CSRs 0x7cc, 0x7cd and
+0x7ce) is the one of the zksync-airbender branch
+`mb/keccak-03-read-ts-packed-memory-borrows` (7a147da32e0c); the `dev`
+branch and v3 have the older `keccak_special5` (0x7cb) only, and their
+transpiler rejects an image with the newer CSRs. Run and prove a guest that
+calls `zkvm_keccak256`, `keccak_f1600` or `airbender_keccak*` with that
+revision. The rest of the platform and libairbender run on `dev` too.
+
 ## Build
 
 ```bash

@@ -88,8 +88,8 @@
   "postlink": [
     {
       "tool": "patch_elf",
-      "args": ["--nop-fences", "--unsigned-muldiv"],
-      "note": "The native code carries what Airbender cannot run: FENCE, which it rejects (a single hart has nothing to order), and the signed RV32M instructions, which v3 does not prove. The JIT emits neither for managed code."
+      "args": ["--nop-fences", "--unsigned-muldiv", "--unimp-system", "--unimp-csr", "0xc22"],
+      "note": "The native code carries what Airbender cannot run: FENCE, which it rejects (a single hart has nothing to order), and the signed RV32M instructions, which v3 does not prove; the JIT emits neither for managed code. Airbender's transpiler also decodes the whole .text before the run and rejects any SYSTEM encoding it does not know: the ebreak with which the JIT ends a call to a noreturn helper, musl's ecalls, and the read of vlenb (0xc22) in the runtime's libunwind become UNIMP (csrrw x0, cycle, x0), which it takes as an illegal instruction. The guest reaches none of them."
     },
     {
       "tool": "flat_image",
