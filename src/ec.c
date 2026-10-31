@@ -367,10 +367,67 @@ NOINLINE void fq_neg(fp2 *r, const fp2 *a, int d)
     fq_sub(r, &zero, a, d);
 }
 
+/*
+ * The BN254 sum r = a + b for a product's factor, r distinct from a and b, left below 2p unreduced: with 4p < 2^256,
+ * factors below 2p keep hi(ab) below p, all fp_mul_n needs.
+ */
+static inline __attribute__((always_inline)) void fp_add_factor8(fp *r, const fp *a, const fp *b)
+{
+    u256_op(digit(r, 0), digit(a, 0), U256_MEMCOPY);
+    u256_op(digit(r, 0), digit(b, 0), U256_ADD);
+}
+
+/* The BN254 product of fp_mul_n for r distinct from a and b, which needs none of its operand checks. */
+static inline __attribute__((always_inline)) void fp_mul_new8(fp *r, const fp *a, const fp *b)
+{
+    u256d *rd = digit(r, 0);
+    u256_op(&T[0], digit(a, 0), U256_MEMCOPY);
+    u256_op(&T[0], digit(b, 0), U256_MUL_LOW);
+    u256_op(&T[0], &PInverse, U256_MUL_LOW);
+    u256_op(&T[0], &P0, U256_MUL_HIGH);
+    u256_op(rd, digit(a, 0), U256_MEMCOPY);
+    u256_op(rd, digit(b, 0), U256_MUL_HIGH);
+    uint32_t borrow = u256_op(rd, &T[0], U256_SUB);
+    if (borrow)
+        u256_op(rd, &P0, borrow);
+}
+
+/* The BN254 difference of fp_sub_n for r distinct from a and b. */
+static inline __attribute__((always_inline)) void fp_sub_new8(fp *r, const fp *a, const fp *b)
+{
+    u256d *rd = digit(r, 0);
+    u256_op(rd, digit(a, 0), U256_MEMCOPY);
+    uint32_t borrow = u256_op(rd, digit(b, 0), U256_SUB);
+    if (borrow)
+        u256_op(rd, &P0, borrow);
+}
+
 /* Fp2 by Karatsuba: (a0 + a1 u)(b0 + b1 u) = a0 b0 - a1 b1 + ((a0 + a1)(b0 + b1) - a0 b0 - a1 b1) u. */
 static inline __attribute__((always_inline)) void fq_mul_n(fp2 *r, const fp2 *a, const fp2 *b, uint32_t n)
 {
     fp t0, t1, t2, t3;
+    if (n == 8)
+    {
+        /* The temporaries are distinct from a, b and r, and r is written once nothing reads a or b. */
+        if (a == b)
+        {
+            fp_add_factor8(&t0, &a->c[0], &a->c[1]);
+            fp_sub_new8(&t1, &a->c[0], &a->c[1]);
+            fp_mul_new8(&t2, &a->c[0], &a->c[1]);
+            fp_mul_new8(&r->c[0], &t0, &t1);
+            fp_add_n(&r->c[1], &t2, &t2, 8);
+            return;
+        }
+        fp_mul_new8(&t0, &a->c[0], &b->c[0]);
+        fp_mul_new8(&t1, &a->c[1], &b->c[1]);
+        fp_add_factor8(&t2, &a->c[0], &a->c[1]);
+        fp_add_factor8(&t3, &b->c[0], &b->c[1]);
+        fp_mul_n(&t2, &t2, &t3, 8);
+        fp_sub_new8(&r->c[0], &t0, &t1);
+        fp_sub_n(&t2, &t2, &t0, 8);
+        fp_sub_new8(&r->c[1], &t2, &t1);
+        return;
+    }
     if (a == b)
     {
         /* A square by the complex method, u^2 = -1: (a0 + a1)(a0 - a1) + 2 a0 a1 u, two products for three. */
@@ -391,18 +448,26 @@ static inline __attribute__((always_inline)) void fq_mul_n(fp2 *r, const fp2 *a,
     fp_sub_n(&r->c[1], &t2, &t1, n);
 }
 
+/* Each limb count in a function of its own, which saves only the registers that count's product needs. */
+static NOINLINE void fq_mul8(fp2 *r, const fp2 *a, const fp2 *b)
+{
+    fq_mul_n(r, a, b, 8);
+}
+
+static NOINLINE void fq_mul12(fp2 *r, const fp2 *a, const fp2 *b)
+{
+    fq_mul_n(r, a, b, 12);
+}
+
 /* The field operations inline, each with the limb count as a constant. */
 NOINLINE void fq_mul(fp2 *r, const fp2 *a, const fp2 *b, int d)
 {
     if (d == 1)
-    {
         fp_mul(&r->c[0], &a->c[0], &b->c[0]);
-        return;
-    }
-    if (C->n == 8)
-        fq_mul_n(r, a, b, 8);
+    else if (C->n == 8)
+        fq_mul8(r, a, b);
     else
-        fq_mul_n(r, a, b, 12);
+        fq_mul12(r, a, b);
 }
 
 NOINLINE bool fq_is_zero(const fp2 *a, int d)
@@ -426,14 +491,74 @@ static void fq_set_one(fp2 *r)
     r->c[0] = C->one;
 }
 
+/*
+ * The degree-d field operations of the point formulas and of fq_pow. On BN254's Fp (g1: eight limbs, degree 1) they
+ * run inline, as a call through fq_* and its degree and limb-count dispatch costs about three times the product it
+ * makes; every other field takes the out-of-line fq_*, which keeps the code small. Elements are reduced, so equality
+ * compares limbs.
+ */
+#define PT_OP static inline __attribute__((always_inline))
+
+PT_OP void pt_fmul(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+{
+    if (g1)
+        fp_mul_n(&r->c[0], &a->c[0], &b->c[0], 8);
+    else
+        fq_mul(r, a, b, d);
+}
+
+PT_OP void pt_fadd(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+{
+    if (g1)
+        fp_add_n(&r->c[0], &a->c[0], &b->c[0], 8);
+    else
+        fq_add(r, a, b, d);
+}
+
+PT_OP void pt_fsub(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+{
+    if (g1)
+        fp_sub_n(&r->c[0], &a->c[0], &b->c[0], 8);
+    else
+        fq_sub(r, a, b, d);
+}
+
+PT_OP bool pt_fzero(const fp2 *a, int d, bool g1)
+{
+    if (!g1)
+        return fq_is_zero(a, d);
+    uint32_t acc = 0;
+    for (int i = 0; i < 8; i++)
+        acc |= a->c[0].l[i];
+    return acc == 0;
+}
+
+PT_OP bool pt_feq(const fp2 *a, const fp2 *b, int d, bool g1)
+{
+    if (!g1)
+        return fq_eq(a, b, d);
+    uint32_t acc = 0;
+    for (int i = 0; i < 8; i++)
+        acc |= a->c[0].l[i] ^ b->c[0].l[i];
+    return acc == 0;
+}
+
+PT_OP bool pt_fone(const fp2 *a, int d, bool g1)
+{
+    uint32_t n = g1 ? 8 : C->n, acc = 0;
+    for (uint32_t i = 0; i < n; i++)
+        acc |= (a->c[0].l[i] ^ C->one.l[i]) | (d == 2 ? a->c[1].l[i] : 0);
+    return acc == 0;
+}
+
 /* a^e by 4-bit windows from the top non-zero one: 14 products for the table, then one per window. */
-NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
+PT_OP void fq_pow_in(fp2 *r, const fp2 *a, const fp *e, int d, bool g1)
 {
     fp2 table[16], acc;
     fq_set_one(&table[0]);
     table[1] = *a;
     for (int i = 2; i < 16; i++)
-        fq_mul(&table[i], &table[i - 1], a, d);
+        pt_fmul(&table[i], &table[i - 1], a, d, g1);
 
     int window = 8 * (int)C->n - 1;
     while (window > 0 && ((e->l[window / 8] >> (4 * (window % 8))) & 15) == 0)
@@ -442,12 +567,20 @@ NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
     for (window--; window >= 0; window--)
     {
         for (int s = 0; s < 4; s++)
-            fq_mul(&acc, &acc, &acc, d);
+            pt_fmul(&acc, &acc, &acc, d, g1);
         uint32_t bits = (e->l[window / 8] >> (4 * (window % 8))) & 15;
         if (bits)
-            fq_mul(&acc, &acc, &table[bits], d);
+            pt_fmul(&acc, &acc, &table[bits], d, g1);
     }
     *r = acc;
+}
+
+NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
+{
+    if (d == 1 && C->n == 8)
+        fq_pow_in(r, a, e, 1, true);
+    else
+        fq_pow_in(r, a, e, d, false);
 }
 
 /* Inverse by Fermat in Fp; in Fp2 through the norm, 1/(a0 + a1 u) = (a0 - a1 u)/(a0^2 + a1^2). */
@@ -615,8 +748,8 @@ NOINLINE static void fp2_mul_xi(fp2 *r, const fp2 *a)
         k_for = C;
     }
     fp2 k;
-    fp_mul_n(&k.c[0], &a->c[0], &k_mont, 8);
-    fp_mul_n(&k.c[1], &a->c[1], &k_mont, 8);
+    fp_mul_new8(&k.c[0], &a->c[0], &k_mont);
+    fp_mul_new8(&k.c[1], &a->c[1], &k_mont);
     fp2_mul_xi_n(r, a, &k, 8);
 }
 
@@ -633,95 +766,124 @@ bool pt_is_inf(const point *p, int d)
 }
 
 /* Doubling for a = 0 (dbl-2009-l). */
-NOINLINE void pt_dbl(point *r, const point *p, int d)
+PT_OP void pt_dbl_in(point *r, const point *p, int d, bool g1)
 {
-    if (pt_is_inf(p, d) || fq_is_zero(&p->y, d))
+    if (pt_fzero(&p->z, d, g1) || pt_fzero(&p->y, d, g1))
     {
         pt_set_inf(r);
         return;
     }
     fp2 xx, yy, yyyy, s, m, t;
-    fq_mul(&xx, &p->x, &p->x, d);
-    fq_mul(&yy, &p->y, &p->y, d);
-    fq_mul(&yyyy, &yy, &yy, d);
+    pt_fmul(&xx, &p->x, &p->x, d, g1);
+    pt_fmul(&yy, &p->y, &p->y, d, g1);
+    pt_fmul(&yyyy, &yy, &yy, d, g1);
 
-    fq_mul(&s, &p->x, &yy, d);
-    fq_add(&s, &s, &s, d);
-    fq_add(&s, &s, &s, d);
+    pt_fmul(&s, &p->x, &yy, d, g1);
+    pt_fadd(&s, &s, &s, d, g1);
+    pt_fadd(&s, &s, &s, d, g1);
 
-    fq_add(&m, &xx, &xx, d);
-    fq_add(&m, &m, &xx, d);
+    pt_fadd(&m, &xx, &xx, d, g1);
+    pt_fadd(&m, &m, &xx, d, g1);
 
     /* Each coordinate is written once nothing reads its input any more, so r may be p with no copies. */
-    fq_mul(&r->z, &p->y, &p->z, d);
-    fq_add(&r->z, &r->z, &r->z, d);
+    pt_fmul(&r->z, &p->y, &p->z, d, g1);
+    pt_fadd(&r->z, &r->z, &r->z, d, g1);
 
-    fq_mul(&r->x, &m, &m, d);
-    fq_sub(&r->x, &r->x, &s, d);
-    fq_sub(&r->x, &r->x, &s, d);
+    pt_fmul(&r->x, &m, &m, d, g1);
+    pt_fsub(&r->x, &r->x, &s, d, g1);
+    pt_fsub(&r->x, &r->x, &s, d, g1);
 
-    fq_sub(&t, &s, &r->x, d);
-    fq_mul(&r->y, &m, &t, d);
-    fq_add(&t, &yyyy, &yyyy, d);
-    fq_add(&t, &t, &t, d);
-    fq_add(&t, &t, &t, d);
-    fq_sub(&r->y, &r->y, &t, d);
+    pt_fsub(&t, &s, &r->x, d, g1);
+    pt_fmul(&r->y, &m, &t, d, g1);
+    pt_fadd(&t, &yyyy, &yyyy, d, g1);
+    pt_fadd(&t, &t, &t, d, g1);
+    pt_fadd(&t, &t, &t, d, g1);
+    pt_fsub(&r->y, &r->y, &t, d, g1);
+}
+
+NOINLINE void pt_dbl(point *r, const point *p, int d)
+{
+    if (d == 1 && C->n == 8)
+        pt_dbl_in(r, p, 1, true);
+    else
+        pt_dbl_in(r, p, d, false);
 }
 
 /* General addition (add-2007-bl without the doubling shortcut), falling back to doubling. */
-NOINLINE void pt_add(point *r, const point *p, const point *q, int d)
+PT_OP void pt_add_in(point *r, const point *p, const point *q, int d, bool g1)
 {
-    if (pt_is_inf(p, d))
+    if (pt_fzero(&p->z, d, g1))
     {
         *r = *q;
         return;
     }
-    if (pt_is_inf(q, d))
+    if (pt_fzero(&q->z, d, g1))
     {
         *r = *p;
         return;
     }
-    fp2 z1z1, z2z2, u1, u2, s1, s2, h, rr, hh, hhh, v, x3, y3, z3, t;
-    fq_mul(&z1z1, &p->z, &p->z, d);
-    fq_mul(&z2z2, &q->z, &q->z, d);
-    fq_mul(&u1, &p->x, &z2z2, d);
-    fq_mul(&u2, &q->x, &z1z1, d);
-    fq_mul(&t, &q->z, &z2z2, d);
-    fq_mul(&s1, &p->y, &t, d);
-    fq_mul(&t, &p->z, &z1z1, d);
-    fq_mul(&s2, &q->y, &t, d);
-
-    if (fq_eq(&u1, &u2, d))
+    fp2 z1z1, z2z2, u1v, u2, s1v, s2, h, rr, hh, hhh, v, x3, y3, z3, t;
+    /* An affine q (z = 1, as loaded) leaves p's coordinates as they are: five products fewer. */
+    bool q_affine = pt_fone(&q->z, d, g1);
+    const fp2 *u1 = &p->x, *s1 = &p->y;
+    pt_fmul(&z1z1, &p->z, &p->z, d, g1);
+    if (!q_affine)
     {
-        if (fq_eq(&s1, &s2, d))
+        pt_fmul(&z2z2, &q->z, &q->z, d, g1);
+        pt_fmul(&u1v, &p->x, &z2z2, d, g1);
+        pt_fmul(&t, &q->z, &z2z2, d, g1);
+        pt_fmul(&s1v, &p->y, &t, d, g1);
+        u1 = &u1v;
+        s1 = &s1v;
+    }
+    pt_fmul(&u2, &q->x, &z1z1, d, g1);
+    pt_fmul(&t, &p->z, &z1z1, d, g1);
+    pt_fmul(&s2, &q->y, &t, d, g1);
+
+    if (pt_feq(u1, &u2, d, g1))
+    {
+        if (pt_feq(s1, &s2, d, g1))
             pt_dbl(r, p, d);
         else
             pt_set_inf(r);
         return;
     }
 
-    fq_sub(&h, &u2, &u1, d);
-    fq_sub(&rr, &s2, &s1, d);
-    fq_mul(&hh, &h, &h, d);
-    fq_mul(&hhh, &hh, &h, d);
-    fq_mul(&v, &u1, &hh, d);
+    pt_fsub(&h, &u2, u1, d, g1);
+    pt_fsub(&rr, &s2, s1, d, g1);
+    pt_fmul(&hh, &h, &h, d, g1);
+    pt_fmul(&hhh, &hh, &h, d, g1);
+    pt_fmul(&v, u1, &hh, d, g1);
 
-    fq_mul(&x3, &rr, &rr, d);
-    fq_sub(&x3, &x3, &hhh, d);
-    fq_sub(&x3, &x3, &v, d);
-    fq_sub(&x3, &x3, &v, d);
+    pt_fmul(&x3, &rr, &rr, d, g1);
+    pt_fsub(&x3, &x3, &hhh, d, g1);
+    pt_fsub(&x3, &x3, &v, d, g1);
+    pt_fsub(&x3, &x3, &v, d, g1);
 
-    fq_sub(&t, &v, &x3, d);
-    fq_mul(&y3, &rr, &t, d);
-    fq_mul(&t, &s1, &hhh, d);
-    fq_sub(&y3, &y3, &t, d);
+    pt_fsub(&t, &v, &x3, d, g1);
+    pt_fmul(&y3, &rr, &t, d, g1);
+    pt_fmul(&t, s1, &hhh, d, g1);
+    pt_fsub(&y3, &y3, &t, d, g1);
 
-    fq_mul(&z3, &p->z, &q->z, d);
-    fq_mul(&z3, &z3, &h, d);
+    if (q_affine)
+        pt_fmul(&z3, &p->z, &h, d, g1);
+    else
+    {
+        pt_fmul(&z3, &p->z, &q->z, d, g1);
+        pt_fmul(&z3, &z3, &h, d, g1);
+    }
 
     r->x = x3;
     r->y = y3;
     r->z = z3;
+}
+
+NOINLINE void pt_add(point *r, const point *p, const point *q, int d)
+{
+    if (d == 1 && C->n == 8)
+        pt_add_in(r, p, q, 1, true);
+    else
+        pt_add_in(r, p, q, d, false);
 }
 
 void pt_neg(point *r, const point *p, int d)
@@ -730,18 +892,97 @@ void pt_neg(point *r, const point *p, int d)
     fq_neg(&r->y, &p->y, d);
 }
 
-/* k*p for a big-endian scalar of any length, by double-and-add. */
+static inline uint32_t scalar_bit(const uint8_t *k, size_t klen, size_t i)
+{
+    return i < 8 * klen ? (k[klen - 1 - i / 8] >> (i % 8)) & 1 : 0;
+}
+
+/*
+ * The digits of the big-endian k, least significant first, for a double-and-add loop: its non-adjacent form (-1, 0
+ * or 1, no two adjacent non-zero) when that saves additions net of the extra step a longer form takes, else its
+ * bits. Returns the digit count, at most 8 klen + 1, the top digit 1; none for k = 0.
+ */
+static int scalar_digits(int8_t *dg, const uint8_t *k, size_t klen)
+{
+    int naf_len = 0, naf_weight = 0, bin_len = 0, bin_weight = 0;
+    uint32_t carry = 0;
+    for (size_t i = 0; i < 8 * klen || carry; i++)
+    {
+        uint32_t bit = scalar_bit(k, klen, i), v = bit + carry;
+        int8_t z = 0;
+        if (v == 1)
+        {
+            carry = scalar_bit(k, klen, i + 1);
+            z = carry ? -1 : 1;
+            naf_len = (int)i + 1;
+            naf_weight++;
+        }
+        else
+            carry = v >> 1;
+        dg[i] = z;
+        if (bit)
+        {
+            bin_len = (int)i + 1;
+            bin_weight++;
+        }
+    }
+    if (naf_weight + (naf_len - bin_len) < bin_weight)
+        return naf_len;
+    for (int i = 0; i < bin_len; i++)
+        dg[i] = (int8_t)scalar_bit(k, klen, (size_t)i);
+    return bin_len;
+}
+
+/* |x|, the curve family parameter, big-endian. */
+static void x_bytes(uint8_t k[8])
+{
+    for (int i = 0; i < 8; i++)
+        k[i] = (uint8_t)(C->x >> (56 - 8 * i));
+}
+
+enum
+{
+    MaxScalarBytes = 32
+};
+
+/* k*p for a big-endian scalar of at most MaxScalarBytes, by double-and-add on scalar_digits. */
 void pt_mul(point *r, const point *p, const uint8_t *k, size_t klen, int d)
 {
-    point base = *p, acc;
+    int8_t dg[8 * MaxScalarBytes + 1];
+    int n = scalar_digits(dg, k, klen);
+    if (n == 0)
+    {
+        pt_set_inf(r);
+        return;
+    }
+    point base = *p, neg, acc = *p;
+    pt_neg(&neg, p, d);
+    for (int i = n - 2; i >= 0; i--)
+    {
+        pt_dbl(&acc, &acc, d);
+        if (dg[i])
+            pt_add(&acc, &acc, dg[i] > 0 ? &base : &neg, d);
+    }
+    *r = acc;
+}
+
+/* kp*p + kq*q for big-endian scalars of klen bytes each, at most MaxScalarBytes, by one double-and-add over both. */
+void pt_mul2(point *r, const point *p, const uint8_t *kp, const point *q, const uint8_t *kq, size_t klen, int d)
+{
+    int8_t dp[8 * MaxScalarBytes + 1], dq[8 * MaxScalarBytes + 1];
+    int np = scalar_digits(dp, kp, klen), nq = scalar_digits(dq, kq, klen);
+    point negp, negq, acc;
+    pt_neg(&negp, p, d);
+    pt_neg(&negq, q, d);
     pt_set_inf(&acc);
-    for (size_t i = 0; i < klen; i++)
-        for (int b = 7; b >= 0; b--)
-        {
-            pt_dbl(&acc, &acc, d);
-            if ((k[i] >> b) & 1)
-                pt_add(&acc, &acc, &base, d);
-        }
+    for (int i = (np > nq ? np : nq) - 1; i >= 0; i--)
+    {
+        pt_dbl(&acc, &acc, d);
+        if (i < np && dp[i])
+            pt_add(&acc, &acc, dp[i] > 0 ? p : &negp, d);
+        if (i < nq && dq[i])
+            pt_add(&acc, &acc, dq[i] > 0 ? q : &negq, d);
+    }
     *r = acc;
 }
 
@@ -749,8 +990,7 @@ void pt_mul(point *r, const point *p, const uint8_t *k, size_t klen, int d)
 void pt_mul_x(point *r, const point *p, int d)
 {
     uint8_t k[8];
-    for (int i = 0; i < 8; i++)
-        k[i] = (uint8_t)(C->x >> (56 - 8 * i));
+    x_bytes(k);
     pt_mul(r, p, k, sizeof(k), d);
     if (C->xneg)
         pt_neg(r, r, d);
@@ -1181,16 +1421,22 @@ NOINLINE static void fp12_cyclotomic_sqr(fp12 *r, const fp12 *a)
     cyclotomic_part(&r->c[W(5)], &t3, z5, true);
 }
 
-/* a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper. */
+/*
+ * a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper and the
+ * conjugate is the inverse that a negative digit multiplies by.
+ */
 NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 {
-    fp12 acc, base = *a;
-    fp12_one(&acc);
-    for (int i = 63; i >= 0; i--)
+    uint8_t k[8];
+    int8_t dg[8 * sizeof(k) + 1];
+    x_bytes(k);
+    fp12 acc = *a, base = *a, inv;
+    fp12_conj(&inv, a);
+    for (int i = scalar_digits(dg, k, sizeof(k)) - 2; i >= 0; i--)
     {
         fp12_cyclotomic_sqr(&acc, &acc);
-        if ((C->x >> i) & 1)
-            fp12_mul(&acc, &acc, &base);
+        if (dg[i])
+            fp12_mul(&acc, &acc, dg[i] > 0 ? &base : &inv);
     }
     if (C->xneg)
         fp12_conj(&acc, &acc);
@@ -1306,7 +1552,7 @@ NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *
  */
 void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
 {
-    point pa[PairingBatch], qa[PairingBatch], t[PairingBatch];
+    point pa[PairingBatch], qa[PairingBatch], qn[PairingBatch], t[PairingBatch];
     int k = 0;
     for (int i = 0; i < count; i++)
     {
@@ -1316,6 +1562,7 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
         qa[k] = g2[i];
         pt_set_affine(&pa[k], 1);
         pt_set_affine(&qa[k], 2);
+        pt_neg(&qn[k], &qa[k], 2);
         t[k] = qa[k];
         k++;
     }
@@ -1324,9 +1571,9 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
     fp12 acc;
     line l;
     fp12_one(&acc);
-    int top = 8 * (int)sizeof(C->loop) - 1;
-    while (!((C->loop[sizeof(C->loop) - 1 - top / 8] >> (top % 8)) & 1))
-        top--;
+    /* A digit -1 adds -q: the Miller function for -1 is a vertical line, which the final exponentiation removes. */
+    int8_t dg[8 * sizeof(C->loop) + 1];
+    int top = scalar_digits(dg, C->loop, sizeof(C->loop)) - 1;
     for (int i = top - 1; i >= 0; i--)
     {
         /* The first square is of 1. */
@@ -1337,9 +1584,9 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
             miller_dbl(&l, &t[j], &pa[j]);
             fp12_mul_line(&acc, &l);
         }
-        if ((C->loop[sizeof(C->loop) - 1 - i / 8] >> (i % 8)) & 1)
+        if (dg[i])
             for (int j = 0; j < k; j++)
-                miller_add(&acc, &t[j], &qa[j], &pa[j]);
+                miller_add(&acc, &t[j], dg[i] > 0 ? &qa[j] : &qn[j], &pa[j]);
     }
     if (!C->mtwist)
     {
