@@ -1114,7 +1114,21 @@ enum
 static apoint MsmBase[MsmTerms];
 static u256d MsmScalar[MsmTerms]; /* plain */
 static int8_t MsmDigits[MsmMaxDigits][MsmTerms];
-static jpoint MsmBuckets[1 << (MsmMaxWindow - 1)];
+/* The buckets of all windows at once, affine, with Jacobian spill buckets beside them. With MsmMaxWindow the largest
+   window, its count of buckets bounds every smaller window's. */
+enum
+{
+    MsmWindowsAtMax = (129 + MsmMaxWindow - 1) / MsmMaxWindow + 1,
+    MsmMaxBuckets = MsmWindowsAtMax << (MsmMaxWindow - 1),
+    /* Additions that share an inversion: an inversion costs about 60 additions' savings. */
+    MsmBatchSize = 256
+};
+static apoint MsmBucket[MsmMaxBuckets];
+static jpoint MsmSpill[MsmMaxBuckets];
+static uint8_t MsmFilled[MsmMaxBuckets];
+static uint16_t MsmStamp[MsmMaxBuckets];
+static uint32_t MsmBatch[MsmBatchSize];
+static u256d MsmDen[MsmBatchSize], MsmPrefix[MsmBatchSize];
 static u256d VerifyS[VerifyBatch], VerifyPrefix[VerifyBatch];
 
 /* The c-bit window of k at bit `at`; k has 256 bits, at + c stays below them. */
@@ -1125,6 +1139,130 @@ static uint32_t window_bits(const u256d *k, int at, int c)
     if (offset + c > 32)
         bits |= k->w[limb + 1] << (32 - offset);
     return bits & ((1u << c) - 1);
+}
+
+/* (x, y) = 2 (x, y) for an affine point; secp256k1 has no point with y = 0. Rare: the bucket fill below needs it
+   only when a term meets its own multiple. */
+static void affine_double(apoint *p, const mont_ctx *f)
+{
+    jpoint t = {p->x, p->y, f->one};
+    u256d zi, zi2;
+    jdouble0(&t, &t, f);
+    field_inverse(&zi, &t.z, f);
+    MUL(&zi2, &zi, &zi);
+    MUL(&p->x, &t.x, &zi2);
+    MUL(&zi2, &zi2, &zi);
+    MUL(&p->y, &t.y, &zi2);
+}
+
+/* The y of term i, negated for a negative digit: the base's own or, negated, in *t. */
+static inline __attribute__((always_inline)) const u256d *msm_y(uint32_t i, int negative, u256d *t, const mont_ctx *f)
+{
+    if (!negative)
+        return &MsmBase[i].y;
+    u256d zero = {{0}};
+    SUB(t, &zero, &MsmBase[i].y);
+    return t;
+}
+
+/* Adds the batch's terms into their affine buckets. acc is the product of the denominators; walking back, acc times
+   the product of those before k is 1 / den_k. */
+static void msm_flush(uint32_t batch, const u256d *product, int buckets, const mont_ctx *f)
+{
+    u256d acc;
+    field_inverse(&acc, product, f);
+    for (uint32_t k = batch; k-- > 0;)
+    {
+        uint32_t code = MsmBatch[k], i = code >> 6, j = code & 63;
+        int d = MsmDigits[j][i];
+        apoint *a = &MsmBucket[j * (uint32_t)buckets + (uint32_t)(d < 0 ? -d : d) - 1];
+        u256d inv, lambda, x3, t, ny;
+        const u256d *y = msm_y(i, d < 0, &ny, f);
+        MUL(&inv, &acc, &MsmPrefix[k]);
+        MUL(&acc, &acc, &MsmDen[k]);
+        SUB(&lambda, y, &a->y);
+        MUL(&lambda, &lambda, &inv);
+        MUL(&x3, &lambda, &lambda);
+        SUB(&x3, &x3, &a->x);
+        SUB(&x3, &x3, &MsmBase[i].x);
+        SUB(&t, &a->x, &x3);
+        MUL(&t, &t, &lambda);
+        SUB(&a->y, &t, &a->y);
+        u256_op(&a->x, &x3, U256_MEMCOPY);
+    }
+}
+
+/*
+ * Adds each term into its bucket of every window. The additions go in batches that share one inversion (Montgomery's
+ * trick) into affine buckets: 6 products each where a mixed addition into a Jacobian bucket takes 11. A batch takes at
+ * most one addition per bucket, as the next one needs its result; a term whose bucket is already in the batch goes
+ * into that bucket's Jacobian spill instead, which the top windows, with few distinct digits, use most.
+ */
+static void msm_fill(uint32_t terms, int digits, int buckets, const mont_ctx *f)
+{
+    uint32_t count = (uint32_t)digits * (uint32_t)buckets, batch = 0;
+    uint16_t stamp = 1;
+    memset(MsmFilled, 0, count);
+    memset(MsmStamp, 0, sizeof(MsmStamp[0]) * count);
+    for (uint32_t b = 0; b < count; b++)
+        MsmSpill[b].z = (u256d){{0}};
+    u256d acc = f->one, ny;
+    for (uint32_t i = 0; i < terms; i++)
+        for (int j = 0; j < digits; j++)
+        {
+            int d = MsmDigits[j][i];
+            if (!d)
+                continue;
+            uint32_t b = (uint32_t)j * (uint32_t)buckets + (uint32_t)(d < 0 ? -d : d) - 1;
+            apoint *a = &MsmBucket[b];
+            if (!MsmFilled[b])
+            {
+                u256_op(&a->x, &MsmBase[i].x, U256_MEMCOPY);
+                u256_op(&a->y, msm_y(i, d < 0, &ny, f), U256_MEMCOPY);
+                MsmFilled[b] = 1;
+                continue;
+            }
+            if (MsmStamp[b] == stamp)
+            {
+                apoint q;
+                u256_op(&q.x, &MsmBase[i].x, U256_MEMCOPY);
+                u256_op(&q.y, msm_y(i, d < 0, &ny, f), U256_MEMCOPY);
+                jpoint *spill = &MsmSpill[b];
+                if (is_zero(&spill->z))
+                {
+                    spill->x = q.x;
+                    spill->y = q.y;
+                    spill->z = f->one;
+                }
+                else
+                    jadd_ge(spill, &q, f);
+                continue;
+            }
+            u256d *den = &MsmDen[batch];
+            SUB(den, &MsmBase[i].x, &a->x);
+            if (is_zero(den))
+            {
+                /* The term is the bucket's point, or its negative. */
+                if (equal(msm_y(i, d < 0, &ny, f), &a->y))
+                    affine_double(a, f);
+                else
+                    MsmFilled[b] = 0;
+                continue;
+            }
+            MsmStamp[b] = stamp;
+            u256_op(&MsmPrefix[batch], &acc, U256_MEMCOPY);
+            MUL(&acc, &acc, den);
+            MsmBatch[batch++] = i << 6 | (uint32_t)j;
+            if (batch == MsmBatchSize)
+            {
+                msm_flush(batch, &acc, buckets, f);
+                batch = 0;
+                stamp++;
+                acc = f->one;
+            }
+        }
+    if (batch)
+        msm_flush(batch, &acc, buckets, f);
 }
 
 /* Whether the sum of MsmScalar[i] MsmBase[i] over the first `terms` is the point at infinity. */
@@ -1147,6 +1285,7 @@ static int msm_is_infinity(uint32_t terms, const curve *cv)
             MsmDigits[j][i] = (int8_t)(carry ? v - (1 << c) : v);
         }
     }
+    msm_fill(terms, digits, buckets, f);
 
     jpoint acc;
     acc.z = zero;
@@ -1155,39 +1294,25 @@ static int msm_is_infinity(uint32_t terms, const curve *cv)
         if (!is_zero(&acc.z))
             for (int k = 0; k < c; k++)
                 jdouble0(&acc, &acc, f);
-        for (int b = 0; b < buckets; b++)
-            MsmBuckets[b].z = zero;
-        for (uint32_t i = 0; i < terms; i++)
-        {
-            int d = MsmDigits[j][i];
-            if (!d)
-                continue;
-            const apoint *q = &MsmBase[i];
-            apoint negated;
-            if (d < 0)
-            {
-                negated.x = q->x;
-                SUB(&negated.y, &zero, &q->y);
-                q = &negated;
-                d = -d;
-            }
-            jpoint *bucket = &MsmBuckets[d - 1];
-            if (is_zero(&bucket->z))
-            {
-                bucket->x = q->x;
-                bucket->y = q->y;
-                bucket->z = f->one;
-            }
-            else
-                jadd_ge(bucket, q, f);
-        }
         /* sum b * bucket[b - 1] as a running sum from the top bucket down. */
         jpoint running, total;
         running.z = zero;
         total.z = zero;
         for (int b = buckets - 1; b >= 0; b--)
         {
-            jadd_jacobian(&running, &MsmBuckets[b], f);
+            const apoint *q = &MsmBucket[j * buckets + b];
+            if (MsmFilled[j * buckets + b])
+            {
+                if (is_zero(&running.z))
+                {
+                    running.x = q->x;
+                    running.y = q->y;
+                    running.z = f->one;
+                }
+                else
+                    jadd_ge(&running, q, f);
+            }
+            jadd_jacobian(&running, &MsmSpill[j * buckets + b], f);
             jadd_jacobian(&total, &running, f);
         }
         jadd_jacobian(&acc, &total, f);

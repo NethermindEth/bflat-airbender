@@ -302,8 +302,24 @@ static size_t funnel_copy(uint8_t *d, const uint8_t *s, size_t n)
     size_t blocks = n >> 5;
     if (m == 0)
     {
-        for (size_t i = 0; i < blocks; i++)
-            u256_op(&out[i], &a[i], U256_MEMCOPY);
+        /* Four blocks a round, then one at a time: each block is the delegation and the two pointer steps, where the
+           compiler would rebuild both pointers and keep a count. The delegation keeps a0 and a1. */
+        register uint32_t x10 __asm__("a0") = (uint32_t)out;
+        register uint32_t x11 __asm__("a1") = (uint32_t)a;
+        uint32_t rounds_end = (uint32_t)(out + (blocks & ~(size_t)3)), end = (uint32_t)(out + blocks);
+#define MEMCOPY_BLOCK "li a2, 0x80\n csrrw x0, 0x7ca, x0\n addi a0, a0, 32\n addi a1, a1, 32\n"
+        __asm__ volatile("beq a0, %[rounds_end], 2f\n"
+                         "1:\n" MEMCOPY_BLOCK MEMCOPY_BLOCK MEMCOPY_BLOCK MEMCOPY_BLOCK
+                         "bne a0, %[rounds_end], 1b\n"
+                         "2:\n"
+                         "beq a0, %[end], 4f\n"
+                         "3:\n" MEMCOPY_BLOCK
+                         "bne a0, %[end], 3b\n"
+                         "4:\n"
+                         : "+r"(x10), "+r"(x11)
+                         : [rounds_end] "r"(rounds_end), [end] "r"(end)
+                         : "a2", "memory");
+#undef MEMCOPY_BLOCK
         return blocks << 5;
     }
     if (!FunnelReady)
@@ -327,14 +343,52 @@ static size_t funnel_copy(uint8_t *d, const uint8_t *s, size_t n)
     return blocks << 5;
 }
 
-/* The word loops: a misaligned source is read as the aligned words that cover it, each output word merged from two
-   of them, and the last may run up to three bytes past the source within its own aligned word. */
+__attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_bytes(uint8_t *d, const uint8_t *s, size_t n)
+{
+    /* Stepped by the destination alone, with the source at a fixed distance: one increment a byte. */
+    ptrdiff_t distance = s - d;
+    uint8_t *end = d + n;
+    for (; d != end; d++)
+        *d = d[distance];
+}
+
+/* The word loop for a source misaligned to the word-aligned d: each output word is merged from the two aligned
+   source words that cover it, and the last may run up to three bytes past the source within its own aligned word.
+   Out of line: its eight live words take saved registers, which the other paths then need not save. */
+__attribute__((no_builtin("memcpy"), noinline)) static void copy_merged(uint32_t *dw, const uint8_t *s, size_t n)
+{
+    uint32_t misalignment = (uintptr_t)s & 3;
+    const uint32_t *sw = (const uint32_t *)(s - misalignment);
+    uint32_t low = 8 * misalignment, high = 32 - low;
+    uint32_t current = *sw++;
+    for (; n >= 32; n -= 32, dw += 8, sw += 8)
+    {
+        uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
+        dw[0] = (current >> low) | (w0 << high);
+        dw[1] = (w0 >> low) | (w1 << high);
+        dw[2] = (w1 >> low) | (w2 << high);
+        dw[3] = (w2 >> low) | (w3 << high);
+        dw[4] = (w3 >> low) | (w4 << high);
+        dw[5] = (w4 >> low) | (w5 << high);
+        dw[6] = (w5 >> low) | (w6 << high);
+        dw[7] = (w6 >> low) | (w7 << high);
+        current = w7;
+    }
+    for (; n >= 4; n -= 4)
+    {
+        uint32_t next = *sw++;
+        *dw++ = (current >> low) | (next << high);
+        current = next;
+    }
+    copy_bytes((uint8_t *)dw, (const uint8_t *)sw - 4 + misalignment, n);
+}
+
+/* The word loops, for a misaligned source by copy_merged. */
 __attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_words(uint8_t *d, const uint8_t *s, size_t n)
 {
     if (n < 16)
     {
-        while (n--)
-            *d++ = *s++;
+        copy_bytes(d, s, n);
         return;
     }
     while ((uintptr_t)d & 3)
@@ -343,8 +397,11 @@ __attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_wor
         n--;
     }
     uint32_t *dw = (uint32_t *)d;
-    uint32_t misalignment = (uintptr_t)s & 3;
-    if (misalignment == 0)
+    if ((uintptr_t)s & 3)
+    {
+        copy_merged(dw, s, n);
+        return;
+    }
     {
         const uint32_t *sw = (const uint32_t *)s;
         for (; n >= 32; n -= 32, dw += 8, sw += 8)
@@ -361,40 +418,11 @@ __attribute__((no_builtin("memcpy"), always_inline)) static inline void copy_wor
         }
         for (; n >= 4; n -= 4)
             *dw++ = *sw++;
-        s = (const uint8_t *)sw;
+        copy_bytes((uint8_t *)dw, (const uint8_t *)sw, n);
     }
-    else
-    {
-        const uint32_t *sw = (const uint32_t *)(s - misalignment);
-        uint32_t low = 8 * misalignment, high = 32 - low;
-        uint32_t current = *sw++;
-        for (; n >= 32; n -= 32, dw += 8, sw += 8)
-        {
-            uint32_t w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3], w4 = sw[4], w5 = sw[5], w6 = sw[6], w7 = sw[7];
-            dw[0] = (current >> low) | (w0 << high);
-            dw[1] = (w0 >> low) | (w1 << high);
-            dw[2] = (w1 >> low) | (w2 << high);
-            dw[3] = (w2 >> low) | (w3 << high);
-            dw[4] = (w3 >> low) | (w4 << high);
-            dw[5] = (w4 >> low) | (w5 << high);
-            dw[6] = (w5 >> low) | (w6 << high);
-            dw[7] = (w6 >> low) | (w7 << high);
-            current = w7;
-        }
-        for (; n >= 4; n -= 4)
-        {
-            uint32_t next = *sw++;
-            *dw++ = (current >> low) | (next << high);
-            current = next;
-        }
-        s = (const uint8_t *)sw - 4 + misalignment;
-    }
-    d = (uint8_t *)dw;
-    while (n--)
-        *d++ = *s++;
 }
 
-__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+__attribute__((no_builtin("memcpy"), noinline)) static void *copy_long(void *restrict dest, const void *restrict src, size_t n)
 {
     uint8_t *d = dest;
     const uint8_t *s = src;
@@ -416,6 +444,18 @@ __attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, c
         n -= done;
     }
     copy_words(d, s, n);
+    /* Hidden from the compiler, which would otherwise know the result is dest and keep dest in __wrap_memcpy across
+       the call instead of jumping to it. */
+    __asm__("" : "+r"(dest));
+    return dest;
+}
+
+/* Most copies are a few bytes: they take the byte loop before copy_long's frame. */
+__attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, const void *restrict src, size_t n)
+{
+    if (n >= 16)
+        return copy_long(dest, src, n);
+    copy_bytes(dest, src, n);
     return dest;
 }
 
