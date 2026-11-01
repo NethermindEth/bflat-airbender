@@ -76,14 +76,21 @@ static inline void fp_copy(fp *r, const fp *a, uint32_t n)
         u256_op(digit(r, 1), digit(a, 1), U256_MEMCOPY);
 }
 
+/* The top limb of BN254's p, the one prime of eight limbs here. */
+enum
+{
+    Bn254PTop = 0x30644e72
+};
+
 /* r -= p when r >= p, for r below 2p. */
 static inline __attribute__((always_inline)) void fp_reduce(fp *r, uint32_t n)
 {
     /* A top limb below p's settles it without the trial subtraction, and one above makes r > p, so p comes off in
        place; only an equal top limb needs the trial. */
-    if (r->l[n - 1] < C->p.l[n - 1])
+    uint32_t top = n == 8 ? Bn254PTop : C->p.l[n - 1];
+    if (r->l[n - 1] < top)
         return;
-    if (r->l[n - 1] > C->p.l[n - 1])
+    if (r->l[n - 1] > top)
     {
         uint32_t below = u256_op(digit(r, 0), &P0, U256_SUB);
         if (n > 8)
@@ -110,15 +117,14 @@ static inline __attribute__((always_inline)) void fp_add_n(fp *r, const fp *a, c
 {
     if (r == b)
     {
-        const fp *t = a;
-        a = b;
-        b = t;
-    }
-    if (r == b)
-    {
-        /* a, b and r are one element: double a copy of it. */
-        fp_copy(&Scratch, b, n);
-        b = &Scratch;
+        /* r += a; when a is r too, r doubles a copy of itself. */
+        b = a;
+        a = r;
+        if (b == r)
+        {
+            fp_copy(&Scratch, r, n);
+            b = &Scratch;
+        }
     }
     fp_copy(r, a, n);
     uint32_t carry = u256_op(digit(r, 0), digit(b, 0), U256_ADD);
@@ -492,73 +498,82 @@ static void fq_set_one(fp2 *r)
 }
 
 /*
- * The degree-d field operations of the point formulas and of fq_pow. On BN254's Fp (g1: eight limbs, degree 1) they
- * run inline, as a call through fq_* and its degree and limb-count dispatch costs about three times the product it
- * makes; every other field takes the out-of-line fq_*, which keeps the code small. Elements are reduced, so equality
- * compares limbs.
+ * The degree-d field operations of the point formulas and of fq_pow. With n = 8, BN254's, they run inline, as a call
+ * through fq_* and its degree and limb-count dispatch costs about three times the product it makes; with n = 0 they
+ * take the out-of-line fq_*, which keeps the code small. Elements are reduced, so equality compares limbs.
  */
 #define PT_OP static inline __attribute__((always_inline))
 
-PT_OP void pt_fmul(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+PT_OP void pt_fmul(fp2 *r, const fp2 *a, const fp2 *b, int d, uint32_t n)
 {
-    if (g1)
+    if (n != 8)
+        fq_mul(r, a, b, d);
+    else if (d == 1)
         fp_mul_n(&r->c[0], &a->c[0], &b->c[0], 8);
     else
-        fq_mul(r, a, b, d);
+        fq_mul8(r, a, b);
 }
 
-PT_OP void pt_fadd(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+PT_OP void pt_fadd(fp2 *r, const fp2 *a, const fp2 *b, int d, uint32_t n)
 {
-    if (g1)
-        fp_add_n(&r->c[0], &a->c[0], &b->c[0], 8);
-    else
+    if (n != 8)
+    {
         fq_add(r, a, b, d);
+        return;
+    }
+    for (int i = 0; i < d; i++)
+        fp_add_n(&r->c[i], &a->c[i], &b->c[i], 8);
 }
 
-PT_OP void pt_fsub(fp2 *r, const fp2 *a, const fp2 *b, int d, bool g1)
+PT_OP void pt_fsub(fp2 *r, const fp2 *a, const fp2 *b, int d, uint32_t n)
 {
-    if (g1)
-        fp_sub_n(&r->c[0], &a->c[0], &b->c[0], 8);
-    else
+    if (n != 8)
+    {
         fq_sub(r, a, b, d);
+        return;
+    }
+    for (int i = 0; i < d; i++)
+        fp_sub_n(&r->c[i], &a->c[i], &b->c[i], 8);
 }
 
-PT_OP bool pt_fzero(const fp2 *a, int d, bool g1)
+PT_OP bool pt_fzero(const fp2 *a, int d, uint32_t n)
 {
-    if (!g1)
+    if (n != 8)
         return fq_is_zero(a, d);
     uint32_t acc = 0;
-    for (int i = 0; i < 8; i++)
-        acc |= a->c[0].l[i];
+    for (int i = 0; i < d; i++)
+        for (int j = 0; j < 8; j++)
+            acc |= a->c[i].l[j];
     return acc == 0;
 }
 
-PT_OP bool pt_feq(const fp2 *a, const fp2 *b, int d, bool g1)
+PT_OP bool pt_feq(const fp2 *a, const fp2 *b, int d, uint32_t n)
 {
-    if (!g1)
+    if (n != 8)
         return fq_eq(a, b, d);
     uint32_t acc = 0;
-    for (int i = 0; i < 8; i++)
-        acc |= a->c[0].l[i] ^ b->c[0].l[i];
+    for (int i = 0; i < d; i++)
+        for (int j = 0; j < 8; j++)
+            acc |= a->c[i].l[j] ^ b->c[i].l[j];
     return acc == 0;
 }
 
-PT_OP bool pt_fone(const fp2 *a, int d, bool g1)
+PT_OP bool pt_fone(const fp2 *a, int d, uint32_t n)
 {
-    uint32_t n = g1 ? 8 : C->n, acc = 0;
-    for (uint32_t i = 0; i < n; i++)
+    uint32_t limbs = n ? n : C->n, acc = 0;
+    for (uint32_t i = 0; i < limbs; i++)
         acc |= (a->c[0].l[i] ^ C->one.l[i]) | (d == 2 ? a->c[1].l[i] : 0);
     return acc == 0;
 }
 
 /* a^e by 4-bit windows from the top non-zero one: 14 products for the table, then one per window. */
-PT_OP void fq_pow_in(fp2 *r, const fp2 *a, const fp *e, int d, bool g1)
+PT_OP void fq_pow_in(fp2 *r, const fp2 *a, const fp *e, int d, uint32_t n)
 {
     fp2 table[16], acc;
     fq_set_one(&table[0]);
     table[1] = *a;
     for (int i = 2; i < 16; i++)
-        pt_fmul(&table[i], &table[i - 1], a, d, g1);
+        pt_fmul(&table[i], &table[i - 1], a, d, n);
 
     int window = 8 * (int)C->n - 1;
     while (window > 0 && ((e->l[window / 8] >> (4 * (window % 8))) & 15) == 0)
@@ -567,10 +582,10 @@ PT_OP void fq_pow_in(fp2 *r, const fp2 *a, const fp *e, int d, bool g1)
     for (window--; window >= 0; window--)
     {
         for (int s = 0; s < 4; s++)
-            pt_fmul(&acc, &acc, &acc, d, g1);
+            pt_fmul(&acc, &acc, &acc, d, n);
         uint32_t bits = (e->l[window / 8] >> (4 * (window % 8))) & 15;
         if (bits)
-            pt_fmul(&acc, &acc, &table[bits], d, g1);
+            pt_fmul(&acc, &acc, &table[bits], d, n);
     }
     *r = acc;
 }
@@ -578,9 +593,9 @@ PT_OP void fq_pow_in(fp2 *r, const fp2 *a, const fp *e, int d, bool g1)
 NOINLINE static void fq_pow(fp2 *r, const fp2 *a, const fp *e, int d)
 {
     if (d == 1 && C->n == 8)
-        fq_pow_in(r, a, e, 1, true);
+        fq_pow_in(r, a, e, 1, 8);
     else
-        fq_pow_in(r, a, e, d, false);
+        fq_pow_in(r, a, e, d, 0);
 }
 
 /* Inverse by Fermat in Fp; in Fp2 through the norm, 1/(a0 + a1 u) = (a0 - a1 u)/(a0^2 + a1^2). */
@@ -727,30 +742,26 @@ static inline __attribute__((always_inline)) void fp2_mul_xi_n(fp2 *r, const fp2
     fp_copy(&r->c[0], &t, n);
 }
 
+/* 9 in Montgomery form, for BN254's xi = 9 + u; in RAM, where the delegation reads its operands. */
+static fp Nine = {{0x410d7ff7, 0xf60647ce, 0xd31bd011, 0x2f3d6f4d, 0x3940c6d1, 0x2943337e, 0xa7e39857, 0x1d9598e8}};
+
+/* a * (9 + u) on BN254, with 9 a as two products by 9: an addition costs a third of a product, and 9 a by additions
+   takes four per coefficient. r may be a. */
+static inline __attribute__((always_inline)) void fp2_mul_xi8(fp2 *r, const fp2 *a)
+{
+    fp2 k;
+    fp_mul_new8(&k.c[0], &a->c[0], &Nine);
+    fp_mul_new8(&k.c[1], &a->c[1], &Nine);
+    fp2_mul_xi_n(r, a, &k, 8);
+}
+
 /* a * xi with xi = k + u: (a0 k - a1) + (a0 + a1 k) u. r may be a. */
 NOINLINE static void fp2_mul_xi(fp2 *r, const fp2 *a)
 {
     if (C->xi == 1)
-    {
         fp2_mul_xi_n(r, a, a, 12);
-        return;
-    }
-    /* k a as two products by k in Montgomery form, formed once per curve: an addition costs a third of a
-       product, and 9 a takes four of them per coefficient. Only BN254 has k > 1. */
-    static fp k_mont;
-    static const curve *k_for;
-    if (k_for != C)
-    {
-        fp plain;
-        memset(&plain, 0, sizeof(plain));
-        plain.l[0] = C->xi;
-        fp_mul(&k_mont, &plain, &C->r2);
-        k_for = C;
-    }
-    fp2 k;
-    fp_mul_new8(&k.c[0], &a->c[0], &k_mont);
-    fp_mul_new8(&k.c[1], &a->c[1], &k_mont);
-    fp2_mul_xi_n(r, a, &k, 8);
+    else
+        fp2_mul_xi8(r, a);
 }
 
 /* ---- points --------------------------------------------------------------------------------- */
@@ -766,111 +777,113 @@ bool pt_is_inf(const point *p, int d)
 }
 
 /* Doubling for a = 0 (dbl-2009-l). */
-PT_OP void pt_dbl_in(point *r, const point *p, int d, bool g1)
+PT_OP void pt_dbl_in(point *r, const point *p, int d, uint32_t n)
 {
-    if (pt_fzero(&p->z, d, g1) || pt_fzero(&p->y, d, g1))
+    if (pt_fzero(&p->z, d, n) || pt_fzero(&p->y, d, n))
     {
         pt_set_inf(r);
         return;
     }
     fp2 xx, yy, yyyy, s, m, t;
-    pt_fmul(&xx, &p->x, &p->x, d, g1);
-    pt_fmul(&yy, &p->y, &p->y, d, g1);
-    pt_fmul(&yyyy, &yy, &yy, d, g1);
+    pt_fmul(&xx, &p->x, &p->x, d, n);
+    pt_fmul(&yy, &p->y, &p->y, d, n);
+    pt_fmul(&yyyy, &yy, &yy, d, n);
 
-    pt_fmul(&s, &p->x, &yy, d, g1);
-    pt_fadd(&s, &s, &s, d, g1);
-    pt_fadd(&s, &s, &s, d, g1);
+    pt_fmul(&s, &p->x, &yy, d, n);
+    pt_fadd(&s, &s, &s, d, n);
+    pt_fadd(&s, &s, &s, d, n);
 
-    pt_fadd(&m, &xx, &xx, d, g1);
-    pt_fadd(&m, &m, &xx, d, g1);
+    pt_fadd(&m, &xx, &xx, d, n);
+    pt_fadd(&m, &m, &xx, d, n);
 
     /* Each coordinate is written once nothing reads its input any more, so r may be p with no copies. */
-    pt_fmul(&r->z, &p->y, &p->z, d, g1);
-    pt_fadd(&r->z, &r->z, &r->z, d, g1);
+    pt_fmul(&r->z, &p->y, &p->z, d, n);
+    pt_fadd(&r->z, &r->z, &r->z, d, n);
 
-    pt_fmul(&r->x, &m, &m, d, g1);
-    pt_fsub(&r->x, &r->x, &s, d, g1);
-    pt_fsub(&r->x, &r->x, &s, d, g1);
+    pt_fmul(&r->x, &m, &m, d, n);
+    pt_fsub(&r->x, &r->x, &s, d, n);
+    pt_fsub(&r->x, &r->x, &s, d, n);
 
-    pt_fsub(&t, &s, &r->x, d, g1);
-    pt_fmul(&r->y, &m, &t, d, g1);
-    pt_fadd(&t, &yyyy, &yyyy, d, g1);
-    pt_fadd(&t, &t, &t, d, g1);
-    pt_fadd(&t, &t, &t, d, g1);
-    pt_fsub(&r->y, &r->y, &t, d, g1);
+    pt_fsub(&t, &s, &r->x, d, n);
+    pt_fmul(&r->y, &m, &t, d, n);
+    pt_fadd(&t, &yyyy, &yyyy, d, n);
+    pt_fadd(&t, &t, &t, d, n);
+    pt_fadd(&t, &t, &t, d, n);
+    pt_fsub(&r->y, &r->y, &t, d, n);
 }
 
 NOINLINE void pt_dbl(point *r, const point *p, int d)
 {
-    if (d == 1 && C->n == 8)
-        pt_dbl_in(r, p, 1, true);
+    if (C->n != 8)
+        pt_dbl_in(r, p, d, 0);
+    else if (d == 1)
+        pt_dbl_in(r, p, 1, 8);
     else
-        pt_dbl_in(r, p, d, false);
+        pt_dbl_in(r, p, 2, 8);
 }
 
 /* General addition (add-2007-bl without the doubling shortcut), falling back to doubling. */
-PT_OP void pt_add_in(point *r, const point *p, const point *q, int d, bool g1)
+PT_OP void pt_add_in(point *r, const point *p, const point *q, int d, uint32_t n)
 {
-    if (pt_fzero(&p->z, d, g1))
+    if (pt_fzero(&p->z, d, n))
     {
         *r = *q;
         return;
     }
-    if (pt_fzero(&q->z, d, g1))
+    if (pt_fzero(&q->z, d, n))
     {
         *r = *p;
         return;
     }
     fp2 z1z1, z2z2, u1v, u2, s1v, s2, h, rr, hh, hhh, v, x3, y3, z3, t;
     /* An affine q (z = 1, as loaded) leaves p's coordinates as they are: five products fewer. */
-    bool q_affine = pt_fone(&q->z, d, g1);
+    bool q_affine = pt_fone(&q->z, d, n);
     const fp2 *u1 = &p->x, *s1 = &p->y;
-    pt_fmul(&z1z1, &p->z, &p->z, d, g1);
+    pt_fmul(&z1z1, &p->z, &p->z, d, n);
     if (!q_affine)
     {
-        pt_fmul(&z2z2, &q->z, &q->z, d, g1);
-        pt_fmul(&u1v, &p->x, &z2z2, d, g1);
-        pt_fmul(&t, &q->z, &z2z2, d, g1);
-        pt_fmul(&s1v, &p->y, &t, d, g1);
+        pt_fmul(&z2z2, &q->z, &q->z, d, n);
+        pt_fmul(&u1v, &p->x, &z2z2, d, n);
+        pt_fmul(&t, &q->z, &z2z2, d, n);
+        pt_fmul(&s1v, &p->y, &t, d, n);
         u1 = &u1v;
         s1 = &s1v;
     }
-    pt_fmul(&u2, &q->x, &z1z1, d, g1);
-    pt_fmul(&t, &p->z, &z1z1, d, g1);
-    pt_fmul(&s2, &q->y, &t, d, g1);
+    pt_fmul(&u2, &q->x, &z1z1, d, n);
+    pt_fmul(&t, &p->z, &z1z1, d, n);
+    pt_fmul(&s2, &q->y, &t, d, n);
 
-    if (pt_feq(u1, &u2, d, g1))
+    if (pt_feq(u1, &u2, d, n))
     {
-        if (pt_feq(s1, &s2, d, g1))
+        if (pt_feq(s1, &s2, d, n))
             pt_dbl(r, p, d);
         else
             pt_set_inf(r);
         return;
     }
 
-    pt_fsub(&h, &u2, u1, d, g1);
-    pt_fsub(&rr, &s2, s1, d, g1);
-    pt_fmul(&hh, &h, &h, d, g1);
-    pt_fmul(&hhh, &hh, &h, d, g1);
-    pt_fmul(&v, u1, &hh, d, g1);
+    pt_fsub(&h, &u2, u1, d, n);
+    pt_fsub(&rr, &s2, s1, d, n);
+    pt_fmul(&hh, &h, &h, d, n);
+    pt_fmul(&hhh, &hh, &h, d, n);
+    pt_fmul(&v, u1, &hh, d, n);
 
-    pt_fmul(&x3, &rr, &rr, d, g1);
-    pt_fsub(&x3, &x3, &hhh, d, g1);
-    pt_fsub(&x3, &x3, &v, d, g1);
-    pt_fsub(&x3, &x3, &v, d, g1);
+    pt_fmul(&x3, &rr, &rr, d, n);
+    pt_fsub(&x3, &x3, &hhh, d, n);
+    pt_fsub(&x3, &x3, &v, d, n);
+    pt_fsub(&x3, &x3, &v, d, n);
 
-    pt_fsub(&t, &v, &x3, d, g1);
-    pt_fmul(&y3, &rr, &t, d, g1);
-    pt_fmul(&t, s1, &hhh, d, g1);
-    pt_fsub(&y3, &y3, &t, d, g1);
+    pt_fsub(&t, &v, &x3, d, n);
+    pt_fmul(&y3, &rr, &t, d, n);
+    pt_fmul(&t, s1, &hhh, d, n);
+    pt_fsub(&y3, &y3, &t, d, n);
 
     if (q_affine)
-        pt_fmul(&z3, &p->z, &h, d, g1);
+        pt_fmul(&z3, &p->z, &h, d, n);
     else
     {
-        pt_fmul(&z3, &p->z, &q->z, d, g1);
-        pt_fmul(&z3, &z3, &h, d, g1);
+        pt_fmul(&z3, &p->z, &q->z, d, n);
+        pt_fmul(&z3, &z3, &h, d, n);
     }
 
     r->x = x3;
@@ -880,10 +893,12 @@ PT_OP void pt_add_in(point *r, const point *p, const point *q, int d, bool g1)
 
 NOINLINE void pt_add(point *r, const point *p, const point *q, int d)
 {
-    if (d == 1 && C->n == 8)
-        pt_add_in(r, p, q, 1, true);
+    if (C->n != 8)
+        pt_add_in(r, p, q, d, 0);
+    else if (d == 1)
+        pt_add_in(r, p, q, 1, 8);
     else
-        pt_add_in(r, p, q, d, false);
+        pt_add_in(r, p, q, 2, 8);
 }
 
 void pt_neg(point *r, const point *p, int d)
@@ -1113,6 +1128,77 @@ void pt_frob(point *r, const point *p, bool inverse)
 
 /* ---- Fp12 ----------------------------------------------------------------------------------- */
 
+/*
+ * The tower and Miller loop functions on the hot path are written once for n limbs, and BY_LIMBS makes F8 and F12, an
+ * instance for each curve with n a constant, and F, which calls the instance of the curve in use. BN254's (eight limbs)
+ * Fp2 sums and products by xi then run inline, as a call costs about as much as the sum, and BLS12-381 calls.
+ */
+#define TOWER static inline __attribute__((always_inline))
+#define BY_LIMBS(F, PARAMS, ...)                                                                                       \
+    static NOINLINE void F##8 PARAMS                                                                                   \
+    {                                                                                                                  \
+        F##_n(__VA_ARGS__, 8);                                                                                         \
+    }                                                                                                                  \
+    static NOINLINE void F##12 PARAMS                                                                                  \
+    {                                                                                                                  \
+        F##_n(__VA_ARGS__, 12);                                                                                        \
+    }                                                                                                                  \
+    static inline void F PARAMS                                                                                        \
+    {                                                                                                                  \
+        if (C->n == 8)                                                                                                 \
+            F##8(__VA_ARGS__);                                                                                         \
+        else                                                                                                           \
+            F##12(__VA_ARGS__);                                                                                        \
+    }
+
+TOWER void fp2_add_n(fp2 *r, const fp2 *a, const fp2 *b, uint32_t n)
+{
+    if (n != 8)
+    {
+        fq_add(r, a, b, 2);
+        return;
+    }
+    fp_add_n(&r->c[0], &a->c[0], &b->c[0], 8);
+    fp_add_n(&r->c[1], &a->c[1], &b->c[1], 8);
+}
+
+TOWER void fp2_sub_n(fp2 *r, const fp2 *a, const fp2 *b, uint32_t n)
+{
+    if (n != 8)
+    {
+        fq_sub(r, a, b, 2);
+        return;
+    }
+    fp_sub_n(&r->c[0], &a->c[0], &b->c[0], 8);
+    fp_sub_n(&r->c[1], &a->c[1], &b->c[1], 8);
+}
+
+TOWER void fp2_mul_n(fp2 *r, const fp2 *a, const fp2 *b, uint32_t n)
+{
+    if (n == 8)
+        fq_mul8(r, a, b);
+    else
+        fq_mul12(r, a, b);
+}
+
+/* a * xi; r may be a. */
+TOWER void fp2_xi_n(fp2 *r, const fp2 *a, uint32_t n)
+{
+    if (n == 8)
+        fp2_mul_xi8(r, a);
+    else
+        fp2_mul_xi(r, a);
+}
+
+/* r = a b for r distinct from a and b. */
+TOWER void fp_mul_new_n(fp *r, const fp *a, const fp *b, uint32_t n)
+{
+    if (n == 8)
+        fp_mul_new8(r, a, b);
+    else
+        fp_mul(r, a, b);
+}
+
 void fp12_one(fp12 *r)
 {
     memset(r, 0, sizeof(*r));
@@ -1142,65 +1228,66 @@ static inline fp6 *fp12_odd(const fp12 *a)
     return (fp6 *)(uintptr_t)&a->c[3];
 }
 
-static void fp6_add(fp6 *r, const fp6 *a, const fp6 *b)
+TOWER void fp6_add_n(fp6 *r, const fp6 *a, const fp6 *b, uint32_t n)
 {
     for (int i = 0; i < 3; i++)
-        fq_add(&r->c[i], &a->c[i], &b->c[i], 2);
+        fp2_add_n(&r->c[i], &a->c[i], &b->c[i], n);
 }
 
-static void fp6_sub(fp6 *r, const fp6 *a, const fp6 *b)
+TOWER void fp6_sub_n(fp6 *r, const fp6 *a, const fp6 *b, uint32_t n)
 {
     for (int i = 0; i < 3; i++)
-        fq_sub(&r->c[i], &a->c[i], &b->c[i], 2);
+        fp2_sub_n(&r->c[i], &a->c[i], &b->c[i], n);
 }
 
 /* r = a v: (a0 + a1 v + a2 v^2) v = xi a2 + a0 v + a1 v^2. */
-static void fp6_mul_v(fp6 *r, const fp6 *a)
+TOWER void fp6_mul_v_n(fp6 *r, const fp6 *a, uint32_t n)
 {
     fp2 t;
-    fp2_mul_xi(&t, &a->c[2]);
+    fp2_xi_n(&t, &a->c[2], n);
     r->c[2] = a->c[1];
     r->c[1] = a->c[0];
     r->c[0] = t;
 }
 
-NOINLINE static void fp6_mul(fp6 *r, const fp6 *a, const fp6 *b)
+TOWER void fp6_mul_n(fp6 *r, const fp6 *a, const fp6 *b, uint32_t n)
 {
     fp2 t0, t1, t2, s, u;
     fp6 out;
-    fq_mul(&t0, &a->c[0], &b->c[0], 2);
-    fq_mul(&t1, &a->c[1], &b->c[1], 2);
-    fq_mul(&t2, &a->c[2], &b->c[2], 2);
+    fp2_mul_n(&t0, &a->c[0], &b->c[0], n);
+    fp2_mul_n(&t1, &a->c[1], &b->c[1], n);
+    fp2_mul_n(&t2, &a->c[2], &b->c[2], n);
 
     /* c0 = t0 + xi ((a1 + a2)(b1 + b2) - t1 - t2) */
-    fq_add(&s, &a->c[1], &a->c[2], 2);
-    fq_add(&u, &b->c[1], &b->c[2], 2);
-    fq_mul(&s, &s, &u, 2);
-    fq_sub(&s, &s, &t1, 2);
-    fq_sub(&s, &s, &t2, 2);
-    fp2_mul_xi(&s, &s);
-    fq_add(&out.c[0], &t0, &s, 2);
+    fp2_add_n(&s, &a->c[1], &a->c[2], n);
+    fp2_add_n(&u, &b->c[1], &b->c[2], n);
+    fp2_mul_n(&s, &s, &u, n);
+    fp2_sub_n(&s, &s, &t1, n);
+    fp2_sub_n(&s, &s, &t2, n);
+    fp2_xi_n(&s, &s, n);
+    fp2_add_n(&out.c[0], &t0, &s, n);
 
     /* c1 = (a0 + a1)(b0 + b1) - t0 - t1 + xi t2 */
-    fq_add(&s, &a->c[0], &a->c[1], 2);
-    fq_add(&u, &b->c[0], &b->c[1], 2);
-    fq_mul(&s, &s, &u, 2);
-    fq_sub(&s, &s, &t0, 2);
-    fq_sub(&s, &s, &t1, 2);
-    fp2_mul_xi(&u, &t2);
-    fq_add(&out.c[1], &s, &u, 2);
+    fp2_add_n(&s, &a->c[0], &a->c[1], n);
+    fp2_add_n(&u, &b->c[0], &b->c[1], n);
+    fp2_mul_n(&s, &s, &u, n);
+    fp2_sub_n(&s, &s, &t0, n);
+    fp2_sub_n(&s, &s, &t1, n);
+    fp2_xi_n(&u, &t2, n);
+    fp2_add_n(&out.c[1], &s, &u, n);
 
     /* c2 = (a0 + a2)(b0 + b2) - t0 - t2 + t1 */
-    fq_add(&s, &a->c[0], &a->c[2], 2);
-    fq_add(&u, &b->c[0], &b->c[2], 2);
-    fq_mul(&s, &s, &u, 2);
-    fq_sub(&s, &s, &t0, 2);
-    fq_sub(&s, &s, &t2, 2);
-    fq_add(&out.c[2], &s, &t1, 2);
+    fp2_add_n(&s, &a->c[0], &a->c[2], n);
+    fp2_add_n(&u, &b->c[0], &b->c[2], n);
+    fp2_mul_n(&s, &s, &u, n);
+    fp2_sub_n(&s, &s, &t0, n);
+    fp2_sub_n(&s, &s, &t2, n);
+    fp2_add_n(&out.c[2], &s, &t1, n);
     *r = out;
 }
+BY_LIMBS(fp6_mul, (fp6 *r, const fp6 *a, const fp6 *b), r, a, b)
 
-NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
+TOWER void fp12_mul_n(fp12 *r, const fp12 *a, const fp12 *b, uint32_t n)
 {
     const fp6 *x = fp12_even(a), *y = fp12_odd(a);
     fp6 s, t, u;
@@ -1208,14 +1295,14 @@ NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
     {
         /* (A + B w)^2 = (A^2 + v B^2) + 2 A B w, where (A + B)(A + v B) = A^2 + v B^2 + (1 + v) A B. */
         fp6_mul(&u, x, y);
-        fp6_mul_v(&t, y);
-        fp6_add(&t, &t, x);
-        fp6_add(&s, x, y);
+        fp6_mul_v_n(&t, y, n);
+        fp6_add_n(&t, &t, x, n);
+        fp6_add_n(&s, x, y, n);
         fp6_mul(&s, &s, &t);
-        fp6_sub(&s, &s, &u);
-        fp6_mul_v(&t, &u);
-        fp6_sub(fp12_even(r), &s, &t);
-        fp6_add(fp12_odd(r), &u, &u);
+        fp6_sub_n(&s, &s, &u, n);
+        fp6_mul_v_n(&t, &u, n);
+        fp6_sub_n(fp12_even(r), &s, &t, n);
+        fp6_add_n(fp12_odd(r), &u, &u, n);
         return;
     }
 
@@ -1224,49 +1311,52 @@ NOINLINE static void fp12_mul(fp12 *r, const fp12 *a, const fp12 *b)
     fp6 ac, bd;
     fp6_mul(&ac, x, c);
     fp6_mul(&bd, y, d);
-    fp6_add(&s, x, y);
-    fp6_add(&t, c, d);
+    fp6_add_n(&s, x, y, n);
+    fp6_add_n(&t, c, d, n);
     fp6_mul(&s, &s, &t);
-    fp6_sub(&s, &s, &ac);
-    fp6_sub(fp12_odd(r), &s, &bd);
-    fp6_mul_v(&t, &bd);
-    fp6_add(fp12_even(r), &t, &ac);
+    fp6_sub_n(&s, &s, &ac, n);
+    fp6_sub_n(fp12_odd(r), &s, &bd, n);
+    fp6_mul_v_n(&t, &bd, n);
+    fp6_add_n(fp12_even(r), &t, &ac, n);
 }
+BY_LIMBS(fp12_mul, (fp12 *r, const fp12 *a, const fp12 *b), r, a, b)
 
 /* The p^6-power Frobenius, w -> -w; it inverts elements of the cyclotomic subgroup. */
 /* r = a (b0 + b1 v): 5 Fp2 products by Karatsuba. r may be a. */
-static void fp6_mul_01(fp6 *r, const fp6 *a, const fp2 *b0, const fp2 *b1)
+TOWER void fp6_mul_01_n(fp6 *r, const fp6 *a, const fp2 *b0, const fp2 *b1, uint32_t n)
 {
     fp2 t0, t1, c0, c1, c2;
-    fq_mul(&t0, &a->c[0], b0, 2);
-    fq_mul(&t1, &a->c[1], b1, 2);
-    fq_add(&c1, &a->c[0], &a->c[1], 2);
-    fq_add(&c2, b0, b1, 2);
-    fq_mul(&c1, &c1, &c2, 2);
-    fq_sub(&c1, &c1, &t0, 2);
-    fq_sub(&c1, &c1, &t1, 2);
-    fq_mul(&c0, &a->c[2], b1, 2);
-    fp2_mul_xi(&c0, &c0);
-    fq_add(&c0, &c0, &t0, 2);
-    fq_mul(&c2, &a->c[2], b0, 2);
-    fq_add(&c2, &c2, &t1, 2);
+    fp2_mul_n(&t0, &a->c[0], b0, n);
+    fp2_mul_n(&t1, &a->c[1], b1, n);
+    fp2_add_n(&c1, &a->c[0], &a->c[1], n);
+    fp2_add_n(&c2, b0, b1, n);
+    fp2_mul_n(&c1, &c1, &c2, n);
+    fp2_sub_n(&c1, &c1, &t0, n);
+    fp2_sub_n(&c1, &c1, &t1, n);
+    fp2_mul_n(&c0, &a->c[2], b1, n);
+    fp2_xi_n(&c0, &c0, n);
+    fp2_add_n(&c0, &c0, &t0, n);
+    fp2_mul_n(&c2, &a->c[2], b0, n);
+    fp2_add_n(&c2, &c2, &t1, n);
     r->c[0] = c0;
     r->c[1] = c1;
     r->c[2] = c2;
 }
+BY_LIMBS(fp6_mul_01, (fp6 *r, const fp6 *a, const fp2 *b0, const fp2 *b1), r, a, b0, b1)
 
 /* r = a b1 v: 3 Fp2 products. r may be a. */
-static void fp6_mul_1(fp6 *r, const fp6 *a, const fp2 *b1)
+TOWER void fp6_mul_1_n(fp6 *r, const fp6 *a, const fp2 *b1, uint32_t n)
 {
     fp2 c0, c1, c2;
-    fq_mul(&c0, &a->c[2], b1, 2);
-    fp2_mul_xi(&c0, &c0);
-    fq_mul(&c1, &a->c[0], b1, 2);
-    fq_mul(&c2, &a->c[1], b1, 2);
+    fp2_mul_n(&c0, &a->c[2], b1, n);
+    fp2_xi_n(&c0, &c0, n);
+    fp2_mul_n(&c1, &a->c[0], b1, n);
+    fp2_mul_n(&c2, &a->c[1], b1, n);
     r->c[0] = c0;
     r->c[1] = c1;
     r->c[2] = c2;
 }
+BY_LIMBS(fp6_mul_1, (fp6 *r, const fp6 *a, const fp2 *b1), r, a, b1)
 
 /*
  * A line through points of the twist, evaluated at the G1 point p: cy y_P + cx x_P w + c0 w^3 on a D-type twist and
@@ -1282,35 +1372,36 @@ typedef struct
  * f *= l. As L0 + L1 w over Fp6, one of L0 and L1 is a single Fp2 term and the other has two, so Karatsuba takes 13
  * Fp2 products where a dense product takes 18.
  */
-NOINLINE static void fp12_mul_line(fp12 *f, const line *l)
+TOWER void fp12_mul_line_n(fp12 *f, const line *l, uint32_t n)
 {
     fp6 *x = fp12_even(f), *y = fp12_odd(f);
     fp6 a, b, s;
     fp2 sum;
-    fp6_add(&s, x, y);
+    fp6_add_n(&s, x, y, n);
     if (C->mtwist)
     {
         /* L0 = c0 + (cx x_P) v, L1 = (cy y_P) v */
         fp6_mul_01(&a, x, &l->c0, &l->x);
         fp6_mul_1(&b, y, &l->y);
-        fq_add(&sum, &l->x, &l->y, 2);
+        fp2_add_n(&sum, &l->x, &l->y, n);
         fp6_mul_01(&s, &s, &l->c0, &sum);
     }
     else
     {
         /* L0 = cy y_P, L1 = cx x_P + c0 v */
         for (int i = 0; i < 3; i++)
-            fq_mul(&a.c[i], &x->c[i], &l->y, 2);
+            fp2_mul_n(&a.c[i], &x->c[i], &l->y, n);
         fp6_mul_01(&b, y, &l->x, &l->c0);
-        fq_add(&sum, &l->y, &l->x, 2);
+        fp2_add_n(&sum, &l->y, &l->x, n);
         fp6_mul_01(&s, &s, &sum, &l->c0);
     }
     /* (F0 + F1 w)(L0 + L1 w) = (F0 L0 + v F1 L1) + ((F0 + F1)(L0 + L1) - F0 L0 - F1 L1) w */
-    fp6_sub(&s, &s, &a);
-    fp6_sub(y, &s, &b);
-    fp6_mul_v(&b, &b);
-    fp6_add(x, &a, &b);
+    fp6_sub_n(&s, &s, &a, n);
+    fp6_sub_n(y, &s, &b, n);
+    fp6_mul_v_n(&b, &b, n);
+    fp6_add_n(x, &a, &b, n);
 }
+BY_LIMBS(fp12_mul_line, (fp12 *f, const line *l), f, l)
 
 NOINLINE static void fp12_conj(fp12 *r, const fp12 *a)
 {
@@ -1372,30 +1463,29 @@ NOINLINE static void fp12_inv(fp12 *r, const fp12 *a)
     fp12_mul(r, &c, &t);
 }
 
-/* (z + y v)^2 in Fp4 = Fp2[v]/(v^2 - xi), as t + s v. */
-static void fp4_sqr(fp2 *t, fp2 *s, const fp2 *z, const fp2 *y)
+/* (z + y v)^2 in Fp4 = Fp2[v]/(v^2 - xi), as t + s v: t = z^2 + xi y^2 and s = (z + y)^2 - z^2 - y^2, by squares. */
+TOWER void fp4_sqr_n(fp2 *t, fp2 *s, const fp2 *z, const fp2 *y, uint32_t n)
 {
-    fp2 product, sum, shifted;
-    fq_mul(&product, z, y, 2);
-    fq_add(&sum, z, y, 2);
-    fp2_mul_xi(&shifted, y);
-    fq_add(&shifted, &shifted, z, 2);
-    fq_mul(t, &sum, &shifted, 2);
-    fq_sub(t, t, &product, 2);
-    fp2_mul_xi(&shifted, &product);
-    fq_sub(t, t, &shifted, 2);
-    fq_add(s, &product, &product, 2);
+    fp2 zz, yy;
+    fp2_mul_n(&zz, z, z, n);
+    fp2_mul_n(&yy, y, y, n);
+    fp2_add_n(s, z, y, n);
+    fp2_mul_n(s, s, s, n);
+    fp2_sub_n(s, s, &zz, n);
+    fp2_sub_n(s, s, &yy, n);
+    fp2_xi_n(t, &yy, n);
+    fp2_add_n(t, t, &zz, n);
 }
 
 /* *r = 3 t + 2 z when plus, else 3 t - 2 z; r may be z. */
-static void cyclotomic_part(fp2 *r, const fp2 *t, const fp2 *z, bool plus)
+TOWER void cyclotomic_part_n(fp2 *r, const fp2 *t, const fp2 *z, bool plus, uint32_t n)
 {
     if (plus)
-        fq_add(r, t, z, 2);
+        fp2_add_n(r, t, z, n);
     else
-        fq_sub(r, t, z, 2);
-    fq_add(r, r, r, 2);
-    fq_add(r, r, t, 2);
+        fp2_sub_n(r, t, z, n);
+    fp2_add_n(r, r, r, n);
+    fp2_add_n(r, r, t, n);
 }
 
 /*
@@ -1404,22 +1494,23 @@ static void cyclotomic_part(fp2 *r, const fp2 *t, const fp2 *z, bool plus)
  * are the even and the odd coefficients of w here. The squarings read every coefficient before any is written, and
  * each result takes only its own coefficient after them, so r may be a with no copies of either.
  */
-NOINLINE static void fp12_cyclotomic_sqr(fp12 *r, const fp12 *a)
+TOWER void fp12_cyclotomic_sqr_n(fp12 *r, const fp12 *a, uint32_t n)
 {
     const fp2 *z0 = &a->c[W(0)], *z4 = &a->c[W(2)], *z3 = &a->c[W(4)], *z2 = &a->c[W(1)], *z1 = &a->c[W(3)],
               *z5 = &a->c[W(5)];
     fp2 t0, t1, t2, t3, t4, t5, x;
-    fp4_sqr(&t0, &t1, z0, z1);
-    fp4_sqr(&t2, &t3, z2, z3);
-    fp4_sqr(&t4, &t5, z4, z5);
-    cyclotomic_part(&r->c[W(0)], &t0, z0, false);
-    cyclotomic_part(&r->c[W(3)], &t1, z1, true);
-    fp2_mul_xi(&x, &t5);
-    cyclotomic_part(&r->c[W(1)], &x, z2, true);
-    cyclotomic_part(&r->c[W(4)], &t4, z3, false);
-    cyclotomic_part(&r->c[W(2)], &t2, z4, false);
-    cyclotomic_part(&r->c[W(5)], &t3, z5, true);
+    fp4_sqr_n(&t0, &t1, z0, z1, n);
+    fp4_sqr_n(&t2, &t3, z2, z3, n);
+    fp4_sqr_n(&t4, &t5, z4, z5, n);
+    cyclotomic_part_n(&r->c[W(0)], &t0, z0, false, n);
+    cyclotomic_part_n(&r->c[W(3)], &t1, z1, true, n);
+    fp2_xi_n(&x, &t5, n);
+    cyclotomic_part_n(&r->c[W(1)], &x, z2, true, n);
+    cyclotomic_part_n(&r->c[W(4)], &t4, z3, false, n);
+    cyclotomic_part_n(&r->c[W(2)], &t2, z4, false, n);
+    cyclotomic_part_n(&r->c[W(5)], &t3, z5, true, n);
 }
+BY_LIMBS(fp12_cyclotomic_sqr, (fp12 *r, const fp12 *a), r, a)
 
 /*
  * a^x for the signed curve parameter x; a must be in the cyclotomic subgroup, where the squares are cheaper and the
@@ -1446,12 +1537,12 @@ NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 /* ---- pairing -------------------------------------------------------------------------------- */
 
 /* Evaluates the line with coefficients cy, cx and c0 at the G1 point p. */
-static void line_eval(line *l, const fp2 *cy, const fp2 *cx, const fp2 *c0, const point *p)
+TOWER void line_eval_n(line *l, const fp2 *cy, const fp2 *cx, const fp2 *c0, const point *p, uint32_t n)
 {
     for (int i = 0; i < 2; i++)
     {
-        fp_mul(&l->y.c[i], &cy->c[i], &p->y.c[0]);
-        fp_mul(&l->x.c[i], &cx->c[i], &p->x.c[0]);
+        fp_mul_new_n(&l->y.c[i], &cy->c[i], &p->y.c[0], n);
+        fp_mul_new_n(&l->x.c[i], &cx->c[i], &p->x.c[0], n);
     }
     l->c0 = *c0;
 }
@@ -1468,41 +1559,42 @@ static void fq_half(fp2 *r, const fp2 *a)
  * E = 3 b' C, F = 3E, H = 2 Y Z, I = E - B and J = X^2, 2t = (X Y (B - F) / 2, ((B + F) / 2)^2 - 3 E^2, B H), and the
  * tangent, scaled by -Z^2, has cy = -H, cx = 3J and c0 = I (y^2 - 3b' = 3x^3 - 2y^2 on the curve).
  */
-NOINLINE static void miller_dbl(line *l, point *t, const point *p)
+TOWER void miller_dbl_n(line *l, point *t, const point *p, uint32_t n)
 {
     fp2 a, b, c, e, f, g, h, i, j, s;
-    fq_mul(&a, &t->x, &t->y, 2);
+    fp2_mul_n(&a, &t->x, &t->y, n);
     fq_half(&a, &a);
-    fq_mul(&b, &t->y, &t->y, 2);
-    fq_mul(&c, &t->z, &t->z, 2);
-    fq_add(&e, &c, &c, 2);
-    fq_add(&e, &e, &c, 2);
-    fq_mul(&e, &e, &C->b2, 2);
-    fq_add(&f, &e, &e, 2);
-    fq_add(&f, &f, &e, 2);
-    fq_add(&g, &b, &f, 2);
+    fp2_mul_n(&b, &t->y, &t->y, n);
+    fp2_mul_n(&c, &t->z, &t->z, n);
+    fp2_add_n(&e, &c, &c, n);
+    fp2_add_n(&e, &e, &c, n);
+    fp2_mul_n(&e, &e, &C->b2, n);
+    fp2_add_n(&f, &e, &e, n);
+    fp2_add_n(&f, &f, &e, n);
+    fp2_add_n(&g, &b, &f, n);
     fq_half(&g, &g);
-    fq_add(&h, &t->y, &t->z, 2);
-    fq_mul(&h, &h, &h, 2);
-    fq_sub(&h, &h, &b, 2);
-    fq_sub(&h, &h, &c, 2);
-    fq_sub(&i, &e, &b, 2);
-    fq_mul(&j, &t->x, &t->x, 2);
+    fp2_add_n(&h, &t->y, &t->z, n);
+    fp2_mul_n(&h, &h, &h, n);
+    fp2_sub_n(&h, &h, &b, n);
+    fp2_sub_n(&h, &h, &c, n);
+    fp2_sub_n(&i, &e, &b, n);
+    fp2_mul_n(&j, &t->x, &t->x, n);
 
-    fq_sub(&s, &b, &f, 2);
-    fq_mul(&t->x, &a, &s, 2);
-    fq_mul(&s, &e, &e, 2);
-    fq_mul(&t->y, &g, &g, 2);
-    fq_sub(&t->y, &t->y, &s, 2);
-    fq_sub(&t->y, &t->y, &s, 2);
-    fq_sub(&t->y, &t->y, &s, 2);
-    fq_mul(&t->z, &b, &h, 2);
+    fp2_sub_n(&s, &b, &f, n);
+    fp2_mul_n(&t->x, &a, &s, n);
+    fp2_mul_n(&s, &e, &e, n);
+    fp2_mul_n(&t->y, &g, &g, n);
+    fp2_sub_n(&t->y, &t->y, &s, n);
+    fp2_sub_n(&t->y, &t->y, &s, n);
+    fp2_sub_n(&t->y, &t->y, &s, n);
+    fp2_mul_n(&t->z, &b, &h, n);
 
     fq_neg(&h, &h, 2);
-    fq_add(&s, &j, &j, 2);
-    fq_add(&s, &s, &j, 2);
-    line_eval(l, &h, &s, &i, p);
+    fp2_add_n(&s, &j, &j, n);
+    fp2_add_n(&s, &s, &j, n);
+    line_eval_n(l, &h, &s, &i, p, n);
 }
+BY_LIMBS(miller_dbl, (line *l, point *t, const point *p), l, t, p)
 
 /*
  * f *= the chord through t and the affine q evaluated at p, and t += q, t projective as in miller_dbl (arkworks'
@@ -1510,37 +1602,38 @@ NOINLINE static void miller_dbl(line *l, point *t, const point *p)
  * H = E + F - 2G, t + q = (L H, O (G - H) - E Y, Z E), and the chord, scaled by L Z, has cy = L, cx = -O and
  * c0 = O x_Q - L y_Q. t is neither q nor -q: the loop reaches no such multiple of a point of order r.
  */
-NOINLINE static void miller_add(fp12 *f, point *t, const point *q, const point *p)
+TOWER void miller_add_n(fp12 *f, point *t, const point *q, const point *p, uint32_t n)
 {
     fp2 o, el, c, d, e, g, h, s;
     line l;
-    fq_mul(&s, &q->y, &t->z, 2);
-    fq_sub(&o, &t->y, &s, 2);
-    fq_mul(&s, &q->x, &t->z, 2);
-    fq_sub(&el, &t->x, &s, 2);
-    fq_mul(&c, &o, &o, 2);
-    fq_mul(&d, &el, &el, 2);
-    fq_mul(&e, &el, &d, 2);
-    fq_mul(&c, &t->z, &c, 2);
-    fq_mul(&g, &t->x, &d, 2);
-    fq_add(&h, &e, &c, 2);
-    fq_sub(&h, &h, &g, 2);
-    fq_sub(&h, &h, &g, 2);
+    fp2_mul_n(&s, &q->y, &t->z, n);
+    fp2_sub_n(&o, &t->y, &s, n);
+    fp2_mul_n(&s, &q->x, &t->z, n);
+    fp2_sub_n(&el, &t->x, &s, n);
+    fp2_mul_n(&c, &o, &o, n);
+    fp2_mul_n(&d, &el, &el, n);
+    fp2_mul_n(&e, &el, &d, n);
+    fp2_mul_n(&c, &t->z, &c, n);
+    fp2_mul_n(&g, &t->x, &d, n);
+    fp2_add_n(&h, &e, &c, n);
+    fp2_sub_n(&h, &h, &g, n);
+    fp2_sub_n(&h, &h, &g, n);
 
-    fq_mul(&t->x, &el, &h, 2);
-    fq_sub(&s, &g, &h, 2);
-    fq_mul(&s, &s, &o, 2);
-    fq_mul(&g, &e, &t->y, 2);
-    fq_sub(&t->y, &s, &g, 2);
-    fq_mul(&t->z, &t->z, &e, 2);
+    fp2_mul_n(&t->x, &el, &h, n);
+    fp2_sub_n(&s, &g, &h, n);
+    fp2_mul_n(&s, &s, &o, n);
+    fp2_mul_n(&g, &e, &t->y, n);
+    fp2_sub_n(&t->y, &s, &g, n);
+    fp2_mul_n(&t->z, &t->z, &e, n);
 
-    fq_mul(&s, &o, &q->x, 2);
-    fq_mul(&g, &el, &q->y, 2);
-    fq_sub(&s, &s, &g, 2);
+    fp2_mul_n(&s, &o, &q->x, n);
+    fp2_mul_n(&g, &el, &q->y, n);
+    fp2_sub_n(&s, &s, &g, n);
     fq_neg(&o, &o, 2);
-    line_eval(&l, &el, &o, &s, p);
+    line_eval_n(&l, &el, &o, &s, p, n);
     fp12_mul_line(f, &l);
 }
+BY_LIMBS(miller_add, (fp12 *f, point *t, const point *q, const point *p), f, t, q, p)
 
 /*
  * Multiplies f by the Miller functions of the optimal ate pairing of each pair g1[i] (G1) and
