@@ -464,6 +464,31 @@ __attribute__((no_builtin("memcpy"))) void *__wrap_memcpy(void *restrict dest, c
     return dest;
 }
 
+void *__real_memmove(void *dest, const void *src, size_t n);
+
+/* memmove, by --wrap: managed code copies through it, mostly a few bytes between disjoint buffers. A short copy runs
+   forwards unless the destination starts inside the source; a long one goes to copy_long when the two are disjoint,
+   else to the libc memmove. */
+__attribute__((no_builtin("memcpy", "memmove"))) void *__wrap_memmove(void *dest, const void *src, size_t n)
+{
+    if (n < 16)
+    {
+        if ((uintptr_t)dest - (uintptr_t)src >= n)
+        {
+            copy_bytes(dest, src, n);
+            return dest;
+        }
+        uint8_t *d = dest;
+        const uint8_t *s = src;
+        while (n--)
+            d[n] = s[n];
+        return dest;
+    }
+    if ((uintptr_t)src - (uintptr_t)dest - n <= -2 * n)
+        return copy_long(dest, src, n);
+    return __real_memmove(dest, src, n);
+}
+
 /* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR
  * access in place of a call to this. */
 uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
