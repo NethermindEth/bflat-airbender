@@ -112,3 +112,19 @@ build. The release job checks the assets against the list and the signature
 `BFLAT_SIGNING_PUBLIC_KEY`) before it makes the release.
 `tools/sign_package.py` is a copy of the script in bflat-riscv64; keep it the
 same.
+
+## Runner
+
+`runner/Dockerfile` is the Airbender CLI at the zksync-airbender commit that
+the platform targets, with the cycles of a run printed on stderr. The Release
+Airbender runner workflow (run by hand) publishes it as
+`nethermindeth/airbender-runner:<commit>`, so that what runs an Airbender guest
+pulls it instead of building zksync-airbender:
+
+```bash
+docker run --rm -v "$PWD:/n" nethermindeth/airbender-runner:<commit> run \
+    --bin /n/nethermind.bin --text /n/nethermind.text \
+    --input-file /n/input.hex --cycles 12000000000
+```
+
+A pull request that changes the runner builds it without a push.

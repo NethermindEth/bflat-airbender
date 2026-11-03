@@ -1,0 +1,107 @@
+# Publishes the Airbender CLI as a container image (runner/Dockerfile), so
+# that what runs an Airbender guest (the Airbender job of bflat-riscv64,
+# Nethermind's Airbender guest, bflat-ts) pulls it instead of building
+# zksync-airbender, several minutes a run.
+#
+# The tag is the zksync-airbender commit. It must be the one that the
+# platform and libairbender of this repository target (README.md).
+#
+# Published to Docker Hub with the other images of the guests
+# (nethermindeth/bflat-riscv64-11, nethermindeth/sp1-runner). Logs in with
+# OIDC: needs the DOCKERHUB_ORGANIZATION and DOCKERHUB_OIDC_CONNECTIONID
+# variables, and a Docker Hub OIDC connection that trusts the docker-hub
+# environment of this repository, which a push runs in.
+#
+# A pull request that changes the runner builds it without a push. Publish by
+# hand; after publishing, pin the new digest in the consumers.
+name: Release Airbender runner
+
+on:
+  pull_request:
+    paths:
+      - runner/**
+      - .github/workflows/release-runner.yml
+  workflow_dispatch:
+    inputs:
+      airbender_commit:
+        description: zksync-airbender commit to build the CLI from (the image tag)
+        type: string
+        default: 7a147da32e0c74308891a3fbd03193e724115266
+      push:
+        description: Push to Docker Hub (off = build only, to check it compiles)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  AIRBENDER_COMMIT: ${{ inputs.airbender_commit || '7a147da32e0c74308891a3fbd03193e724115266' }}
+  IMAGE: nethermindeth/airbender-runner
+
+jobs:
+  runner:
+    name: airbender-runner
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.push == true && 'docker-hub' || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check the commit
+        run: |
+          [[ "$AIRBENDER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::airbender_commit must be a full commit hash, not '$AIRBENDER_COMMIT'"
+            exit 1
+          }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check the Docker Hub OIDC variables are present
+        if: inputs.push
+        env:
+          ORGANIZATION: ${{ vars.DOCKERHUB_ORGANIZATION }}
+          CONNECTION_ID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+        run: |
+          [ -n "$ORGANIZATION" ] && [ -n "$CONNECTION_ID" ] || {
+            echo "::error::DOCKERHUB_ORGANIZATION / DOCKERHUB_OIDC_CONNECTIONID are not set for this repository. Add them, or run with push off to build only."
+            exit 1
+          }
+
+      - name: Log in to Docker Hub
+        if: inputs.push
+        uses: docker/login-action@v4
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The token must outlive the image build, as buildx only pushes at the end
+          DOCKERHUB_OIDC_EXPIREIN: 3600
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: runner
+          build-args: AIRBENDER_COMMIT=${{ env.AIRBENDER_COMMIT }}
+          push: ${{ inputs.push == true }}
+          load: ${{ inputs.push != true }}
+          tags: ${{ env.IMAGE }}:${{ env.AIRBENDER_COMMIT }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the CLI
+        if: inputs.push != true
+        run: docker run --rm "$IMAGE:$AIRBENDER_COMMIT" --help
+
+      - name: Report the digest to pin
+        if: inputs.push
+        run: |
+          echo "### Pin this in the consumers" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$IMAGE:$AIRBENDER_COMMIT@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
