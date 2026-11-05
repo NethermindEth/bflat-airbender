@@ -59,7 +59,7 @@ for s in "${required[@]}"; do
 done
 if [ "$platform" = airbender ]; then
     unexpected=$(llvm-nm -u --format=just-symbols "$obj/libairbender.o" \
-        | grep -vxE '(malloc|calloc|realloc|free|memcpy|memmove|memset|memcmp|__real_memcpy)|__[a-z]+[dst]i[0-9]|(zkvm_platform_exit|zkvm_platform_write|airbender_finish_error|airbender_output)' || true)
+        | grep -vxE '(malloc|calloc|realloc|free|memcpy|memmove|memset|memcmp|__real_memcpy|__real_memmove)|__[a-z]+[dst]i[0-9]|(zkvm_platform_exit|zkvm_platform_write|airbender_finish_error|airbender_output)' || true)
     [ -z "$unexpected" ] || { echo "libairbender.a needs what the guest link does not provide:" $unexpected >&2; exit 1; }
 fi
 echo "built $out/libairbender.a: $(wc -l < "$obj/exports.txt") entry points"

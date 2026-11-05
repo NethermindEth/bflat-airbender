@@ -95,6 +95,7 @@ void pt_dbl(point *r, const point *p, int d);
 void pt_add(point *r, const point *p, const point *q, int d);
 void pt_neg(point *r, const point *p, int d);
 void pt_mul(point *r, const point *p, const uint8_t *k, size_t klen, int d);
+void pt_mul2(point *r, const point *p, const uint8_t *kp, const point *q, const uint8_t *kq, size_t klen, int d);
 void pt_mul_x(point *r, const point *p, int d);
 bool pt_eq(const point *p, const point *q, int d);
 bool pt_is_inf(const point *p, int d);

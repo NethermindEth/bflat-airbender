@@ -28,6 +28,170 @@ static curve Bn254 = {
     .loop = {0x01, 0x9d, 0x79, 0x70, 0x39, 0xbe, 0x76, 0x3b, 0xa8},
 };
 
+/*
+ * GLV on G1 (Gallant, Lambert and Vanstone): (x, y) -> (beta x, y), beta a cube root of 1 mod p, is multiplication by
+ * lambda, a cube root of 1 mod r, so k P = k1 P + k2 (beta x, y). The short basis (A1, -B), (B, B2) of the lattice of
+ * (a, b) with a + b lambda = 0 mod r gives k1 = k - c1 A1 - c2 B and k2 = c1 B - c2 B2 with c1 = floor(k G1 / 2^256)
+ * and c2 = floor(k G2 / 2^256), G1 and G2 the basis scaled by 2^256 / r: any c1 and c2 keep k1 + k2 lambda = k mod r,
+ * and these leave both halves at most 128 bits for any 256-bit k. Little-endian 32-bit limbs; Beta in Montgomery form.
+ */
+static fp Beta = {{0x13e80b9c, 0x3350c88e, 0xdb5e56b9, 0x7dce557c, 0xb615564a, 0x6001b4b8, 0x020217e0, 0x2682e617}};
+static const uint32_t GlvA1[4] = {0x7d4f1128, 0x8211bbeb, 0xeeb859fc, 0x6f4d8248};
+static const uint32_t GlvB[2] = {0x94d213e3, 0x89d32568};
+static const uint32_t GlvB2[4] = {0x1221250b, 0x0be4e154, 0xeeb859fd, 0x6f4d8248};
+static const uint32_t GlvG1[5] = {0x00ff6565, 0x5398fd03, 0xa773d2d2, 0x4ccef014, 0x00000002};
+static const uint32_t GlvG2[3] = {0xc7e0b3d7, 0xd91d232e, 0x00000002};
+
+enum
+{
+    GlvLimbs = 9 /* k and the halves, signed, mod 2^288 */
+};
+
+/* r = a b, na + nb limbs. */
+static void mp_mul(uint32_t *r, const uint32_t *a, int na, const uint32_t *b, int nb)
+{
+    memset(r, 0, 4 * (size_t)(na + nb));
+    for (int i = 0; i < na; i++)
+    {
+        uint64_t carry = 0;
+        for (int j = 0; j < nb; j++)
+        {
+            carry += (uint64_t)a[i] * b[j] + r[i + j];
+            r[i + j] = (uint32_t)carry;
+            carry >>= 32;
+        }
+        r[i + nb] = (uint32_t)carry;
+    }
+}
+
+/* r -= a mod 2^(32 GlvLimbs), a of na limbs. */
+static void mp_sub(uint32_t *r, const uint32_t *a, int na)
+{
+    uint32_t borrow = 0;
+    for (int i = 0; i < GlvLimbs; i++)
+    {
+        uint32_t ai = i < na ? a[i] : 0, d = r[i] - ai - borrow;
+        borrow = r[i] < ai || (r[i] == ai && borrow);
+        r[i] = d;
+    }
+}
+
+/* |v| in place, v signed mod 2^(32 GlvLimbs); true when v is negative. */
+static bool mp_abs(uint32_t *v)
+{
+    bool neg = v[GlvLimbs - 1] >> 31;
+    if (neg)
+    {
+        uint32_t m[GlvLimbs];
+        memcpy(m, v, sizeof(m));
+        memset(v, 0, sizeof(m));
+        mp_sub(v, m, GlvLimbs);
+    }
+    return neg;
+}
+
+enum
+{
+    NafWidth = 5,
+    NafTable = 1 << (NafWidth - 2), /* p, 3p, .. 15p */
+    NafMax = 131 /* digits of a value below 2^129 */
+};
+
+/* The width-5 NAF of k, below 2^129 in five limbs (which it consumes): odd digits in (-16, 16) and zeros, least
+   significant first, at most one non-zero digit in five. Returns the length. */
+static int wnaf(int8_t naf[NafMax], uint32_t k[5])
+{
+    int len = 0;
+    while (k[0] | k[1] | k[2] | k[3] | k[4])
+    {
+        int dg = 0;
+        if (k[0] & 1)
+        {
+            dg = (int)(k[0] & ((1u << NafWidth) - 1));
+            if (dg >= 1 << (NafWidth - 1))
+                dg -= 1 << NafWidth;
+            /* k - dg is a multiple of 2^5. */
+            uint64_t c = (uint64_t)k[0] - (uint64_t)(int64_t)dg;
+            k[0] = (uint32_t)c;
+            for (int i = 1; i < 5; i++)
+            {
+                c = (uint64_t)k[i] + (uint64_t)((int64_t)c >> 32);
+                k[i] = (uint32_t)c;
+            }
+        }
+        naf[len++] = (int8_t)dg;
+        for (int i = 0; i < 4; i++)
+            k[i] = (k[i] >> 1) | (k[i + 1] << 31);
+        k[4] >>= 1;
+    }
+    return len;
+}
+
+static void g1_mul_glv(point *r, const point *p, const uint8_t scalar[32])
+{
+    uint32_t k[8], prod[13], c1[5], c2[3], k1[GlvLimbs] = {0}, k2[GlvLimbs] = {0}, t[9];
+    for (int i = 0; i < 8; i++)
+    {
+        const uint8_t *b = scalar + 4 * (7 - i);
+        k[i] = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+    }
+    mp_mul(prod, k, 8, GlvG1, 5);
+    memcpy(c1, prod + 8, sizeof(c1));
+    mp_mul(prod, k, 8, GlvG2, 3);
+    memcpy(c2, prod + 8, sizeof(c2));
+
+    memcpy(k1, k, sizeof(k));
+    mp_mul(t, c1, 5, GlvA1, 4);
+    mp_sub(k1, t, 9);
+    mp_mul(t, c2, 3, GlvB, 2);
+    mp_sub(k1, t, 5);
+    mp_mul(t, c1, 5, GlvB, 2);
+    memcpy(k2, t, 4 * 7);
+    mp_mul(t, c2, 3, GlvB2, 4);
+    mp_sub(k2, t, 7);
+
+    /* The halves share the doublings, each a width-5 NAF over the odd multiples of its point: those of p1 are
+       Jacobian, and phi maps them to those of p2 with one product each, (beta X, Y, Z). */
+    static point table[2][NafTable];
+    point p1 = *p, two, neg;
+    bool neg1 = mp_abs(k1);
+    if (neg1)
+        pt_neg(&p1, &p1, 1);
+    pt_dbl(&two, &p1, 1);
+    table[0][0] = p1;
+    for (int i = 1; i < NafTable; i++)
+        pt_add(&table[0][i], &table[0][i - 1], &two, 1);
+    bool neg2 = mp_abs(k2) != neg1; /* phi of the multiples of p1 has the sign of k1 */
+    for (int i = 0; i < NafTable; i++)
+    {
+        table[1][i] = table[0][i];
+        fp_mul(&table[1][i].x.c[0], &table[0][i].x.c[0], &Beta);
+        if (neg2)
+            pt_neg(&table[1][i], &table[1][i], 1);
+    }
+
+    int8_t naf[2][NafMax];
+    int len[2] = {wnaf(naf[0], k1), wnaf(naf[1], k2)};
+    point acc;
+    memset(&acc, 0, sizeof(acc)); /* infinity */
+    for (int i = (len[0] > len[1] ? len[0] : len[1]) - 1; i >= 0; i--)
+    {
+        pt_dbl(&acc, &acc, 1);
+        for (int h = 0; h < 2; h++)
+        {
+            int dg = i < len[h] ? naf[h][i] : 0;
+            if (dg > 0)
+                pt_add(&acc, &acc, &table[h][dg >> 1], 1);
+            else if (dg < 0)
+            {
+                pt_neg(&neg, &table[h][-dg >> 1], 1);
+                pt_add(&acc, &acc, &neg, 1);
+            }
+        }
+    }
+    *r = acc;
+}
+
 static bool load_g1(point *p, const uint8_t in[64])
 {
     return pt_load(p, in, 1, false) && pt_on_curve(p, 1);
@@ -72,7 +236,7 @@ zkvm_status zkvm_bn254_g1_mul(const uint8_t point_in[64], const uint8_t scalar[3
     point a;
     if (!load_g1(&a, point_in))
         return ZKVM_EFAIL;
-    pt_mul(&a, &a, scalar, 32, 1);
+    g1_mul_glv(&a, &a, scalar);
     pt_store(result, &a, 1, false);
     return ZKVM_EOK;
 }

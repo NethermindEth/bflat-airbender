@@ -17,6 +17,10 @@
       {
         "symbol": "memcpy",
         "note": "libairbender's __wrap_memcpy: long copies through the u256 delegation, word loops otherwise."
+      },
+      {
+        "symbol": "memmove",
+        "note": "libairbender's __wrap_memmove: short copies inline, long copies between disjoint buffers by the memcpy body, overlapping ones by musl's memmove."
       }
     ]
   },
