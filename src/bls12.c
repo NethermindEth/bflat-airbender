@@ -547,16 +547,14 @@ zkvm_status zkvm_kzg_point_eval(const uint8_t commitment[48], const uint8_t z[32
     if (!g1_uncompress(&c, commitment) || !g1_in_group(&c) || !g1_uncompress(&pi, proof) || !g1_in_group(&pi))
         return ZKVM_EOK;
 
-    /* e(C - [y]G1, -G2) e(proof, [tau - z]G2) == 1 */
+    /* e(C - [y]G1, -G2) e(proof, [tau - z]G2) == 1, as e(C - [y]G1 + [z]proof, -G2) e(proof, [tau]G2) == 1: the
+       multiplication by z moves to G1, where [y](-G1) + [z]proof takes one pass that shares the doublings. */
     pt_load(&g, G1Gen, 1, false);
-    pt_mul(&t, &g, y, ScalarBytes, 1);
-    pt_neg(&t, &t, 1);
+    pt_neg(&g, &g, 1);
+    pt_mul2(&t, &g, y, &pi, z, ScalarBytes, 1);
     pt_add(&c, &c, &t, 1);
     pt_load(&g, G2Gen, 2, false);
     pt_load(&q, TauG2, 2, false);
-    pt_mul(&t, &g, z, ScalarBytes, 2);
-    pt_neg(&t, &t, 2);
-    pt_add(&q, &q, &t, 2);
     pt_neg(&g, &g, 2);
 
     fp12 f;
