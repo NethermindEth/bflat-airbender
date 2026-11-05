@@ -76,8 +76,8 @@ static void mp_sub(uint32_t *r, const uint32_t *a, int na)
     }
 }
 
-/* |v| as 20 big-endian bytes; true when v is negative. */
-static bool mp_abs_be(uint8_t out[20], uint32_t *v)
+/* |v| in place, v signed mod 2^(32 GlvLimbs); true when v is negative. */
+static bool mp_abs(uint32_t *v)
 {
     bool neg = v[GlvLimbs - 1] >> 31;
     if (neg)
@@ -87,9 +87,44 @@ static bool mp_abs_be(uint8_t out[20], uint32_t *v)
         memset(v, 0, sizeof(m));
         mp_sub(v, m, GlvLimbs);
     }
-    for (int i = 0; i < 20; i++)
-        out[19 - i] = (uint8_t)(v[i / 4] >> (8 * (i % 4)));
     return neg;
+}
+
+enum
+{
+    NafWidth = 5,
+    NafTable = 1 << (NafWidth - 2), /* p, 3p, .. 15p */
+    NafMax = 131 /* digits of a value below 2^129 */
+};
+
+/* The width-5 NAF of k, below 2^129 in five limbs (which it consumes): odd digits in (-16, 16) and zeros, least
+   significant first, at most one non-zero digit in five. Returns the length. */
+static int wnaf(int8_t naf[NafMax], uint32_t k[5])
+{
+    int len = 0;
+    while (k[0] | k[1] | k[2] | k[3] | k[4])
+    {
+        int dg = 0;
+        if (k[0] & 1)
+        {
+            dg = (int)(k[0] & ((1u << NafWidth) - 1));
+            if (dg >= 1 << (NafWidth - 1))
+                dg -= 1 << NafWidth;
+            /* k - dg is a multiple of 2^5. */
+            uint64_t c = (uint64_t)k[0] - (uint64_t)(int64_t)dg;
+            k[0] = (uint32_t)c;
+            for (int i = 1; i < 5; i++)
+            {
+                c = (uint64_t)k[i] + (uint64_t)((int64_t)c >> 32);
+                k[i] = (uint32_t)c;
+            }
+        }
+        naf[len++] = (int8_t)dg;
+        for (int i = 0; i < 4; i++)
+            k[i] = (k[i] >> 1) | (k[i + 1] << 31);
+        k[4] >>= 1;
+    }
+    return len;
 }
 
 static void g1_mul_glv(point *r, const point *p, const uint8_t scalar[32])
@@ -115,14 +150,46 @@ static void g1_mul_glv(point *r, const point *p, const uint8_t scalar[32])
     mp_mul(t, c2, 3, GlvB2, 4);
     mp_sub(k2, t, 7);
 
-    uint8_t e1[20], e2[20];
-    point p1 = *p, p2 = *p;
-    fp_mul(&p2.x.c[0], &p->x.c[0], &Beta);
-    if (mp_abs_be(e1, k1))
+    /* The halves share the doublings, each a width-5 NAF over the odd multiples of its point: those of p1 are
+       Jacobian, and phi maps them to those of p2 with one product each, (beta X, Y, Z). */
+    static point table[2][NafTable];
+    point p1 = *p, two, neg;
+    bool neg1 = mp_abs(k1);
+    if (neg1)
         pt_neg(&p1, &p1, 1);
-    if (mp_abs_be(e2, k2))
-        pt_neg(&p2, &p2, 1);
-    pt_mul2(r, &p1, e1, &p2, e2, sizeof(e1), 1);
+    pt_dbl(&two, &p1, 1);
+    table[0][0] = p1;
+    for (int i = 1; i < NafTable; i++)
+        pt_add(&table[0][i], &table[0][i - 1], &two, 1);
+    bool neg2 = mp_abs(k2) != neg1; /* phi of the multiples of p1 has the sign of k1 */
+    for (int i = 0; i < NafTable; i++)
+    {
+        table[1][i] = table[0][i];
+        fp_mul(&table[1][i].x.c[0], &table[0][i].x.c[0], &Beta);
+        if (neg2)
+            pt_neg(&table[1][i], &table[1][i], 1);
+    }
+
+    int8_t naf[2][NafMax];
+    int len[2] = {wnaf(naf[0], k1), wnaf(naf[1], k2)};
+    point acc;
+    memset(&acc, 0, sizeof(acc)); /* infinity */
+    for (int i = (len[0] > len[1] ? len[0] : len[1]) - 1; i >= 0; i--)
+    {
+        pt_dbl(&acc, &acc, 1);
+        for (int h = 0; h < 2; h++)
+        {
+            int dg = i < len[h] ? naf[h][i] : 0;
+            if (dg > 0)
+                pt_add(&acc, &acc, &table[h][dg >> 1], 1);
+            else if (dg < 0)
+            {
+                pt_neg(&neg, &table[h][-dg >> 1], 1);
+                pt_add(&acc, &acc, &neg, 1);
+            }
+        }
+    }
+    *r = acc;
 }
 
 static bool load_g1(point *p, const uint8_t in[64])
