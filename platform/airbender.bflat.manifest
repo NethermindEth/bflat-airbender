@@ -93,7 +93,18 @@
   "postlink": [
     {
       "tool": "patch_elf",
-      "args": ["--nop-fences", "--unsigned-muldiv", "--unimp-system", "--unimp-csr", "0xc22"],
+      "args": [
+        "--nop-fences",
+        "--unsigned-muldiv",
+        "--unimp-system",
+        "--unimp-csr",
+        "0xc22",
+        {
+          "value": "--remove-eh",
+          "when": {"eh": "failfast"},
+          "note": "Drops .eh_frame, .eh_frame_hdr and .dotnet_eh_table, which is exactly what the unwinder reads. airbender.ld places them at the end of the ROM, so the flat image loses them too. Only when the build trades exception handling for size."
+        }
+      ],
       "note": "The native code carries what Airbender cannot run: FENCE, which it rejects (a single hart has nothing to order), and the signed RV32M instructions, which v3 does not prove; the JIT emits neither for managed code. Airbender's transpiler also decodes the whole .text before the run and rejects any SYSTEM encoding it does not know: the ebreak with which the JIT ends a call to a noreturn helper, musl's ecalls, and the read of vlenb (0xc22) in the runtime's libunwind become UNIMP (csrrw x0, cycle, x0), which it takes as an illegal instruction. The guest reaches none of them."
     },
     {
@@ -128,8 +139,7 @@
       "guest_subst"
     ],
     "flags": ["no-atomics", "noos", "no-console"],
-    "unwind": false,
-    "note": "No unwind tables: they would take about half a MiB of the ROM, so every exception goes to the guest's ZkvmThrow handler (bflat builds as with --remove-eh). No JitZkBumpAddr: the rv32 guest keeps the allocation helper call, which it was validated with.",
+    "note": "The unwind tables take about half a MiB of the ROM of a large guest: build it with --remove-eh to route every exception to its ZkvmThrow handler instead. No JitZkBumpAddr: the rv32 guest keeps the allocation helper call, which it was validated with.",
     "linker_script": "airbender.ld",
     "entry": "airbender_entry.o"
   }

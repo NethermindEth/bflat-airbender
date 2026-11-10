@@ -34,6 +34,7 @@ MEMORY {
 PHDRS {
   text PT_LOAD FLAGS(5);
   rodata PT_LOAD FLAGS(4);
+  eh PT_LOAD FLAGS(4);
   data PT_LOAD FLAGS(6);
   tls PT_TLS;
 }
@@ -72,11 +73,6 @@ SECTIONS
     *(.srodata .srodata.*)
     *(.rodata .rodata.*)
   } >rom :rodata
-
-  /* No unwind tables (see /DISCARD/ below): pal/eh's synthetic program
-   * headers describe an empty .eh_frame_hdr. */
-  __eh_frame_hdr_start = .;
-  __eh_frame_hdr_end = .;
 
   /* Everything initialised that runs from RAM, as one block _start copies:
    * keep every PROGBITS section between __ram_init_start and __ram_init_end,
@@ -164,19 +160,38 @@ SECTIONS
 
   _end = .;
 
-  /* The ROM image ends with the load copy of the RAM block. */
+  /* The unwind tables come last in the ROM, after the load copy of the RAM
+   * block, so --remove-eh (patch_elf, see the platform manifest) drops them
+   * from the end of the flat image rather than leaving a hole in it. pal/eh's
+   * synthetic program headers report .eh_frame_hdr as PT_GNU_EH_FRAME. The
+   * address is explicit: the ROM region places by VMA, and the load copy
+   * has none there. They come after every other section: the TLS segment
+   * would take them in between .tdata and .tbss, and objcopy would place them
+   * by its load address; and a NOLOAD section after them would join their
+   * segment. */
+  .eh_frame_hdr ALIGN(LOADADDR(.tdata) + SIZEOF(.tdata), 8) : {
+    __eh_frame_hdr_start = .;
+    KEEP(*(.eh_frame_hdr))
+    __eh_frame_hdr_end = .;
+  } :eh
+
+  .eh_frame ALIGN(8) : {
+    KEEP(*(.eh_frame .eh_frame.*))
+  } :eh
+
+  .dotnet_eh_table ALIGN(8) : {
+    KEEP(*(.dotnet_eh_table))
+  } :eh
+
+  /* The ROM image ends with the load copy of the RAM block when --remove-eh
+   * drops the unwind tables, and with the tables otherwise. The linker cannot
+   * tell which, so it bounds the image without them: a large guest proves
+   * only with --remove-eh. */
   __rom_image_end = __ram_init_load + (__ram_init_end - __ram_init_start);
   ASSERT(__rom_image_end <= (DEFINED(AIRBENDER_ROM_SIZE) ? AIRBENDER_ROM_SIZE : 4M),
          "image does not fit Airbender's ROM; link with --defsym=AIRBENDER_ROM_SIZE=<bytes> to simulate it anyway")
 
-  /* The unwind tables would take about half a MiB of a guest's ROM; an
-   * Airbender image routes every exception to the guest's ZkvmThrow handler
-   * instead (the platform has "unwind": false, so bflat builds every guest as
-   * with --remove-eh). */
   /DISCARD/ : {
-    *(.eh_frame_hdr)
-    *(.eh_frame .eh_frame.*)
-    *(.dotnet_eh_table)
     *(.debug*)
     *(.comment)
     *(.riscv.attributes)

@@ -14,15 +14,24 @@ The platform (`platform/`, see the manifest format in bflat-riscv64's
   writes the cycle CSR, which no circuit satisfies) and `zkvm_platform_write`
   (the quasi-UART of the non-determinism CSR).
 - `airbender.ld`: the memory map. The ROM at address 0 holds the image, 4 MiB
-  in v3; the link fails if it does not fit.
+  in v3; the link fails if the image without its unwind tables does not
+  fit. The tables come last in the ROM, after the load copy of the RAM
+  block.
 - `airbender.bflat.manifest`: the platform manifest. The modules of bflat it
   requires, the ISA (no C, A, F or D), the RyuJIT options (unsigned RV32M only,
-  no unaligned access, the zkVM tuning measured on the Nethermind guest), no
-  unwind tables, the post-link steps (the FENCE and signed RV32M rewrites
-  of the native code, and the flat images `<output>.bin` and `<output>.text`
-  that Airbender loads), and the ISA checks of the linked image, which fail
-  the build on an F, D, C or A instruction. The checks need a bflat that reads
-  ELF32 images (bflat-riscv64 #69).
+  no unaligned access, the zkVM tuning measured on the Nethermind guest), the
+  post-link steps (the FENCE and signed RV32M rewrites of the native code,
+  the removal of the unwind tables under `--remove-eh`, and the flat images
+  `<output>.bin` and `<output>.text` that Airbender loads), and the ISA
+  checks of the linked image, which fail the build on an F, D, C or A
+  instruction. The checks need a bflat that reads ELF32 images
+  (bflat-riscv64 #69), and `--remove-eh` one whose patch_elf takes it on an
+  ELF32 image.
+
+The image keeps its unwind tables, so a `throw` is dispatched to its `catch`
+and `finally` blocks. They take about half a MiB of the ROM of a large
+guest: build it with `--remove-eh` to drop them, and a `throw` then goes to
+the guest's `ZkvmThrow` handler or exits the guest.
 
 `libairbender.a`, with its manifest `libairbender.bflat.manifest`, supplies
 what the guest reaches through `__Internal` P/Invokes
