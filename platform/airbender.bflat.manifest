@@ -85,6 +85,15 @@
       }
     ]
   },
+  "link": {
+    "ld": [
+      {
+        "value": "--defsym=AIRBENDER_ROM_EH=1",
+        "when": {"eh": "unwind"},
+        "note": "The image keeps its unwind tables at the end of the ROM: airbender.ld then bounds the image with them, so a guest they push past the ROM fails to link rather than at run time."
+      }
+    ]
+  },
   "checks": {
     "float": true,
     "compressed": true,

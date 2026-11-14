@@ -14,9 +14,9 @@ The platform (`platform/`, see the manifest format in bflat-riscv64's
   writes the cycle CSR, which no circuit satisfies) and `zkvm_platform_write`
   (the quasi-UART of the non-determinism CSR).
 - `airbender.ld`: the memory map. The ROM at address 0 holds the image, 4 MiB
-  in v3; the link fails if the image without its unwind tables does not
-  fit. The tables come last in the ROM, after the load copy of the RAM
-  block.
+  in v3; the link fails if the image, with its unwind tables unless the
+  build passes `--remove-eh`, does not fit. The tables come last in the ROM,
+  after the load copy of the RAM block.
 - `airbender.bflat.manifest`: the platform manifest. The modules of bflat it
   requires, the ISA (no C, A, F or D), the RyuJIT options (unsigned RV32M only,
   no unaligned access, the zkVM tuning measured on the Nethermind guest), the
