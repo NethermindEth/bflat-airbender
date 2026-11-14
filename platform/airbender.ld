@@ -10,7 +10,8 @@
  * Airbender v3's ROM is 4 MiB (common_constants/src/rom.rs ROM_BYTE_SIZE);
  * earlier versions have 2 MiB (circuit_defs/<machine>/src/lib.rs
  * MAX_ROM_SIZE), and the simulator does not bound it. AIRBENDER_ROM_SIZE
- * defaults to the v3 limit so an image that would not prove fails to link.
+ * defaults to the v3 limit so an image that would not prove fails to link,
+ * its unwind tables included unless the build drops them (--remove-eh).
  *
  * v3 also proves only the unsigned RV32M instructions. The JIT leaves the
  * signed ones out of managed code (JitRiscVUnsignedMulDiv); for the native
@@ -185,10 +186,17 @@ SECTIONS
 
   /* The ROM image ends with the load copy of the RAM block when --remove-eh
    * drops the unwind tables, and with the tables otherwise. The linker cannot
-   * tell which, so it bounds the image without them: a large guest proves
-   * only with --remove-eh. */
+   * tell which, so the platform manifest defines AIRBENDER_ROM_EH for a build
+   * that keeps them, and the bound then takes them in. */
   __rom_image_end = __ram_init_load + (__ram_init_end - __ram_init_start);
-  ASSERT(__rom_image_end <= (DEFINED(AIRBENDER_ROM_SIZE) ? AIRBENDER_ROM_SIZE : 4M),
+  /* The tables follow it in this order, each aligned to 8. Only their sizes
+   * are read: an ADDR() of one, or a symbol assigned inside it, would keep an
+   * empty table, which the linker then places in RAM. An empty one counts at
+   * most 7 bytes of alignment. */
+  __eh_tables_end = ALIGN(ALIGN(ALIGN(__rom_image_end, 8) + SIZEOF(.eh_frame_hdr), 8)
+                          + SIZEOF(.eh_frame), 8) + SIZEOF(.dotnet_eh_table);
+  __rom_end = DEFINED(AIRBENDER_ROM_EH) ? MAX(__rom_image_end, __eh_tables_end) : __rom_image_end;
+  ASSERT(__rom_end <= (DEFINED(AIRBENDER_ROM_SIZE) ? AIRBENDER_ROM_SIZE : 4M),
          "image does not fit Airbender's ROM; link with --defsym=AIRBENDER_ROM_SIZE=<bytes> to simulate it anyway")
 
   /DISCARD/ : {
