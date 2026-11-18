@@ -46,6 +46,25 @@ guest):
   evaluation. The field arithmetic runs on Airbender's u256 delegation
   (CSR 0x7ca), Keccak on its Keccak-f delegation.
 
+- The Trusted input of the Nethermind guest, read once: `read_input` hashes
+  the witness nodes and the codes while it copies them
+  (`airbender_prehashed_nodes`, `airbender_prehashed_code`).
+- A trie engine over those nodes (`src/mpt.c`, the `airbender_mpt_` calls):
+  account and storage reads and writes, and the root. It builds each node
+  once, checks the full branches the way the guest's
+  `SecuredTrieNodeValidator` does, and hashes a changed branch from the bytes
+  of its witness node.
+- Hints: values after the trusted input that the library or the guest
+  checks where computing them costs more. The division hints
+  (`airbender_division_hints`) are checked by the guest. The field hint tape
+  holds the slopes of affine additions (secp256k1 batch verification, BN254
+  and BLS12-381 additions) and the witnesses that replace the final
+  exponentiation of a pairing check. An input without these sections runs
+  the same code as before, and a wrong or missing hint only costs the
+  computation.
+- The log bloom (`airbender_bloom_set`) and the 64-bit division of
+  compiler-rt (`__udivdi3`, `__umoddi3`, wrapped by the manifest).
+
 A guest that uses no accelerator links with the platform alone.
 
 The Keccak-f delegation that libairbender calls (CSRs 0x7cc, 0x7cd and
@@ -101,6 +120,10 @@ library and run under qemu-riscv32 (`python3 tests/run.py qemu-riscv32
 output/linux/harness`). That build has no u256 delegation, so `u256_soft.c`
 computes its results. It fails if the harness answers fewer cases than it was
 given.
+
+`tests/mpt/run.sh [rounds] [seed]` builds the trie engine for the host with
+the address and undefined-behaviour sanitizers and compares its reads, writes
+and roots with a trie built from scratch.
 
 `tests/platform/run-tls.sh` checks that the memory map keeps the initialized
 TLS in the ROM copy of the RAM block.

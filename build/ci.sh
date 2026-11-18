@@ -1,6 +1,7 @@
 #!/bin/bash
 # The build of CI and of the release: both platforms and the gates in the image of the Dockerfile,
-# then tests/run.py with the harness under qemu-riscv32 (QEMU names it) on the host.
+# then tests/run.py with the harness under qemu-riscv32 (QEMU names it) and the trie engine against
+# its reference (tests/mpt/run.sh) on the host.
 set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -14,3 +15,4 @@ docker run --platform linux/amd64 --rm -v "$TOP:$TOP" -w "$TOP" "$image" bash -e
     bash tests/platform/run-tls.sh
     chmod -R a+rwX output'
 python3 "$TOP/tests/run.py" "${QEMU:-qemu-riscv32}" "$TOP/output/linux/harness"
+bash "$TOP/tests/mpt/run.sh"
