@@ -831,6 +831,18 @@ PT_OP bool pt_hint(fp *r, uint32_t n)
     return limbs_cmp(r->l, C->p.l, 8) < 0;
 }
 
+/* num / den by an inversion, for want of a hint, and given to field_hint_emit. Out of line and for any field
+ * width: it runs only while a tape is recorded, or when the tape is wrong or exhausted. */
+NOINLINE static void pt_slope_computed(fp2 *lam, const fp2 *num, const fp2 *den, int d)
+{
+    fp2 inv;
+    fq_inv(&inv, den, d);
+    pt_fmul(lam, num, &inv, d, 0);
+    for (int j = 0; j < d; j++)
+        for (uint32_t k = 0; k < (C->n + 7) / 8; k++)
+            field_hint_emit(digit(&lam->c[j], (int)k));
+}
+
 /* num / den for den != 0: the tape's value where its product with den is num, computed otherwise. */
 PT_OP void pt_slope(fp2 *lam, const fp2 *num, const fp2 *den, int d, uint32_t n)
 {
@@ -844,14 +856,7 @@ PT_OP void pt_slope(fp2 *lam, const fp2 *num, const fp2 *den, int d, uint32_t n)
         ok = pt_feq(&t, num, d, n);
     }
     if (!ok)
-    {
-        fp2 inv;
-        fq_inv(&inv, den, d);
-        pt_fmul(lam, num, &inv, d, n);
-        for (int j = 0; j < d; j++)
-            for (uint32_t k = 0; k < (C->n + 7) / 8; k++)
-                field_hint_emit(digit(&lam->c[j], (int)k));
-    }
+        pt_slope_computed(lam, num, den, d);
 }
 
 PT_OP void pt_fcopy(fp2 *r, const fp2 *a, int d, uint32_t n)
@@ -891,14 +896,17 @@ PT_OP void pt_dbl_affine_in(point *r, const point *p, int d, uint32_t n)
     pt_chord(r, p, &p->x, &lam, d, n);
 }
 
+NOINLINE static bool pt_dbl_hinted(point *r, const point *p, int d);
+
 PT_OP void pt_add_affine_in(point *r, const point *p, const point *q, int d, uint32_t n)
 {
     fp2 num, den, lam;
     pt_fsub(&den, &q->x, &p->x, d, n);
     if (pt_fzero(&den, d, n))
     {
+        /* Equal points are rare: the doubling stays out of line. */
         if (pt_feq(&p->y, &q->y, d, n))
-            pt_dbl_affine_in(r, p, d, n);
+            pt_dbl_hinted(r, p, d);
         else
             pt_set_inf(r);
         return;
@@ -1690,40 +1698,6 @@ static struct
     line_coef lines[LineCacheLines];
 } LineCache[LineCachePoints];
 static uint32_t LineCacheNext;
-/* The lines of the points the KZG point evaluation pairs against (kzg_lines.c): a count of points and of lines,
-   then each point's x and y and its lines, twelve limbs a field element. */
-extern const uint32_t KzgLineSeed[];
-/* Fills place `slot` with the lines of q if they are in the table. */
-static int line_cache_seed(int slot, const point *q)
-{
-    const uint32_t *w = KzgLineSeed;
-    uint32_t points = w[0], lines = w[1];
-    w += 2;
-    for (uint32_t i = 0; i < points; i++, w += 48 + 72 * lines)
-    {
-        const fp *xy[4] = {&q->x.c[0], &q->x.c[1], &q->y.c[0], &q->y.c[1]};
-        uint32_t differs = 0;
-        for (int k = 0; k < 4; k++)
-            for (int l = 0; l < 12; l++)
-                differs |= xy[k]->l[l] ^ w[12 * k + l];
-        if (differs)
-            continue;
-        const uint32_t *from = w + 48;
-        fp *to = &LineCache[slot].lines[0].cy.c[0];
-        for (uint32_t k = 0; k < 6 * lines; k++, from += 12)
-        {
-            for (int l = 0; l < 12; l++)
-                to[k].l[l] = from[l];
-            for (int l = 12; l < FpMaxLimbs; l++)
-                to[k].l[l] = 0;
-        }
-        LineCache[slot].x = q->x;
-        LineCache[slot].y = q->y;
-        LineCache[slot].of = C;
-        return 1;
-    }
-    return 0;
-}
 /* Where miller_dbl and miller_add leave the coefficients of the line they make, when it is set. */
 static line_coef *LineOut;
 
@@ -2046,8 +2020,6 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
             for (int e = 0; e < j; e++)
                 if (!kept[e] && slot[e] == slot[j])
                     keep[j] = 0;
-            if (C->mtwist && keep[j] && line_cache_seed(slot[j], &qa[j]))
-                kept[j] = LineCache[slot[j]].lines;
         }
     }
     if (Pw.state == PwFresh)
