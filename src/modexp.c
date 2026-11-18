@@ -149,9 +149,31 @@ static void accumulate_digit(int d, const u256d *v)
         carry = u256_op(&MontT[++d], &MontZero2, U256_ADD | U256_CARRY);
 }
 
+/* One 256-bit digit: r = a b / 2^256 mod N. The low half of a b + m N is zero by the choice of m, so only its
+ * carry is needed, and that is 1 unless the low half of a b is zero. */
+static void mont_mul_1(u256d *r, const u256d *a, const u256d *b)
+{
+    u256_op(&MontX, a, U256_MEMCOPY);
+    u256_op(&MontX, b, U256_MUL_LOW);
+    u256_op(&MontT[0], a, U256_MEMCOPY);
+    u256_op(&MontT[0], b, U256_MUL_HIGH);
+    u256_op(&MontM2, &MontX, U256_MEMCOPY);
+    u256_op(&MontM2, &MontNPrime, U256_MUL_LOW);
+    u256_op(&MontM2, &MontN[0], U256_MUL_HIGH);
+    uint32_t low_zero = u256_op(&MontX, &MontZero2, U256_EQ);
+    uint32_t carry = u256_op(&MontT[0], &MontM2, U256_ADD | (low_zero ? 0 : U256_CARRY));
+    u256_op(&MontD[0], &MontT[0], U256_MEMCOPY);
+    uint32_t borrow = u256_op(&MontD[0], &MontN[0], U256_SUB);
+    u256_op(r, (carry || !borrow) ? &MontD[0] : &MontT[0], U256_MEMCOPY);
+}
 /* r = a b / R mod N, for a, b < N; r may alias a or b. */
 static void mont_mul_k(u256d *r, const u256d *a, const u256d *b, int k)
 {
+    if (k == 1)
+    {
+        mont_mul_1(r, a, b);
+        return;
+    }
     for (int d = 0; d <= 2 * k; d++)
         u256_op(&MontT[d], &MontZero2, U256_MEMCOPY);
     for (int i = 0; i < k; i++)
