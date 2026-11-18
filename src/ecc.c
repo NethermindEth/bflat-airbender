@@ -27,6 +27,14 @@ typedef struct
 
 static void from_be(u256d *r, const uint8_t in[32])
 {
+    if (((uintptr_t)in & 3) == 0)
+    {
+        const uint32_t *w = (const uint32_t *)in;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; i++)
+            r->w[i] = rev8(w[7 - i]);
+        return;
+    }
     for (int i = 0; i < 8; i++)
         r->w[i] = ((uint32_t)in[31 - 4 * i - 3] << 24) | ((uint32_t)in[31 - 4 * i - 2] << 16) |
                   ((uint32_t)in[31 - 4 * i - 1] << 8) | in[31 - 4 * i];
@@ -1103,17 +1111,19 @@ void airbender_secp256k1_ecrecover_batch(const uint8_t *msgs, const uint8_t *sig
 
 enum
 {
-    VerifyBatch = 512,
+    VerifyBatch = 2048,
+    /* Without hinted slopes the additions share inversions in batches, tuned for chunks of this many. */
+    VerifyBatchUnhinted = 512,
     MsmTerms = 3 * VerifyBatch + 2,
     MsmMinWindow = 4,
-    MsmMaxWindow = 7,
+    MsmMaxWindow = 10,
     /* Digits of a scalar below 2^129, one more for the last carry. */
     MsmMaxDigits = (129 + MsmMinWindow - 1) / MsmMinWindow + 1
 };
 
 static apoint MsmBase[MsmTerms];
 static u256d MsmScalar[MsmTerms]; /* plain */
-static int8_t MsmDigits[MsmMaxDigits][MsmTerms];
+static int16_t MsmDigits[MsmMaxDigits][MsmTerms];
 /* The buckets of all windows at once, affine, with Jacobian spill buckets beside them. With MsmMaxWindow the largest
    window, its count of buckets bounds every smaller window's. */
 enum
@@ -1265,12 +1275,275 @@ static void msm_fill(uint32_t terms, int digits, int buckets, const mont_ctx *f)
         msm_flush(batch, &acc, buckets, f);
 }
 
+field_hints FieldHints;
+
+__attribute__((noinline)) void field_hint_emit(const u256d *v)
+{
+    (void)v;
+    __asm__ volatile("");
+}
+
+static __attribute__((noinline)) const u256d *slope_computed(u256d *lambda, const u256d *dy, const u256d *den,
+                                                             const mont_ctx *f)
+{
+    u256d inv;
+    /* field_inverse is an addition chain for secp256k1's prime. */
+    if (f == &CurveK1.p)
+        field_inverse(&inv, den, f);
+    else
+        inverse(&inv, den, f);
+    MUL(lambda, dy, &inv);
+    field_hint_emit(lambda);
+    return lambda;
+}
+
+/* dy / den for den != 0: the tape's next value where it is below p and its product with den is dy, which only the
+   quotient is; computed otherwise. */
+static inline __attribute__((always_inline)) const u256d *slope(u256d *lambda, const u256d *dy, const u256d *den,
+                                                                const mont_ctx *f)
+{
+    if (FieldHints.next != FieldHints.end)
+    {
+        const u256d *h = FieldHints.next++;
+        if (less(h, &f->n))
+        {
+            MUL(lambda, h, den);
+            if (u256_op(lambda, dy, U256_EQ))
+                return h;
+        }
+    }
+    return slope_computed(lambda, dy, den, f);
+}
+
+/* Zero in RAM, for the delegation's comparisons. */
+static u256d HintZero;
+
+/* (x, y) = 2 (x, y) with the tangent's slope from the tape; secp256k1 has no point with y = 0. */
+static __attribute__((noinline)) void affine_double_hinted(apoint *p, const mont_ctx *f)
+{
+    u256d num, den, lam, x3;
+    MUL(&num, &p->x, &p->x);
+    ADD(&den, &num, &num);
+    ADD(&num, &num, &den);
+    ADD(&den, &p->y, &p->y);
+    const u256d *l = slope(&lam, &num, &den, f);
+    MUL(&x3, l, l);
+    SUB(&x3, &x3, &p->x);
+    SUB(&x3, &x3, &p->x);
+    SUB(&p->x, &p->x, &x3);
+    MUL(&p->x, &p->x, l);
+    SUB(&p->x, &p->x, &p->y);
+    u256_op(&p->y, &p->x, U256_MEMCOPY);
+    u256_op(&p->x, &x3, U256_MEMCOPY);
+}
+
+/* a += (qx, qy) for affine points, the chord's slope from the tape: three products. Returns 0 where the sum is the
+   point at infinity, with a left as it was. */
+static inline __attribute__((always_inline)) int affine_add_hinted(apoint *a, const u256d *qx, const u256d *qy,
+                                                                   const mont_ctx *f)
+{
+    u256d den, dy, lam, x3;
+    SUB(&den, qx, &a->x);
+    if (u256_op(&den, &HintZero, U256_EQ))
+    {
+        /* The same point, or its negative. */
+        if (!equal(qy, &a->y))
+            return 0;
+        affine_double_hinted(a, f);
+        return 1;
+    }
+    SUB(&dy, qy, &a->y);
+    const u256d *l = slope(&lam, &dy, &den, f);
+    MUL(&x3, l, l);
+    SUB(&x3, &x3, &a->x);
+    SUB(&x3, &x3, qx);
+    SUB(&a->x, &a->x, &x3);
+    MUL(&a->x, &a->x, l);
+    SUB(&a->x, &a->x, &a->y);
+    u256_op(&a->y, &a->x, U256_MEMCOPY);
+    u256_op(&a->x, &x3, U256_MEMCOPY);
+    return 1;
+}
+
+/* msm_fill with each addition's slope from the hint tape: three products an addition and no inversion to share, so
+   every addition goes into its affine bucket at once and no spill bucket is used. */
+static void msm_fill_hinted(uint32_t terms, int digits, int buckets, const mont_ctx *f)
+{
+    uint32_t count = (uint32_t)digits * (uint32_t)buckets;
+    memset(MsmFilled, 0, count);
+    u256d ny, zero = {{0}};
+    for (uint32_t i = 0; i < terms; i++)
+    {
+        int negated = 0;
+        for (int j = 0; j < digits; j++)
+        {
+            int d = MsmDigits[j][i];
+            if (!d)
+                continue;
+            uint32_t b = (uint32_t)j * (uint32_t)buckets + (uint32_t)(d < 0 ? -d : d) - 1;
+            apoint *a = &MsmBucket[b];
+            /* A term's negative digits share one negation. */
+            const u256d *y = &MsmBase[i].y;
+            if (d < 0)
+            {
+                if (!negated)
+                {
+                    SUB(&ny, &zero, y);
+                    negated = 1;
+                }
+                y = &ny;
+            }
+            if (!MsmFilled[b])
+            {
+                u256_op(&a->x, &MsmBase[i].x, U256_MEMCOPY);
+                u256_op(&a->y, y, U256_MEMCOPY);
+                MsmFilled[b] = 1;
+                continue;
+            }
+            if (!affine_add_hinted(a, &MsmBase[i].x, y, f))
+                MsmFilled[b] = 0;
+        }
+    }
+}
+
+/* The windows' bucket sums with hinted affine additions: sum b * bucket[b - 1] as a running sum from the top bucket
+   down, both sums affine. */
+static int msm_sum_hinted(int digits, int buckets, int c, const mont_ctx *f)
+{
+    jpoint acc, tj;
+    acc.z = (u256d){{0}};
+    for (int j = digits - 1; j >= 0; j--)
+    {
+        if (!is_zero(&acc.z))
+            for (int k = 0; k < c; k++)
+                jdouble0(&acc, &acc, f);
+        apoint running, total;
+        int has_running = 0, has_total = 0;
+        for (int b = buckets - 1; b >= 0; b--)
+        {
+            const apoint *q = &MsmBucket[j * buckets + b];
+            if (MsmFilled[j * buckets + b])
+            {
+                if (!has_running)
+                {
+                    u256_op(&running.x, &q->x, U256_MEMCOPY);
+                    u256_op(&running.y, &q->y, U256_MEMCOPY);
+                    has_running = 1;
+                }
+                else
+                    has_running = affine_add_hinted(&running, &q->x, &q->y, f);
+            }
+            if (!has_running)
+                continue;
+            if (!has_total)
+            {
+                u256_op(&total.x, &running.x, U256_MEMCOPY);
+                u256_op(&total.y, &running.y, U256_MEMCOPY);
+                has_total = 1;
+            }
+            else
+                has_total = affine_add_hinted(&total, &running.x, &running.y, f);
+        }
+        if (has_total)
+        {
+            tj.x = total.x;
+            tj.y = total.y;
+            tj.z = f->one;
+            jadd_jacobian(&acc, &tj, f);
+        }
+    }
+    return is_zero(&acc.z);
+}
+
+/*
+ * k1 P + k2 phi(P) on y^2 = x^3 + b over the field of f, where phi(x, y) = (beta x, y): Straus over the two
+ * width-5 NAFs, least significant digit first, on affine points with every slope from the hint tape. P is
+ * (px, py) in Montgomery form, of odd prime order, already negated for a negative k1; neg2 says phi's multiples
+ * are to be negated. 1 with the sum in (rx, ry), 0 when it is the point at infinity, -1 if P is no such point.
+ */
+int ec_hinted_glv_mul(u256d *rx, u256d *ry, const u256d *px, const u256d *py, const u256d *beta, const int8_t *naf1,
+                      int len1, const int8_t *naf2, int len2, int neg2, const mont_ctx *f)
+{
+    enum
+    {
+        Multiples = 8 /* p, 3p, .. 15p */
+    };
+    apoint table[2][Multiples], two, acc;
+    u256d zero = {{0}}, ny;
+    table[0][0].x = *px;
+    table[0][0].y = *py;
+    two = table[0][0];
+    affine_double_hinted(&two, f);
+    for (int i = 1; i < Multiples; i++)
+    {
+        table[0][i] = table[0][i - 1];
+        if (!affine_add_hinted(&table[0][i], &two.x, &two.y, f))
+            return -1;
+    }
+    for (int i = 0; i < Multiples; i++)
+    {
+        MUL(&table[1][i].x, &table[0][i].x, beta);
+        table[1][i].y = table[0][i].y;
+        if (neg2)
+            SUB(&table[1][i].y, &zero, &table[0][i].y);
+    }
+    const int8_t *naf[2] = {naf1, naf2};
+    int len[2] = {len1, len2}, infinity = 1;
+    for (int i = (len1 > len2 ? len1 : len2) - 1; i >= 0; i--)
+    {
+        if (!infinity)
+            affine_double_hinted(&acc, f);
+        for (int h = 0; h < 2; h++)
+        {
+            int dg = i < len[h] ? naf[h][i] : 0;
+            if (!dg)
+                continue;
+            const apoint *q = &table[h][(dg < 0 ? -dg : dg) >> 1];
+            const u256d *qy = &q->y;
+            if (dg < 0)
+            {
+                SUB(&ny, &zero, &q->y);
+                qy = &ny;
+            }
+            if (infinity)
+            {
+                acc.x = q->x;
+                acc.y = *qy;
+                infinity = 0;
+            }
+            else if (!affine_add_hinted(&acc, &q->x, qy, f))
+            {
+                infinity = 1;
+            }
+        }
+    }
+    if (infinity)
+        return 0;
+    *rx = acc.x;
+    *ry = acc.y;
+    return 1;
+}
 /* Whether the sum of MsmScalar[i] MsmBase[i] over the first `terms` is the point at infinity. */
 static int msm_is_infinity(uint32_t terms, const curve *cv)
 {
     const mont_ctx *f = &cv->p;
     u256d zero = {{0}};
     int c = terms < 32 ? 4 : terms < 128 ? 5 : terms < 512 ? 6 : 7;
+    if (FieldHints.active)
+    {
+        /* A hinted addition costs the same in a bucket and in the sums, so the window is the one with the fewest:
+           one per term and digit, two per bucket and digit. */
+        uint32_t best = ~0u;
+        for (int w = MsmMinWindow; w <= MsmMaxWindow; w++)
+        {
+            uint32_t d = (uint32_t)((129 + w - 1) / w + 1), cost = d * (terms + (1u << w));
+            if (cost < best)
+            {
+                best = cost;
+                c = w;
+            }
+        }
+    }
     int digits = (129 + c - 1) / c + 1;
     int buckets = 1 << (c - 1);
 
@@ -1282,8 +1555,13 @@ static int msm_is_infinity(uint32_t terms, const curve *cv)
         {
             int32_t v = (int32_t)(window_bits(&MsmScalar[i], j * c, c) + carry);
             carry = v > buckets;
-            MsmDigits[j][i] = (int8_t)(carry ? v - (1 << c) : v);
+            MsmDigits[j][i] = (int16_t)(carry ? v - (1 << c) : v);
         }
+    }
+    if (FieldHints.active)
+    {
+        msm_fill_hinted(terms, digits, buckets, f);
+        return msm_sum_hinted(digits, buckets, c, f);
     }
     msm_fill(terms, digits, buckets, f);
 
@@ -1440,9 +1718,10 @@ static int verify_chunk(const uint8_t *msgs, const uint8_t *sigs, const uint8_t 
 int airbender_secp256k1_verify_batch(const uint8_t *msgs, const uint8_t *sigs, const uint8_t *recids,
                                      const uint8_t *keys, const uint8_t *rys, const uint8_t *weights, uint32_t count)
 {
-    for (uint32_t done = 0; done < count; done += VerifyBatch)
+    uint32_t batch = FieldHints.active ? VerifyBatch : VerifyBatchUnhinted;
+    for (uint32_t done = 0; done < count; done += batch)
     {
-        uint32_t now = count - done < VerifyBatch ? count - done : VerifyBatch;
+        uint32_t now = count - done < batch ? count - done : batch;
         if (!verify_chunk(msgs + 32 * done, sigs + 64 * done, recids + done, keys + 64 * done, rys + 32 * done,
                           weights + 16 * done, now))
             return 0;

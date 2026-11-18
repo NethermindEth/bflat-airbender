@@ -812,8 +812,123 @@ PT_OP void pt_dbl_in(point *r, const point *p, int d, uint32_t n)
     pt_fsub(&r->y, &r->y, &t, d, n);
 }
 
+/*
+ * Affine points with the slope of each chord or tangent from the hint tape: the slope is checked by one product
+ * against the two coordinates' differences, so an addition takes three products and a doubling four, with no
+ * inversion, where the Jacobian formulas take sixteen and seven. Points loaded affine stay affine through pt_add and
+ * pt_dbl, so every scalar multiplication over them runs this way while the input has a tape.
+ */
+static bool pw_take(fp *r);
+
+/* The tape's next field element, checked to be reduced. */
+PT_OP bool pt_hint(fp *r, uint32_t n)
+{
+    if (n != 8)
+        return pw_take(r);
+    if (FieldHints.next == FieldHints.end)
+        return false;
+    u256_op(digit(r, 0), FieldHints.next++, U256_MEMCOPY);
+    return limbs_cmp(r->l, C->p.l, 8) < 0;
+}
+
+/* num / den for den != 0: the tape's value where its product with den is num, computed otherwise. */
+PT_OP void pt_slope(fp2 *lam, const fp2 *num, const fp2 *den, int d, uint32_t n)
+{
+    bool ok = true;
+    for (int j = 0; j < d; j++)
+        ok &= pt_hint(&lam->c[j], n);
+    if (ok)
+    {
+        fp2 t;
+        pt_fmul(&t, lam, den, d, n);
+        ok = pt_feq(&t, num, d, n);
+    }
+    if (!ok)
+    {
+        fp2 inv;
+        fq_inv(&inv, den, d);
+        pt_fmul(lam, num, &inv, d, n);
+        for (int j = 0; j < d; j++)
+            for (uint32_t k = 0; k < (C->n + 7) / 8; k++)
+                field_hint_emit(digit(&lam->c[j], (int)k));
+    }
+}
+
+PT_OP void pt_fcopy(fp2 *r, const fp2 *a, int d, uint32_t n)
+{
+    for (int j = 0; j < d; j++)
+        fp_copy(&r->c[j], &a->c[j], n ? n : C->n);
+}
+
+/* r = (x3, lam (x1 - x3) - y1) for x3 = lam^2 - x1 - x2, affine; r may be p. */
+PT_OP void pt_chord(point *r, const point *p, const fp2 *x2, const fp2 *lam, int d, uint32_t n)
+{
+    fp2 x3, t;
+    pt_fmul(&x3, lam, lam, d, n);
+    pt_fsub(&x3, &x3, &p->x, d, n);
+    pt_fsub(&x3, &x3, x2, d, n);
+    pt_fsub(&t, &p->x, &x3, d, n);
+    pt_fmul(&t, &t, lam, d, n);
+    pt_fsub(&r->y, &t, &p->y, d, n);
+    pt_fcopy(&r->x, &x3, d, n);
+    if (r != p)
+        r->z = p->z;
+}
+
+PT_OP void pt_dbl_affine_in(point *r, const point *p, int d, uint32_t n)
+{
+    if (pt_fzero(&p->y, d, n))
+    {
+        pt_set_inf(r);
+        return;
+    }
+    fp2 num, den, lam, t;
+    pt_fmul(&t, &p->x, &p->x, d, n);
+    pt_fadd(&num, &t, &t, d, n);
+    pt_fadd(&num, &num, &t, d, n);
+    pt_fadd(&den, &p->y, &p->y, d, n);
+    pt_slope(&lam, &num, &den, d, n);
+    pt_chord(r, p, &p->x, &lam, d, n);
+}
+
+PT_OP void pt_add_affine_in(point *r, const point *p, const point *q, int d, uint32_t n)
+{
+    fp2 num, den, lam;
+    pt_fsub(&den, &q->x, &p->x, d, n);
+    if (pt_fzero(&den, d, n))
+    {
+        if (pt_feq(&p->y, &q->y, d, n))
+            pt_dbl_affine_in(r, p, d, n);
+        else
+            pt_set_inf(r);
+        return;
+    }
+    pt_fsub(&num, &q->y, &p->y, d, n);
+    pt_slope(&lam, &num, &den, d, n);
+    fp2 x2;
+    pt_fcopy(&x2, &q->x, d, n);
+    pt_chord(r, p, &x2, &lam, d, n);
+}
+
+/* The doubling of an affine point where the input has a hint tape; false leaves it to the Jacobian formulas. */
+NOINLINE static bool pt_dbl_hinted(point *r, const point *p, int d)
+{
+    uint32_t n = C->n == 8 ? 8 : 0;
+    if (!pt_fone(&p->z, d, n))
+        return false;
+    if (n != 8)
+        pt_dbl_affine_in(r, p, d, 0);
+    else if (d == 1)
+        pt_dbl_affine_in(r, p, 1, 8);
+    else
+        pt_dbl_affine_in(r, p, 2, 8);
+    return true;
+}
+
 NOINLINE void pt_dbl(point *r, const point *p, int d)
 {
+    if (FieldHints.active && pt_dbl_hinted(r, p, d))
+        return;
     if (C->n != 8)
         pt_dbl_in(r, p, d, 0);
     else if (d == 1)
@@ -891,8 +1006,24 @@ PT_OP void pt_add_in(point *r, const point *p, const point *q, int d, uint32_t n
     r->z = z3;
 }
 
+NOINLINE static bool pt_add_hinted(point *r, const point *p, const point *q, int d)
+{
+    uint32_t n = C->n == 8 ? 8 : 0;
+    if (!pt_fone(&p->z, d, n) || !pt_fone(&q->z, d, n))
+        return false;
+    if (n != 8)
+        pt_add_affine_in(r, p, q, d, 0);
+    else if (d == 1)
+        pt_add_affine_in(r, p, q, 1, 8);
+    else
+        pt_add_affine_in(r, p, q, 2, 8);
+    return true;
+}
+
 NOINLINE void pt_add(point *r, const point *p, const point *q, int d)
 {
+    if (FieldHints.active && pt_add_hinted(r, p, q, d))
+        return;
     if (C->n != 8)
         pt_add_in(r, p, q, d, 0);
     else if (d == 1)
@@ -1536,6 +1667,66 @@ NOINLINE static void fp12_pow_x(fp12 *r, const fp12 *a)
 
 /* ---- pairing -------------------------------------------------------------------------------- */
 
+/*
+ * The lines of a G2 point depend on it alone: the loop's doublings and additions of it, with the coefficients of
+ * each tangent and chord, are the same for whatever G1 point they are evaluated at. Verifiers pair against the
+ * same few G2 points call after call (a verifying key's; the generator and tau of the KZG setup), so the
+ * coefficients of the last points are kept, and a pair whose G2 point is among them takes its lines from there:
+ * two products by the G1 point's coordinates a line, where a doubling takes some twenty.
+ */
+enum
+{
+    LineCachePoints = 8,
+    LineCacheLines = 8 * 9 + 8 * 9 + 2
+};
+typedef struct
+{
+    fp2 cy, cx, c0;
+} line_coef;
+static struct
+{
+    const curve *of; /* 0 until its lines are whole */
+    fp2 x, y;
+    line_coef lines[LineCacheLines];
+} LineCache[LineCachePoints];
+static uint32_t LineCacheNext;
+/* The lines of the points the KZG point evaluation pairs against (kzg_lines.c): a count of points and of lines,
+   then each point's x and y and its lines, twelve limbs a field element. */
+extern const uint32_t KzgLineSeed[];
+/* Fills place `slot` with the lines of q if they are in the table. */
+static int line_cache_seed(int slot, const point *q)
+{
+    const uint32_t *w = KzgLineSeed;
+    uint32_t points = w[0], lines = w[1];
+    w += 2;
+    for (uint32_t i = 0; i < points; i++, w += 48 + 72 * lines)
+    {
+        const fp *xy[4] = {&q->x.c[0], &q->x.c[1], &q->y.c[0], &q->y.c[1]};
+        uint32_t differs = 0;
+        for (int k = 0; k < 4; k++)
+            for (int l = 0; l < 12; l++)
+                differs |= xy[k]->l[l] ^ w[12 * k + l];
+        if (differs)
+            continue;
+        const uint32_t *from = w + 48;
+        fp *to = &LineCache[slot].lines[0].cy.c[0];
+        for (uint32_t k = 0; k < 6 * lines; k++, from += 12)
+        {
+            for (int l = 0; l < 12; l++)
+                to[k].l[l] = from[l];
+            for (int l = 12; l < FpMaxLimbs; l++)
+                to[k].l[l] = 0;
+        }
+        LineCache[slot].x = q->x;
+        LineCache[slot].y = q->y;
+        LineCache[slot].of = C;
+        return 1;
+    }
+    return 0;
+}
+/* Where miller_dbl and miller_add leave the coefficients of the line they make, when it is set. */
+static line_coef *LineOut;
+
 /* Evaluates the line with coefficients cy, cx and c0 at the G1 point p. */
 TOWER void line_eval_n(line *l, const fp2 *cy, const fp2 *cx, const fp2 *c0, const point *p, uint32_t n)
 {
@@ -1592,6 +1783,12 @@ TOWER void miller_dbl_n(line *l, point *t, const point *p, uint32_t n)
     fq_neg(&h, &h, 2);
     fp2_add_n(&s, &j, &j, n);
     fp2_add_n(&s, &s, &j, n);
+    if (LineOut)
+    {
+        LineOut->cy = h;
+        LineOut->cx = s;
+        LineOut->c0 = i;
+    }
     line_eval_n(l, &h, &s, &i, p, n);
 }
 BY_LIMBS(miller_dbl, (line *l, point *t, const point *p), l, t, p)
@@ -1630,10 +1827,173 @@ TOWER void miller_add_n(fp12 *f, point *t, const point *q, const point *p, uint3
     fp2_mul_n(&g, &el, &q->y, n);
     fp2_sub_n(&s, &s, &g, n);
     fq_neg(&o, &o, 2);
+    if (LineOut)
+    {
+        LineOut->cy = el;
+        LineOut->cx = o;
+        LineOut->c0 = s;
+    }
     line_eval_n(&l, &el, &o, &s, p, n);
     fp12_mul_line(f, &l);
 }
 BY_LIMBS(miller_add, (fp12 *f, point *t, const point *q, const point *p), f, t, q, p)
+/* f *= the kept line k evaluated at p. */
+TOWER void line_apply_n(fp12 *f, const line_coef *k, const point *p, uint32_t n)
+{
+    line l;
+    line_eval_n(&l, &k->cy, &k->cx, &k->c0, p, n);
+    fp12_mul_line(f, &l);
+}
+BY_LIMBS(line_apply, (fp12 *f, const line_coef *k, const point *p), f, k, p)
+
+/*
+ * The residue witness of a pairing check (Eagen and Novakovic, "On Proving Pairings"). f^((p^12 - 1)/r) = 1 exactly
+ * when f w = c^lambda for some c and some w of Fp6, where lambda is a multiple of r: 6x + 2 + p - p^2 + p^3 (BN254) or
+ * |x| + p (BLS12-381). As (p^6 - 1) divides (p^12 - 1)/r, any w of Fp6 passes the exponentiation as 1, so the equation
+ * gives f^((p^12 - 1)/r) = c^(lambda (p^12 - 1)/r) = 1. The hint tape gives c, 1/c and w; c^-(6x + 2) or c^-|x| folds
+ * into the Miller loop as one product a digit, and the Frobenius powers close the check, in place of the final
+ * exponentiation. A hint that does not hold only costs the plain check, which then runs from the start.
+ */
+enum
+{
+    PwFresh = 0, /* no batch yet */
+    PwPlain,     /* the plain check */
+    PwRecord,    /* the plain check, with f given out for a witness to be made of */
+    PwMerging,   /* a witness is loaded and goes into the next loop */
+    PwMerged,    /* the loop took c in */
+    PwFailed     /* the witness did not hold */
+};
+static struct
+{
+    int state;
+    fp12 c, cinv, w;
+} Pw;
+
+enum
+{
+    PwMarkStart = 0, /* + 1 for BLS12-381 */
+    PwMarkNone = 4,
+    PwMarkValue = 8 /* + 1 for BLS12-381 */
+};
+
+static bool fp12_is_one(const fp12 *a);
+NOINLINE static void fp12_frob(fp12 *r, const fp12 *a);
+
+/* A tape value no field element equals: all ones but the low four bits, which carry the tag. */
+static void pw_mark(uint32_t tag)
+{
+    u256d m;
+    for (int i = 0; i < 8; i++)
+        m.w[i] = 0xffffffffu;
+    m.w[0] = 0xfffffff0u | tag;
+    field_hint_emit(&m);
+}
+
+static bool pw_is_mark(const u256d *e, uint32_t tag)
+{
+    for (int i = 1; i < 8; i++)
+        if (e->w[i] != 0xffffffffu)
+            return false;
+    return e->w[0] == (0xfffffff0u | tag);
+}
+
+/* The tape's next field element, of one digit (BN254) or two; false where the tape ends or the value is not reduced. */
+static bool pw_take(fp *r)
+{
+    uint32_t n = C->n;
+    memset(r, 0, sizeof(*r));
+    for (uint32_t i = 0; i < (n + 7) / 8; i++)
+    {
+        if (FieldHints.next == FieldHints.end)
+            return false;
+        memcpy(&r->l[8 * i], FieldHints.next++, 32);
+    }
+    for (uint32_t i = n; i < FpMaxLimbs; i++)
+        if (r->l[i])
+            return false;
+    return limbs_cmp(r->l, C->p.l, n) < 0;
+}
+
+NOINLINE static void pw_open(void)
+{
+    Pw.state = PwPlain;
+    if (!FieldHints.active)
+        return;
+    if (FieldHints.next == FieldHints.end)
+    {
+        Pw.state = PwRecord;
+        pw_mark(PwMarkStart + (C->n == 8 ? 0 : 1));
+        return;
+    }
+    if (pw_is_mark(FieldHints.next, PwMarkNone))
+    {
+        FieldHints.next++;
+        return;
+    }
+    bool ok = true;
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 2; j++)
+            ok &= pw_take(&Pw.c.c[i].c[j]);
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 2; j++)
+            ok &= pw_take(&Pw.cinv.c[i].c[j]);
+    memset(&Pw.w, 0, sizeof(Pw.w));
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 2; j++)
+            ok &= pw_take(&Pw.w.c[i].c[j]);
+    if (!ok)
+        return;
+    fp12 t;
+    fp12_mul(&t, &Pw.c, &Pw.cinv);
+    if (fp12_is_one(&t))
+        Pw.state = PwMerging;
+}
+
+void pairing_begin(void)
+{
+    Pw.state = PwFresh;
+}
+
+bool pairing_retry(void)
+{
+    if (Pw.state != PwFailed)
+    {
+        Pw.state = PwFresh;
+        return false;
+    }
+    Pw.state = PwPlain;
+    return true;
+}
+
+/* f times the Frobenius powers of c that close the witness's equation, and w: 1 where the witness holds. */
+NOINLINE static bool pw_close(fp12 *f)
+{
+    fp12 t;
+    fp12_frob(&t, &Pw.cinv);
+    fp12_mul(f, f, &t);
+    if (!C->mtwist)
+    {
+        fp12_frob(&t, &Pw.c);
+        fp12_frob(&t, &t);
+        fp12_mul(f, f, &t);
+        fp12_frob(&t, &Pw.cinv);
+        fp12_frob(&t, &t);
+        fp12_frob(&t, &t);
+        fp12_mul(f, f, &t);
+    }
+    fp12_mul(f, f, &Pw.w);
+    return fp12_is_one(f);
+}
+
+/* Gives f out, for the witness of this check to be made of. */
+NOINLINE static void pw_record(const fp12 *f)
+{
+    pw_mark(PwMarkValue + (C->n == 8 ? 0 : 1));
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 2; j++)
+            for (uint32_t k = 0; k < (C->n + 7) / 8; k++)
+                field_hint_emit(digit(&f->c[i].c[j], (int)k));
+}
 
 /*
  * Multiplies f by the Miller functions of the optimal ate pairing of each pair g1[i] (G1) and
@@ -1661,36 +2021,111 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
     }
     if (k == 0)
         return;
+    /* The kept lines of each pair's G2 point, or a place to keep them in. */
+    const line_coef *kept[PairingBatch];
+    line_coef *keep[PairingBatch];
+    int slot[PairingBatch], at[PairingBatch];
+    for (int j = 0; j < k; j++)
+    {
+        kept[j] = 0;
+        at[j] = 0;
+        for (int e = 0; e < LineCachePoints; e++)
+        {
+            if (LineCache[e].of == C && fq_eq(&LineCache[e].x, &qa[j].x, 2) && fq_eq(&LineCache[e].y, &qa[j].y, 2))
+            {
+                kept[j] = LineCache[e].lines;
+                break;
+            }
+        }
+        if (!kept[j])
+        {
+            slot[j] = (int)(LineCacheNext++ % LineCachePoints);
+            LineCache[slot[j]].of = 0;
+            keep[j] = LineCache[slot[j]].lines;
+            /* A point given twice in one batch would take one place twice over. */
+            for (int e = 0; e < j; e++)
+                if (!kept[e] && slot[e] == slot[j])
+                    keep[j] = 0;
+            if (C->mtwist && keep[j] && line_cache_seed(slot[j], &qa[j]))
+                kept[j] = LineCache[slot[j]].lines;
+        }
+    }
+    if (Pw.state == PwFresh)
+        pw_open();
+    bool merge = Pw.state == PwMerging;
     fp12 acc;
     line l;
-    fp12_one(&acc);
+    /* With a witness the loop starts from 1/c and takes 1/c or c in at every digit: c^-loop in all. */
+    if (merge)
+        acc = Pw.cinv;
+    else
+        fp12_one(&acc);
     /* A digit -1 adds -q: the Miller function for -1 is a vertical line, which the final exponentiation removes. */
     int8_t dg[8 * sizeof(C->loop) + 1];
     int top = scalar_digits(dg, C->loop, sizeof(C->loop)) - 1;
     for (int i = top - 1; i >= 0; i--)
     {
         /* The first square is of 1. */
-        if (i != top - 1)
+        if (merge || i != top - 1)
             fp12_mul(&acc, &acc, &acc);
         for (int j = 0; j < k; j++)
         {
+            if (kept[j])
+            {
+                line_apply(&acc, &kept[j][at[j]++], &pa[j]);
+                continue;
+            }
+            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
             miller_dbl(&l, &t[j], &pa[j]);
             fp12_mul_line(&acc, &l);
         }
         if (dg[i])
+        {
             for (int j = 0; j < k; j++)
+            {
+                if (kept[j])
+                {
+                    line_apply(&acc, &kept[j][at[j]++], &pa[j]);
+                    continue;
+                }
+                LineOut = keep[j] ? &keep[j][at[j]++] : 0;
                 miller_add(&acc, &t[j], dg[i] > 0 ? &qa[j] : &qn[j], &pa[j]);
+            }
+            if (merge)
+                fp12_mul(&acc, &acc, dg[i] > 0 ? &Pw.cinv : &Pw.c);
+        }
     }
+    if (merge)
+        Pw.state = PwMerged;
     if (!C->mtwist)
     {
         for (int j = 0; j < k; j++)
         {
+            if (kept[j])
+            {
+                line_apply(&acc, &kept[j][at[j]++], &pa[j]);
+                line_apply(&acc, &kept[j][at[j]++], &pa[j]);
+                continue;
+            }
             point q1, q2;
             pt_frob(&q1, &qa[j], false);
             pt_frob(&q2, &q1, false);
             pt_neg(&q2, &q2, 2);
+            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
             miller_add(&acc, &t[j], &q1, &pa[j]);
+            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
             miller_add(&acc, &t[j], &q2, &pa[j]);
+        }
+    }
+    LineOut = 0;
+    /* The lines are whole: the places taken now hold their points. */
+    for (int j = 0; j < k; j++)
+    {
+        if (!kept[j] && keep[j])
+        {
+            LineCache[slot[j]].x = qa[j].x;
+            LineCache[slot[j]].y = qa[j].y;
+            LineCache[slot[j]].of = C;
         }
     }
     fp12_mul(f, f, &acc);
@@ -1773,6 +2208,15 @@ static bool fp12_is_one(const fp12 *a)
 bool pairing_is_one(fp12 *f)
 {
     fp12 t;
+    if (Pw.state == PwMerged)
+    {
+        if (pw_close(f))
+            return true;
+        Pw.state = PwFailed;
+        return false;
+    }
+    if (Pw.state == PwRecord)
+        pw_record(f);
     /* Easy part, f^((p^6 - 1)(p^2 + 1)), which lands f in the cyclotomic subgroup. */
     fp12_inv(&t, f);
     fp12_conj(f, f);

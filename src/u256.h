@@ -44,4 +44,29 @@ static inline uint32_t u256_op(u256d *a, const u256d *b, uint32_t op)
 uint32_t u256_op(u256d *a, const u256d *b, uint32_t op);
 #endif
 
+/* The bytes of x reversed: Zbb's rev8, which Airbender's machines decode on their own, without the rest of Zbb.
+ * One instruction where the shifts and masks are eight or more. */
+static inline __attribute__((always_inline)) uint32_t rev8(uint32_t x)
+{
+#ifdef AIRBENDER
+    uint32_t r;
+    __asm__(".insn i 0x13, 5, %0, %1, 0x698" : "=r"(r) : "r"(x));
+    return r;
+#else
+    return __builtin_bswap32(x);
+#endif
+}
+
+/* The field hint tape: values the prover gives and the code checks, one after another, such as the slope of an
+ * affine addition, checked by one product where computing it takes an inversion. `active` says the input has a tape
+ * section at all; an exhausted or wrong tape only costs the computation. */
+typedef struct
+{
+    const u256d *next, *end;
+    uint32_t active;
+} field_hints;
+extern field_hints FieldHints;
+/* Called with each value that was computed for want of a hint, in tape order: the point a tape is recorded at. */
+void field_hint_emit(const u256d *v);
+
 #endif
