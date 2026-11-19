@@ -26,6 +26,10 @@
  *   MPT_UNALIGNED_WORDS where a word may be read as the aligned words that cover it.
  */
 
+/* Its own, though the platform file has them: read alone, as a code scanner reads it, the file knows its types. */
+#include <stddef.h>
+#include <stdint.h>
+
 enum
 {
     MptOk = 0,

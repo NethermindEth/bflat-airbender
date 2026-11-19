@@ -562,7 +562,7 @@ enum
 static struct
 {
     uint8_t *node_hashes;
-    uint64_t *node_states;
+    uint32_t *node_states; /* in 32-bit words, as the sponge is run */
     const uint8_t *first_node, *last_node;
     const uint8_t **node_data;
     uint32_t node_count;
@@ -776,7 +776,7 @@ static uint32_t read_list(uint32_t *words, uint32_t i, uint32_t end, uint32_t pa
     if (nodes)
     {
         Prehashed.node_hashes = (uint8_t *)hashes;
-        Prehashed.node_states = (uint64_t *)states;
+        Prehashed.node_states = states;
         Prehashed.first_node = first;
         Prehashed.last_node = last;
         Prehashed.node_data = data;
@@ -798,7 +798,7 @@ int airbender_prehashed_nodes(const uint8_t *first, const uint8_t *last, uint32_
     if (count == 0 || count != Prehashed.node_count || first != Prehashed.first_node || last != Prehashed.last_node)
         return 0;
     *hashes = Prehashed.node_hashes;
-    *states = Prehashed.node_states;
+    *states = (uint64_t *)Prehashed.node_states;
     return 1;
 }
 /* ---- The tries over the nodes read_input hashed: see mpt.c ------------------------------------------ */
@@ -838,7 +838,7 @@ static void mpt_hash_edited(uint32_t k, int block, const uint8_t *original, cons
     }
     else
     {
-        const uint32_t *st = (const uint32_t *)Prehashed.node_states
+        const uint32_t *st = Prehashed.node_states
             + (size_t)k * (RetainedStates * RetainedStateWords) + (size_t)(block - 1) * RetainedStateWords;
         copy_capacity(s, st);
         if (block == RetainedStates)
