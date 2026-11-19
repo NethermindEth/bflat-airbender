@@ -1073,36 +1073,41 @@ static mref mpt_set(mref root, const uint8_t *val, uint32_t vlen)
             continue;
         }
         uint32_t i = s->child;
-        n->child[i] = c;
-        n->mask |= 1u << i;
-        n->dmask |= 1u << i;
-        n->dirty = 1;
-        n->changed = 1;
-        if ((c.t & 3) != TEmpty)
+        int only = -1;
+        mnode *o = 0;
+        if ((c.t & 3) == TEmpty)
         {
-            c = mpt_ref_node(n);
-            continue;
-        }
-        /* A child went: with one left, the branch folds into it. */
-        mref all[16];
-        mpt_children(n, all);
-        int only = -1, count = 0;
-        for (int j = 0; j < 16; j++)
-        {
-            if ((all[j].t & 3) != TEmpty)
+            mref all[16];
+            mpt_children(n, all);
+            for (int j = 0; j < 16; j++)
             {
+                if ((uint32_t)j == i || (all[j].t & 3) == TEmpty)
+                    continue;
+                if (only >= 0)
+                {
+                    only = -1;
+                    break;
+                }
                 only = j;
-                count++;
+            }
+            if (only >= 0)
+            {
+                /* Resolving the survivor can fail. The original branch must still be intact then. */
+                o = mpt_node(all[only], (uint32_t)s->depth + 1);
+                if (!o)
+                    return root;
             }
         }
-        if (count != 1)
+        if (!o)
         {
+            n->child[i] = c;
+            n->mask |= 1u << i;
+            n->dmask |= 1u << i;
+            n->dirty = 1;
+            n->changed = 1;
             c = mpt_ref_node(n);
             continue;
         }
-        mnode *o = mpt_node(all[only], (uint32_t)s->depth + 1);
-        if (!o)
-            return root;
         uint8_t front = (uint8_t)(only << 4);
         if (o->kind == KBranch)
         {
@@ -1298,7 +1303,7 @@ static uint32_t mpt_encode(const mnode *n, uint8_t *start)
 
 /* The digest of a branch built from an encoding, whose `changed` children were hashes there and are hashes still
    and whose `emptied` ones were empty there: the encoding with the new hashes over the old. 0 if n is not so. */
-static int mpt_finish_spliced(mnode *n, uint32_t changed, uint32_t emptied, uint32_t *out)
+static int mpt_finish_spliced(mnode *n, uint32_t changed, uint32_t emptied)
 {
     const uint8_t *src = n->src;
     uint8_t *to = (uint8_t *)MptRoom + 64 + ((uintptr_t)src & 31);
@@ -1314,7 +1319,9 @@ static int mpt_finish_spliced(mnode *n, uint32_t changed, uint32_t emptied, uint
             uint32_t i = (uint32_t)__builtin_ctz(m);
             mpt_store32(to + 4 + 33 * i, ((const mnode *)n->child[i].p)->hash);
         }
+        uint32_t *out = mpt_alloc(32);
         mpt_hash_edited(n->widx, block, src, to, out);
+        n->hash = out;
         n->elen = MptFullBranch;
         return 1;
     }
@@ -1343,7 +1350,9 @@ static int mpt_finish_spliced(mnode *n, uint32_t changed, uint32_t emptied, uint
         if (m & 1)
             mpt_store32(to + offset[i], ((const mnode *)n->child[i].p)->hash);
     }
+    uint32_t *out = mpt_alloc(32);
     mpt_keccak(to, len, out);
+    n->hash = out;
     n->elen = len;
     return 1;
 }
@@ -1392,30 +1401,28 @@ static void mpt_finish(mnode *n, int is_root)
                 return;
         }
     }
-    uint32_t *h = mpt_alloc(32);
-    if (changed && !unhashed && n->src && n->hashed && mpt_finish_spliced(n, changed, emptied, h))
+    if (changed && !unhashed && n->src && n->hashed && mpt_finish_spliced(n, changed, emptied))
     {
+        n->dirty = 0;
+        return;
+    }
+    uint8_t *start = (uint8_t *)MptRoom + 64;
+    uint32_t len = mpt_encode(n, start);
+    if (MptErr)
+        return;
+    if (len >= 32 || is_root)
+    {
+        uint32_t *h = mpt_alloc(32);
+        mpt_keccak(start, len, h);
         n->hash = h;
+        n->hashed = 1;
     }
     else
     {
-        uint8_t *start = (uint8_t *)MptRoom + 64;
-        uint32_t len = mpt_encode(n, start);
-        if (MptErr)
-            return;
-        if (len >= 32 || is_root)
-        {
-            mpt_keccak(start, len, h);
-            n->hash = h;
-            n->hashed = 1;
-        }
-        else
-        {
-            n->eraw = mpt_keep(start, len);
-            n->hashed = 0;
-        }
-        n->elen = len;
+        n->eraw = mpt_keep(start, len);
+        n->hashed = 0;
     }
+    n->elen = len;
     n->dirty = 0;
 }
 
@@ -1522,9 +1529,8 @@ static inline uint32_t mpt_bswap(uint32_t x)
 #endif
 }
 
-static const uint8_t *mpt_account_key(const uint8_t *address)
+static inline void mpt_load_address(uint32_t pre[8], const uint8_t *address)
 {
-    uint32_t pre[8];
     if (((uintptr_t)address & 3) == 0)
     {
         const uint32_t *w = (const uint32_t *)address;
@@ -1537,6 +1543,12 @@ static const uint8_t *mpt_account_key(const uint8_t *address)
         memcpy(pre, address, 20);
     }
     pre[5] = pre[6] = pre[7] = 0;
+}
+
+static const uint8_t *mpt_account_key(const uint8_t *address)
+{
+    uint32_t pre[8];
+    mpt_load_address(pre, address);
     return mpt_key(pre, 20);
 }
 
@@ -1615,7 +1627,7 @@ static inline int mpt_take_number(const uint8_t **at, const uint8_t *end, uint32
         return 1;
     }
     count = v - 0x80;
-    if (count > max || p + 1 + count > end)
+    if (count > max || count > (size_t)(end - p - 1) || (count == 1 && p[1] < 0x80))
         return 0;
     p++;
     for (uint32_t i = 0; i < count; i++)
@@ -1630,6 +1642,20 @@ static inline int mpt_take_number(const uint8_t **at, const uint8_t *end, uint32
 static const uint32_t MptEmptyCode[8] = {0x0146d2c5, 0x3c23f786, 0xb27d7e92, 0xc003c7dc,
                                          0x53b600e5, 0x3b2782ca, 0x04d8fa7b, 0x70a4855d};
 
+/* The two hash items of a four-field account, after decoding its nonce and balance into numbers. */
+static inline const uint8_t *mpt_account_hashes(const uint8_t *value, uint32_t len, uint32_t numbers[10])
+{
+    const uint8_t *at = value, *end = at + len;
+    if (len < 70 || at[0] != 0xf8 || (uint32_t)at[1] + 2 != len)
+        return 0;
+    at += 2;
+    if (!mpt_take_number(&at, end, numbers, 8) || !mpt_take_number(&at, end, numbers + 2, 32))
+        return 0;
+    if (end - at != 66 || at[0] != 0xa0 || at[33] != 0xa0)
+        return 0;
+    return at;
+}
+
 /* The account as fields: two words of nonce, eight of balance, the storage root, the code hash, then a word whose
    bit 0 says the storage is empty and bit 1 that the code is. 2, with its encoding at *value, when the encoding is
    not the four items an account has in the state trie. */
@@ -1639,13 +1665,8 @@ int airbender_mpt_get_account_fields(void *trie, const uint8_t *address, uint32_
     int e = mpt_get(trie, mpt_account_key(address), value, len);
     if (e)
         return e;
-    const uint8_t *at = *value, *end = at + *len;
-    if (*len < 70 || at[0] != 0xf8 || (uint32_t)at[1] + 2 != *len)
-        return 2;
-    at += 2;
-    if (!mpt_take_number(&at, end, out, 8) || !mpt_take_number(&at, end, out + 2, 32))
-        return 2;
-    if (end - at != 66 || at[0] != 0xa0 || at[33] != 0xa0)
+    const uint8_t *at = mpt_account_hashes(*value, *len, out);
+    if (!at)
         return 2;
     mpt_load32(out + 10, at + 1);
     mpt_load32(out + 18, at + 34);
@@ -1716,13 +1737,15 @@ void *airbender_mpt_open_storage(void *trie, const uint8_t *address, int *status
         return 0;
     if (e == MptAbsent)
         return mpt_open(MptEmptyRoot);
-    if (len < 70 || value[len - 66] != 0xa0 || value[len - 33] != 0xa0)
+    uint32_t numbers[10];
+    const uint8_t *at = mpt_account_hashes(value, len, numbers);
+    if (!at)
     {
         /* Not the encoding of an account in the state trie: for the caller to read. */
         *status = 2;
         return 0;
     }
-    mpt_load32(h, value + len - 65);
+    mpt_load32(h, at + 1);
     return mpt_open(h);
 }
 
@@ -1738,28 +1761,8 @@ int airbender_mpt_get_slot(void *trie, const uint32_t *index, uint32_t *value)
     if (e)
         return e == MptAbsent ? MptOk : e;
     /* The leaf holds the RLP of the value's big-endian bytes. */
-    if (len == 0)
-        return MptInvalid;
-    uint32_t count;
-    if (v[0] < 0x80)
-    {
-        if (len != 1)
-            return MptInvalid;
-        count = 1;
-    }
-    else
-    {
-        count = v[0] - 0x80u;
-        if (count > 32 || len != 1 + count)
-            return MptInvalid;
-        v++;
-    }
-    for (uint32_t i = 0; i < count; i++)
-    {
-        uint32_t at = count - 1 - i;
-        value[at >> 2] |= (uint32_t)v[i] << (8 * (at & 3));
-    }
-    return MptOk;
+    const uint8_t *end = v + len;
+    return mpt_take_number(&v, end, value, 32) && v == end ? MptOk : MptInvalid;
 }
 
 /* Sets the slot to the eight little-endian words at value, or removes it when they are zero. */

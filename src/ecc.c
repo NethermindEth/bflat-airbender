@@ -1117,6 +1117,7 @@ enum
     MsmTerms = 3 * VerifyBatch + 2,
     MsmMinWindow = 4,
     MsmMaxWindow = 10,
+    MsmUnhintedWindow = 7,
     /* Digits of a scalar below 2^129, one more for the last carry. */
     MsmMaxDigits = (129 + MsmMinWindow - 1) / MsmMinWindow + 1
 };
@@ -1130,13 +1131,14 @@ enum
 {
     MsmWindowsAtMax = (129 + MsmMaxWindow - 1) / MsmMaxWindow + 1,
     MsmMaxBuckets = MsmWindowsAtMax << (MsmMaxWindow - 1),
+    MsmUnhintedBuckets = ((129 + MsmUnhintedWindow - 1) / MsmUnhintedWindow + 1) << (MsmUnhintedWindow - 1),
     /* Additions that share an inversion: an inversion costs about 60 additions' savings. */
     MsmBatchSize = 256
 };
 static apoint MsmBucket[MsmMaxBuckets];
-static jpoint MsmSpill[MsmMaxBuckets];
+static jpoint MsmSpill[MsmUnhintedBuckets];
 static uint8_t MsmFilled[MsmMaxBuckets];
-static uint16_t MsmStamp[MsmMaxBuckets];
+static uint16_t MsmStamp[MsmUnhintedBuckets];
 static uint32_t MsmBatch[MsmBatchSize];
 static u256d MsmDen[MsmBatchSize], MsmPrefix[MsmBatchSize];
 static u256d VerifyS[VerifyBatch], VerifyPrefix[VerifyBatch];
@@ -1318,9 +1320,11 @@ static inline __attribute__((always_inline)) const u256d *slope(u256d *lambda, c
 /* Zero in RAM, for the delegation's comparisons. */
 static u256d HintZero;
 
-/* (x, y) = 2 (x, y) with the tangent's slope from the tape; secp256k1 has no point with y = 0. */
-static __attribute__((noinline)) void affine_double_hinted(apoint *p, const mont_ctx *f)
+/* Double in place. A vertical tangent gives infinity and leaves p untouched. */
+static __attribute__((noinline)) int affine_double_hinted(apoint *p, const mont_ctx *f)
 {
+    if (u256_op(&p->y, &HintZero, U256_EQ))
+        return 0;
     u256d num, den, lam, x3;
     MUL(&num, &p->x, &p->x);
     ADD(&den, &num, &num);
@@ -1335,6 +1339,7 @@ static __attribute__((noinline)) void affine_double_hinted(apoint *p, const mont
     SUB(&p->x, &p->x, &p->y);
     u256_op(&p->y, &p->x, U256_MEMCOPY);
     u256_op(&p->x, &x3, U256_MEMCOPY);
+    return 1;
 }
 
 /* a += (qx, qy) for affine points, the chord's slope from the tape: three products. Returns 0 where the sum is the
@@ -1349,8 +1354,7 @@ static inline __attribute__((always_inline)) int affine_add_hinted(apoint *a, co
         /* The same point, or its negative. */
         if (!equal(qy, &a->y))
             return 0;
-        affine_double_hinted(a, f);
-        return 1;
+        return affine_double_hinted(a, f);
     }
     SUB(&dy, qy, &a->y);
     const u256d *l = slope(&lam, &dy, &den, f);
@@ -1473,7 +1477,8 @@ int ec_hinted_glv_mul(u256d *rx, u256d *ry, const u256d *px, const u256d *py, co
     table[0][0].x = *px;
     table[0][0].y = *py;
     two = table[0][0];
-    affine_double_hinted(&two, f);
+    if (!affine_double_hinted(&two, f))
+        return -1;
     for (int i = 1; i < Multiples; i++)
     {
         table[0][i] = table[0][i - 1];
@@ -1492,7 +1497,7 @@ int ec_hinted_glv_mul(u256d *rx, u256d *ry, const u256d *px, const u256d *py, co
     for (int i = (len1 > len2 ? len1 : len2) - 1; i >= 0; i--)
     {
         if (!infinity)
-            affine_double_hinted(&acc, f);
+            infinity = !affine_double_hinted(&acc, f);
         for (int h = 0; h < 2; h++)
         {
             int dg = i < len[h] ? naf[h][i] : 0;
@@ -1528,7 +1533,7 @@ static int msm_is_infinity(uint32_t terms, const curve *cv)
 {
     const mont_ctx *f = &cv->p;
     u256d zero = {{0}};
-    int c = terms < 32 ? 4 : terms < 128 ? 5 : terms < 512 ? 6 : 7;
+    int c = terms < 32 ? 4 : terms < 128 ? 5 : terms < 512 ? 6 : MsmUnhintedWindow;
     if (FieldHints.active)
     {
         /* A hinted addition costs the same in a bucket and in the sums, so the window is the one with the fewest:

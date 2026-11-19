@@ -124,4 +124,38 @@ for addr, (nonce, bal, sr, ch, enc) in accounts.items():
     assert L.airbender_mpt_root(ctypes.c_void_p(s2), out) == 0 and out.raw == sr
 f = (ctypes.c_uint32 * 27)(); p = ctypes.c_void_p(); n = ctypes.c_uint32()
 assert L.airbender_mpt_get_account_fields(ctypes.c_void_p(t), bytes(20), f, ctypes.byref(p), ctypes.byref(n)) == 1
+# A deletion from a two-child branch needs the other leaf to fold its path.
+keys = [bytes([n]) + bytes(31) for n in (0x10, 0x20)]
+nodes = {}
+root = root_of({k: k for k in keys}, nodes)
+L.t_reset()
+for node in nodes.values():
+    if not node.endswith(keys[1]):
+        L.t_add_node(node, len(node))
+t = ctypes.c_void_p(L.airbender_mpt_open(root))
+assert get(t.value, keys[0]) == keys[0]
+assert L.airbender_mpt_set_raw(t, keys[0], b"", 0) == -1
+assert L.airbender_mpt_root(t, out) == 0 and out.raw == root
+assert get(t.value, keys[0]) == keys[0]
+
+addr = bytes(20)
+t = ctypes.c_void_p(L.airbender_mpt_open(EMPTY))
+hashes = [enc_str(EMPTY), enc_str(keccak(b""))]
+for fields in ([b"\x81\x01", b"\x80"], [b"\x80", b"\x81\x7f"], [b"\x80"] * 3):
+    account = enc_list(fields + hashes)
+    assert L.airbender_mpt_set_account(t, addr, account, len(account)) == 0
+    assert L.airbender_mpt_get_account_fields(t, addr, f, ctypes.byref(p), ctypes.byref(n)) == 2
+    status = ctypes.c_int()
+    assert not L.airbender_mpt_open_storage(t, addr, ctypes.byref(status)) and status.value == 2
+
+slot = (ctypes.c_uint32 * 8)(1)
+slot_key = keccak((1).to_bytes(32, "big"))
+value = (ctypes.c_uint32 * 8)()
+for number in (1, 127, 128, (1 << 256) - 1, 0):
+    words = (ctypes.c_uint32 * 8)(*[(number >> (32 * j)) & 0xffffffff for j in range(8)])
+    assert L.airbender_mpt_set_slot(t, slot, words) == 0
+    assert L.airbender_mpt_get_slot(t, slot, value) == 0 and list(value) == list(words)
+    assert get(t.value, slot_key) == (enc_str(number.to_bytes((number.bit_length() + 7) // 8, "big")) if number else None)
+assert L.airbender_mpt_set_raw(t, slot_key, b"\x81\x7f", 2) == 0
+assert L.airbender_mpt_get_slot(t, slot, value) == -2
 print("ok: rounds", rounds, "ops", ops, "edited fast path calls", L.t_edited_calls())

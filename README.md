@@ -46,9 +46,10 @@ guest):
   evaluation. The field arithmetic runs on Airbender's u256 delegation
   (CSR 0x7ca), Keccak on its Keccak-f delegation.
 
-- The Trusted input of the Nethermind guest, read once: `read_input` hashes
-  the witness nodes and the codes while it copies them
-  (`airbender_prehashed_nodes`, `airbender_prehashed_code`).
+- Guests opt in to witness prehashing by calling `airbender_read_prehashed_input`
+  with the same arguments as `read_input`. It hashes witness nodes and code
+  while reading the Trusted input and exposes their digests through
+  `airbender_prehashed_nodes` and `airbender_prehashed_code`.
 - A trie engine over those nodes (`src/mpt.c`, the `airbender_mpt_` calls):
   account and storage reads and writes, and the root. It builds each node
   once, checks the full branches the way the guest's

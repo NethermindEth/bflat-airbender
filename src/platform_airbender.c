@@ -19,12 +19,16 @@ __attribute__((noreturn)) void zkvm_platform_exit(long code);
 __attribute__((noreturn)) void airbender_finish_error(uint32_t code);
 void zkvm_platform_write(int fd, const char *buf, int len);
 
+#ifdef AIRBENDER
 static inline uint32_t csr_read(void)
 {
     uint32_t value;
     __asm__ volatile("csrrw %0, 0x7c0, x0" : "=r"(value));
     return value;
 }
+#else
+uint32_t csr_read(void); /* supplied by the host input test */
+#endif
 
 /* Airbender v3's Keccak-f[1600] delegation (common_constants delegation_types/keccak_f1600.rs): per
  * round five column-parity (CSR 0x7cd), five theta/rho (0x7cc) and five chi (0x7ce) calls, then one
@@ -55,6 +59,7 @@ static inline __attribute__((always_inline)) void copy_lanes(uint64_t *to, const
 /* Keccak-f[1600] in place on the delegation's state at `state`. */
 static inline __attribute__((always_inline)) void permute_at(uint64_t *state)
 {
+#ifdef AIRBENDER
     register uint32_t x11 __asm__("a1") = (uint32_t)state;
     __asm__ volatile("add x10, x0, x0\n"
                      KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS KECCAK_FOUR_ROUNDS
@@ -63,6 +68,9 @@ static inline __attribute__((always_inline)) void permute_at(uint64_t *state)
                      :
                      : "r"(x11)
                      : "a0", "memory");
+#else
+    keccak_f1600_soft(state);
+#endif
 }
 
 static inline __attribute__((always_inline)) void permute(void)
@@ -324,6 +332,7 @@ void airbender_keccak256(const uint8_t *data, size_t len, uint8_t out[32])
         o[i] = s[i];
 }
 
+#ifdef AIRBENDER
 /* memcpy, by --wrap (the manifest's wrap_symbols): the guest copies megabytes of witness nodes from
  * misaligned input positions. 32 bytes a round; a misaligned source is read as the aligned words that
  * cover it, each output word merged from two of them, and the last may run up to three bytes past the
@@ -531,6 +540,8 @@ __attribute__((no_builtin("memcpy", "memmove"))) void *__wrap_memmove(void *dest
     return __real_memmove(dest, src, n);
 }
 
+#endif
+
 /* The u256 delegation for managed code. A JIT that lists it in JitZkDelegationPInvokes emits the CSR
  * access in place of a call to this. */
 uint32_t airbender_u256_op(u256d *a, const u256d *b, uint32_t op)
@@ -720,29 +731,36 @@ static uint32_t read_plain(uint32_t *words, uint32_t i, uint32_t end)
         words[i] = csr_read();
     return i;
 }
-/* The item list that fills words [i, end): returns where reading stopped, which is end when the list is what the
- * format says, with *count items then hashed. Anything else stops early with *count zero. */
-static uint32_t read_list(uint32_t *words, uint32_t i, uint32_t end, uint32_t padding, int nodes, uint32_t *count)
+/* Returns the first unread word. A complete list, including an empty one, sets *complete. */
+static uint32_t read_list(uint32_t *words, uint32_t i, uint32_t end, uint32_t padding, int nodes, int *complete)
 {
-    *count = 0;
+    *complete = 0;
     if (end - i < 2)
         return i;
     uint32_t n = csr_read();
     words[i] = n;
     words[i + 1] = csr_read();
     i += 2;
-    /* Every item takes its prefix at least, so a count beyond that is no list. */
-    if (n == 0 || n > (end - i) / TrustedItemPrefixWords)
-        return i;
-    uint32_t *hashes = malloc((size_t)n * 32);
-    uint32_t *states = 0;
-    const uint8_t **data = 0;
-    if (nodes)
+    if (n == 0)
     {
-        uint8_t *raw = malloc((size_t)n * (RetainedStates * RetainedStateWords * 4) + 256);
-        states = (uint32_t *)(((uintptr_t)raw + 255) & ~(uintptr_t)255);
+        *complete = i == end;
+        return i;
     }
-    data = malloc((size_t)n * sizeof(*data));
+    if (n > (end - i) / TrustedItemPrefixWords)
+        return i;
+    size_t state_bytes = nodes ? RetainedStates * RetainedStateWords * sizeof(uint32_t) : 0;
+    size_t per_node = state_bytes + 32 + sizeof(const uint8_t *);
+    size_t slack = nodes ? 255 : 0;
+    if (n > (SIZE_MAX - slack) / per_node)
+        return i;
+    uint8_t *area = malloc(n * per_node + slack);
+    if (!area)
+        return i;
+    if (nodes)
+        area = (uint8_t *)(((uintptr_t)area + 255) & ~(uintptr_t)255);
+    uint32_t *states = (uint32_t *)area;
+    uint32_t *hashes = (uint32_t *)(area + n * state_bytes);
+    const uint8_t **data = (const uint8_t **)(hashes + (size_t)8 * n);
     const uint8_t *first = 0, *last = 0;
     for (uint32_t k = 0; k < n; k++)
     {
@@ -753,7 +771,7 @@ static uint32_t read_list(uint32_t *words, uint32_t i, uint32_t end, uint32_t pa
             words[i + p] = csr_read();
         uint32_t len = words[i];
         i += TrustedItemPrefixWords;
-        if (len > 4 * (end - i))
+        if (len > 4 * (end - i) || len > UINT32_MAX - padding - 7)
             return i;
         uint32_t stride = ((len + padding + 7) & ~7u) >> 2, body = (len + 3) >> 2;
         if (stride > end - i)
@@ -788,11 +806,11 @@ static uint32_t read_list(uint32_t *words, uint32_t i, uint32_t end, uint32_t pa
         Prehashed.code_data = data;
         Prehashed.code_count = n;
     }
-    *count = n;
+    *complete = 1;
     return i;
 }
 /* The digests and states of the count state nodes whose first and last lie at first and last, if those are the
- * nodes read_input hashed. The states are 256-byte aligned, three slots a node, written for full branches only. */
+ * nodes the prehashed input reader hashed. The states are 256-byte aligned, three slots a node, written for full branches only. */
 int airbender_prehashed_nodes(const uint8_t *first, const uint8_t *last, uint32_t count, uint8_t **hashes, uint64_t **states)
 {
     if (count == 0 || count != Prehashed.node_count || first != Prehashed.first_node || last != Prehashed.last_node)
@@ -801,7 +819,7 @@ int airbender_prehashed_nodes(const uint8_t *first, const uint8_t *last, uint32_
     *states = (uint64_t *)Prehashed.node_states;
     return 1;
 }
-/* ---- The tries over the nodes read_input hashed: see mpt.c ------------------------------------------ */
+/* ---- The tries over the nodes the input reader hashed: see mpt.c ------------------------------------------ */
 static uint32_t mpt_w_count(void)
 {
     return Prehashed.node_count;
@@ -820,7 +838,7 @@ static void mpt_keccak(const uint8_t *data, uint32_t len, uint32_t out[8])
 {
     keccak256_long(data, len, (uint8_t *)out);
 }
-/* The digest of full branch k as the 532 bytes at edited, which equal those read_input hashed up to rate block
+/* The digest of full branch k as the 532 bytes at edited, which equal those the input reader hashed up to rate block
  * `block` and are valid from it on: the sponge resumes from the state kept after the block before. */
 static void mpt_hash_edited(uint32_t k, int block, const uint8_t *original, const uint8_t *edited, uint32_t out[8])
 {
@@ -934,9 +952,10 @@ static struct
 void airbender_bloom_set(uint8_t *bloom, uint8_t *master, const uint8_t *data, uint32_t len)
 {
     uint32_t pre[8];
-    mpt_load32(pre, data);
     if (len == 20)
-        pre[5] = pre[6] = pre[7] = 0;
+        mpt_load_address(pre, data);
+    else
+        mpt_load32(pre, data);
     uint32_t x = pre[0] ^ pre[1] ^ pre[4] ^ pre[7];
     x ^= x >> 13;
     x ^= x >> 7;
@@ -965,7 +984,7 @@ void airbender_bloom_set(uint8_t *bloom, uint8_t *master, const uint8_t *data, u
             master[at] |= (uint8_t)mask;
     }
 }
-/* The nodes read_input hashed, which the tries are over: the data of the first and of the last, and their count. */
+/* The nodes the input reader hashed, which the tries are over: the data of the first and of the last, and their count. */
 int airbender_mpt_nodes(const uint8_t **first, const uint8_t **last, uint32_t *count)
 {
     *first = Prehashed.first_node;
@@ -973,13 +992,13 @@ int airbender_mpt_nodes(const uint8_t **first, const uint8_t **last, uint32_t *c
     *count = Prehashed.node_count;
     return Prehashed.node_count != 0;
 }
-/* Whether the tries can serve these nodes: the count nodes from first to last are the ones read_input hashed. */
+/* Whether the tries can serve these nodes: the count nodes from first to last are the ones the input reader hashed. */
 int airbender_mpt_attach(const uint8_t *first, const uint8_t *last, uint32_t count)
 {
     return count != 0 && count == Prehashed.node_count && first == Prehashed.first_node
         && last == Prehashed.last_node;
 }
-/* The digest of the code at data, if it is the index-th code read_input hashed. */
+/* The digest of the code at data, if it is the index-th code the input reader hashed. */
 int airbender_prehashed_code(const uint8_t *data, uint32_t index, uint8_t *out)
 {
     if (index >= Prehashed.code_count || Prehashed.code_data[index] != data)
@@ -1003,75 +1022,78 @@ static struct
     uint8_t *start;
     uint32_t count;
 } DivisionHints;
-/* The division hints read_input found after the trusted input: count pairs of a quotient and a remainder. */
+/* The division hints the input reader found after the trusted input: count pairs of a quotient and a remainder. */
 void airbender_division_hints(uint8_t **start, uint32_t *count)
 {
     *start = DivisionHints.start;
     *count = DivisionHints.count;
 }
-void read_input(const uint8_t **buf_ptr, size_t *buf_size)
+/* Return aligned operands for the delegation while preserving the complete raw input. */
+static uint32_t *hint_payload(uint32_t *words, uint32_t count)
+{
+    if (((uintptr_t)words & 31) == 0 || count == 0)
+        return words;
+    size_t bytes = (size_t)count * sizeof(*words);
+    if (bytes > SIZE_MAX - 31)
+        return 0;
+    uint8_t *raw = malloc(bytes + 31);
+    if (!raw)
+        return 0;
+    uint32_t *aligned = (uint32_t *)(((uintptr_t)raw + 31) & ~(uintptr_t)31);
+    memcpy(aligned, words, bytes);
+    return aligned;
+}
+
+static void read_hints(uint32_t *words, uint32_t count)
+{
+    if (count < 2 || words[0] > (count - 2) / 16)
+        return;
+    uint32_t n = words[0], size = 16 * n;
+    DivisionHints.start = (uint8_t *)hint_payload(words + 2, size);
+    if (DivisionHints.start)
+        DivisionHints.count = n;
+    words += 2 + size;
+    count -= 2 + size;
+    if (count < 2 || words[0] > (count - 2) / 8)
+        return;
+    uint32_t m = words[0];
+    if (!m)
+    {
+        FieldHints.active = 1; /* An empty tape requests recording. */
+        return;
+    }
+    const u256d *tape = (const u256d *)hint_payload(words + 2, 8 * m);
+    if (tape)
+        FieldHints = (field_hints){tape, tape + m, 1};
+}
+
+static inline __attribute__((always_inline)) void read_guest_input(const uint8_t **buf_ptr, size_t *buf_size, int prehash)
 {
     uint32_t len = csr_read();
-    uint32_t count = (len + 3) / 4;
+    uint32_t count = len / 4 + (len % 4 != 0);
+    if (count > UINT32_MAX / 4)
+        airbender_fail(0x202);
     uint32_t *words = malloc((size_t)count * 4);
+    if (!words && count)
+        airbender_fail(0x202);
     uint32_t i = 0;
-    if (count >= TrustedHeaderWords)
+    if (prehash && count >= TrustedHeaderWords)
     {
         i = read_plain(words, 0, TrustedHeaderWords);
         uint32_t nodes = words[TrustedNodesField], codes = words[TrustedCodesField], total = words[TrustedTotalField];
         if (words[0] == TrustedMagic && words[1] == 1 && total <= len && ((len | total) & 7) == 0
             && ((nodes | codes) & 7) == 0 && nodes >= 4 * TrustedHeaderWords && nodes < codes && codes < total)
         {
-            uint32_t hashed;
+            int complete;
             i = read_plain(words, i, nodes >> 2);
-            i = read_list(words, i, codes >> 2, 0, 1, &hashed);
-            if (hashed)
-                i = read_list(words, i, total >> 2, TrustedCodePadding, 0, &hashed);
-            /* Past the input proper: division hints, a count and a reserved word, then a quotient and a remainder
-             * of 32 bytes each for every division, read into 32-byte aligned memory for the u256 delegation. */
-            if (hashed && count - i >= 2)
+            i = read_list(words, i, codes >> 2, 0, 1, &complete);
+            if (complete)
+                i = read_list(words, i, total >> 2, TrustedCodePadding, 0, &complete);
+            if (complete && i < count)
             {
-                uint32_t n = csr_read();
-                words[i] = n;
-                words[i + 1] = csr_read();
-                i += 2;
-                if (n <= (count - i) / 16)
-                {
-                    uint8_t *raw = malloc((size_t)n * 64 + 32);
-                    uint32_t *hints = (uint32_t *)(((uintptr_t)raw + 31) & ~(uintptr_t)31);
-                    for (uint32_t k = 0; k < 16 * n; k += 16)
-                    {
-#pragma clang loop unroll(full)
-                        for (int q = 0; q < 16; q++)
-                            hints[k + q] = csr_read();
-                    }
-                    i += 16 * n;
-                    DivisionHints.start = (uint8_t *)hints;
-                    DivisionHints.count = n;
-                }
-                /* Then the field hint tape: a count and a reserved word, then values of 32 bytes each. */
-                if (DivisionHints.start && count - i >= 2)
-                {
-                    uint32_t m = csr_read();
-                    words[i] = m;
-                    words[i + 1] = csr_read();
-                    i += 2;
-                    if (m <= (count - i) / 8)
-                    {
-                        uint8_t *area = malloc((size_t)m * 32 + 32);
-                        uint32_t *tape = (uint32_t *)(((uintptr_t)area + 31) & ~(uintptr_t)31);
-                        for (uint32_t k = 0; k < 8 * m; k += 8)
-                        {
-#pragma clang loop unroll(full)
-                            for (int q = 0; q < 8; q++)
-                                tape[k + q] = csr_read();
-                        }
-                        i += 8 * m;
-                        FieldHints.next = (const u256d *)tape;
-                        FieldHints.end = (const u256d *)tape + m;
-                        FieldHints.active = 1;
-                    }
-                }
+                read_plain(words, i, count);
+                read_hints(words + i, count - i);
+                i = count;
             }
         }
     }
@@ -1080,6 +1102,16 @@ void read_input(const uint8_t **buf_ptr, size_t *buf_size)
     read_plain(words, i, count);
     *buf_ptr = (const uint8_t *)words;
     *buf_size = len;
+}
+
+void read_input(const uint8_t **buf_ptr, size_t *buf_size)
+{
+    read_guest_input(buf_ptr, buf_size, 0);
+}
+
+void airbender_read_prehashed_input(const uint8_t **buf_ptr, size_t *buf_size)
+{
+    read_guest_input(buf_ptr, buf_size, 1);
 }
 
 void write_output(const uint8_t *output, size_t size)

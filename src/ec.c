@@ -1999,6 +1999,8 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
     const line_coef *kept[PairingBatch];
     line_coef *keep[PairingBatch];
     int slot[PairingBatch], at[PairingBatch];
+    uint32_t used = 0;
+    _Static_assert(PairingBatch <= LineCachePoints && LineCachePoints <= 32, "a cache slot per active pair");
     for (int j = 0; j < k; j++)
     {
         kept[j] = 0;
@@ -2008,18 +2010,18 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
             if (LineCache[e].of == C && fq_eq(&LineCache[e].x, &qa[j].x, 2) && fq_eq(&LineCache[e].y, &qa[j].y, 2))
             {
                 kept[j] = LineCache[e].lines;
+                used |= 1u << e;
                 break;
             }
         }
         if (!kept[j])
         {
-            slot[j] = (int)(LineCacheNext++ % LineCachePoints);
+            do
+                slot[j] = (int)(LineCacheNext++ % LineCachePoints);
+            while (used & (1u << slot[j]));
+            used |= 1u << slot[j];
             LineCache[slot[j]].of = 0;
             keep[j] = LineCache[slot[j]].lines;
-            /* A point given twice in one batch would take one place twice over. */
-            for (int e = 0; e < j; e++)
-                if (!kept[e] && slot[e] == slot[j])
-                    keep[j] = 0;
         }
     }
     if (Pw.state == PwFresh)
@@ -2047,7 +2049,7 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
                 line_apply(&acc, &kept[j][at[j]++], &pa[j]);
                 continue;
             }
-            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
+            LineOut = &keep[j][at[j]++];
             miller_dbl(&l, &t[j], &pa[j]);
             fp12_mul_line(&acc, &l);
         }
@@ -2060,7 +2062,7 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
                     line_apply(&acc, &kept[j][at[j]++], &pa[j]);
                     continue;
                 }
-                LineOut = keep[j] ? &keep[j][at[j]++] : 0;
+                LineOut = &keep[j][at[j]++];
                 miller_add(&acc, &t[j], dg[i] > 0 ? &qa[j] : &qn[j], &pa[j]);
             }
             if (merge)
@@ -2083,9 +2085,9 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
             pt_frob(&q1, &qa[j], false);
             pt_frob(&q2, &q1, false);
             pt_neg(&q2, &q2, 2);
-            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
+            LineOut = &keep[j][at[j]++];
             miller_add(&acc, &t[j], &q1, &pa[j]);
-            LineOut = keep[j] ? &keep[j][at[j]++] : 0;
+            LineOut = &keep[j][at[j]++];
             miller_add(&acc, &t[j], &q2, &pa[j]);
         }
     }
@@ -2093,7 +2095,7 @@ void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count)
     /* The lines are whole: the places taken now hold their points. */
     for (int j = 0; j < k; j++)
     {
-        if (!kept[j] && keep[j])
+        if (!kept[j])
         {
             LineCache[slot[j]].x = qa[j].x;
             LineCache[slot[j]].y = qa[j].y;
