@@ -1062,9 +1062,10 @@ static void read_hints(uint32_t *words, uint32_t count)
         FieldHints.active = 1; /* An empty tape requests recording. */
         return;
     }
-    const u256d *tape = (const u256d *)hint_payload(words + 2, 8 * m);
+    uint32_t tape_words = 8 * m;
+    uint32_t *tape = hint_payload(words + 2, tape_words);
     if (tape)
-        FieldHints = (field_hints){tape, tape + m, 1};
+        FieldHints = (field_hints){(const u256d *)tape, (const u256d *)(tape + tape_words), 1};
 }
 
 static inline __attribute__((always_inline)) void read_guest_input(const uint8_t **buf_ptr, size_t *buf_size, int prehash)
