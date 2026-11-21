@@ -10,6 +10,10 @@
  */
 
 #include "ec.h"
+#include "mont.h"
+
+int ec_hinted_glv_mul(u256d *rx, u256d *ry, const u256d *px, const u256d *py, const u256d *beta, const int8_t *naf1,
+                      int len1, const int8_t *naf2, int len2, int neg2, const mont_ctx *f);
 
 /* In RAM, where the delegation reads its operands. */
 static curve Bn254 = {
@@ -150,6 +154,42 @@ static void g1_mul_glv(point *r, const point *p, const uint8_t scalar[32])
     mp_mul(t, c2, 3, GlvB2, 4);
     mp_sub(k2, t, 7);
 
+    if (FieldHints.active && !pt_is_inf(p, 1))
+    {
+        /* With slopes on the hint tape the same sum on affine points, in ecc.c's 256-bit field code: p is affine
+           as loaded, and the field's Montgomery form there is this one's, R = 2^256. */
+        static mont_ctx field;
+        static int ready;
+        if (!ready)
+        {
+            mont_init(&field, C->p.l);
+            ready = 1;
+        }
+        uint32_t h1[GlvLimbs], h2[GlvLimbs];
+        memcpy(h1, k1, sizeof(h1));
+        memcpy(h2, k2, sizeof(h2));
+        bool n1 = mp_abs(h1), n2 = mp_abs(h2) != n1;
+        int8_t digits[2][NafMax];
+        int count[2] = {wnaf(digits[0], h1), wnaf(digits[1], h2)};
+        u256d px, py, rx, ry, zero = {{0}};
+        memcpy(&px, p->x.c[0].l, 32);
+        memcpy(&py, p->y.c[0].l, 32);
+        if (n1)
+            mont_sub(&py, &zero, &py, &field);
+        int got = ec_hinted_glv_mul(&rx, &ry, &px, &py, (const u256d *)Beta.l, digits[0], count[0], digits[1],
+                                    count[1], n2, &field);
+        if (got >= 0)
+        {
+            memset(r, 0, sizeof(*r));
+            if (got)
+            {
+                memcpy(r->x.c[0].l, &rx, 32);
+                memcpy(r->y.c[0].l, &ry, 32);
+                r->z.c[0] = C->one;
+            }
+            return;
+        }
+    }
     /* The halves share the doublings, each a width-5 NAF over the odd multiples of its point: those of p1 are
        Jacobian, and phi maps them to those of p2 with one product each, (beta X, Y, Z). */
     static point table[2][NafTable];
@@ -246,20 +286,24 @@ zkvm_status zkvm_bn254_pairing(const uint8_t *pairs, size_t num_pairs, bool *ver
 {
     ec_use(&Bn254);
     fp12 f;
-    fp12_one(&f);
     *verified = false;
-    for (size_t i = 0; i < num_pairs; i += PairingBatch)
+    pairing_begin();
+    do
     {
-        point p[PairingBatch], q[PairingBatch];
-        int count = num_pairs - i < PairingBatch ? (int)(num_pairs - i) : PairingBatch;
-        for (int j = 0; j < count; j++)
+        fp12_one(&f);
+        for (size_t i = 0; i < num_pairs; i += PairingBatch)
         {
-            const uint8_t *in = pairs + 192 * (i + j);
-            if (!load_g1(&p[j], in) || !load_g2(&q[j], in + 64))
-                return ZKVM_EFAIL;
+            point p[PairingBatch], q[PairingBatch];
+            int count = num_pairs - i < PairingBatch ? (int)(num_pairs - i) : PairingBatch;
+            for (int j = 0; j < count; j++)
+            {
+                const uint8_t *in = pairs + 192 * (i + j);
+                if (!load_g1(&p[j], in) || !load_g2(&q[j], in + 64))
+                    return ZKVM_EFAIL;
+            }
+            pairing_add_batch(&f, p, q, count);
         }
-        pairing_add_batch(&f, p, q, count);
-    }
-    *verified = pairing_is_one(&f);
+        *verified = pairing_is_one(&f);
+    } while (pairing_retry());
     return ZKVM_EOK;
 }

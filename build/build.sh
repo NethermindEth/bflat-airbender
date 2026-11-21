@@ -52,7 +52,7 @@ llvm-ar rcs "$out/libairbender.a" "$obj/libairbender.o"
 # What bflat and the guest call must be there; on Airbender, what the library calls must be what the link of
 # bflat provides: the memory functions of musl, the compiler-rt builtins and the platform interface of the entry.
 required=(read_input write_output sys_write zkvm_keccak256 zkvm_sha256 zkvm_secp256k1_ecrecover)
-[ "$platform" = airbender ] && required+=(airbender_exit airbender_fail airbender_u256_op airbender_keccak256
+[ "$platform" = airbender ] && required+=(airbender_read_prehashed_input airbender_exit airbender_fail airbender_u256_op airbender_keccak256
     airbender_secp256k1_ecrecover_batch airbender_keccak_f1600_in_place)
 for s in "${required[@]}"; do
     grep -qx "$s" "$obj/exports.txt" || { echo "libairbender.a does not define $s" >&2; exit 1; }
