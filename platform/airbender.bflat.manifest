@@ -40,6 +40,7 @@
         "when": {"optimize": true},
         "note": "The zkVM register tuning of ZisK (perf-61/62/63, patches 23 and 31): every callee-saved register a method touches costs its save and restore, and the guest links the non-moving, non-collecting uGC."
       },
+      {"value": "JitZkRev8=1"},
       {"value": "JitZkSynthesizeCounts=1", "when": {"optimize": true}},
       {"value": "JitZkSpillKeepReg=1", "when": {"optimize": true}},
       {"value": "JitZkColdCallSpill=7d", "when": {"optimize": true}},

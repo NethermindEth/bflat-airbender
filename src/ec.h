@@ -113,6 +113,10 @@ enum
 
 void pairing_add_batch(fp12 *f, const point *g1, const point *g2, int count);
 bool pairing_is_one(fp12 *f);
+/* Starts a pairing check: pairing_add_batch calls, then pairing_is_one. Where pairing_retry says so after it, the
+   check ran on a hint that did not hold and is to be run again from fp12_one, without pairing_begin. */
+void pairing_begin(void);
+bool pairing_retry(void);
 void fp12_one(fp12 *r);
 
 #endif
