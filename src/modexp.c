@@ -287,23 +287,29 @@ MONT_INLINE void mont_pow_windows(const uint8_t *exp, size_t exp_len, int k)
     mont_mul_k(MontValue, MontValue, one, k);
 }
 
+/* MontSingle.ninv = n^-1 mod 2^256 for the low digit n of the modulus, by Newton: n is its own inverse mod 8, and each
+   step doubles the bits. */
+static void mont_inverse(const u256d *n)
+{
+    static u256d t, two;
+    MontSingle.ninv = *n;
+    for (int step = 0; step < 7; step++)
+    {
+        t = *n;
+        u256_op(&t, &MontSingle.ninv, U256_MUL_LOW);
+        two = (u256d){{2}};
+        u256_op(&two, &t, U256_SUB);
+        u256_op(&MontSingle.ninv, &two, U256_MUL_LOW);
+    }
+}
+
 static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp, size_t exp_len, size_t mLen)
 {
     int k = (int)((mLen + 7) / 8);
     u256d *n = k == 1 ? &MontSingle.n : MontN;
     load_digits(n, ModLimbs, mLen, k);
 
-    /* N^-1 mod 2^256 by Newton on the low digit: it is its own inverse mod 8, and each step doubles the bits. */
-    static u256d t, two;
-    MontSingle.ninv = n[0];
-    for (int step = 0; step < 7; step++)
-    {
-        t = n[0];
-        u256_op(&t, &MontSingle.ninv, U256_MUL_LOW);
-        two = (u256d){{2}};
-        u256_op(&two, &t, U256_SUB);
-        u256_op(&MontSingle.ninv, &two, U256_MUL_LOW);
-    }
+    mont_inverse(&n[0]);
     if (k > 1)
     {
         MontNPrime = (u256d){{0}};
@@ -331,6 +337,103 @@ static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp,
         acc[i] = MontValue[i / 8].w[i % 8];
 }
 
+/* Primes of at most 256 bits, little-endian limbs, for which x^(m - 2) mod m is the inverse of x (Fermat): BN254's
+   scalar and base fields, secp256k1's and P-256's base and scalar fields, BLS12-381's scalar field. SNARK verifiers
+   invert modulo the BN254 scalar field this way. */
+static const uint32_t InversePrimes[][8] = {
+    {0xf0000001, 0x43e1f593, 0x79b97091, 0x2833e848, 0x8181585d, 0xb85045b6, 0xe131a029, 0x30644e72},
+    {0xd87cfd47, 0x3c208c16, 0x6871ca8d, 0x97816a91, 0x8181585d, 0xb85045b6, 0xe131a029, 0x30644e72},
+    {0xfffffc2f, 0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff},
+    {0xd0364141, 0xbfd25e8c, 0xaf48a03b, 0xbaaedce6, 0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff},
+    {0xffffffff, 0xffffffff, 0xffffffff, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xffffffff},
+    {0xfc632551, 0xf3b9cac2, 0xa7179e84, 0xbce6faad, 0xffffffff, 0xffffffff, 0x00000000, 0xffffffff},
+    {0x00000001, 0xffffffff, 0xfffe5bfe, 0x53bda402, 0x09a1d805, 0x3339d808, 0x299d7d48, 0x73eda753},
+};
+
+enum
+{
+    InverseNotHinted = -1, /* not an inversion modulo one of InversePrimes, or no hint tape */
+    InverseComputed = 0,   /* an inversion whose hint is missing or wrong: the caller computes it and gives it out */
+    InverseDone = 1        /* acc holds the result */
+};
+
+/*
+ * x^(m - 2) mod m, with m in ModLimbs (mLen limbs) one of InversePrimes, is the inverse of x. With a hint tape, the next
+ * value y is the result when it is below m and x y = 1 mod m, checked as mont(x, y) = mont(1, 1): two Montgomery
+ * products where the exponentiation takes some 340. x = 0 gives 0 and takes no hint.
+ */
+static int inverse_hinted(uint32_t *acc, const uint32_t *base, const uint8_t *exp, size_t exp_len, size_t mLen)
+{
+    if (!FieldHints.active || mLen > 8)
+        return InverseNotHinted;
+    uint32_t m[8] = {0};
+    for (size_t i = 0; i < mLen; i++)
+        m[i] = ModLimbs[i];
+    int known = 0;
+    for (size_t p = 0; p < sizeof(InversePrimes) / sizeof(InversePrimes[0]) && !known; p++)
+    {
+        uint32_t diff = 0;
+        for (int i = 0; i < 8; i++)
+            diff |= m[i] ^ InversePrimes[p][i];
+        known = diff == 0;
+    }
+    if (!known)
+        return InverseNotHinted;
+
+    /* The exponent, big-endian with any number of leading zero bytes, must be m - 2. */
+    uint32_t e[8], borrow = 2;
+    for (int i = 0; i < 8; i++)
+    {
+        e[i] = m[i] - borrow;
+        borrow = m[i] < borrow;
+    }
+    for (size_t i = 0; i < exp_len; i++)
+    {
+        size_t bit = (exp_len - 1 - i) * 8;
+        if (exp[i] != (bit < 256 ? (uint8_t)(e[bit / 32] >> (bit % 32)) : 0))
+            return InverseNotHinted;
+    }
+    for (size_t bit = exp_len * 8; bit < 256; bit += 8)
+        if ((uint8_t)(e[bit / 32] >> (bit % 32)) != 0)
+            return InverseNotHinted;
+
+    uint32_t nonzero = 0;
+    for (size_t i = 0; i < mLen; i++)
+        nonzero |= base[i];
+    if (!nonzero)
+    {
+        memset(acc, 0, mLen * sizeof(uint32_t));
+        return InverseDone;
+    }
+
+    if (FieldHints.next == FieldHints.end)
+        return InverseComputed;
+    const u256d *y = FieldHints.next++;
+    int below = 0;
+    for (int i = 7; i >= 0; i--)
+        if (y->w[i] != m[i])
+        {
+            below = y->w[i] < m[i];
+            break;
+        }
+    if (!below)
+        return InverseComputed;
+
+    static u256d value, hint, product, unit;
+    load_digits(&MontSingle.n, ModLimbs, mLen, 1);
+    mont_inverse(&MontSingle.n);
+    load_digits(&value, base, mLen, 1);
+    u256_op(&hint, y, U256_MEMCOPY);
+    mont_mul(&product, &value, &hint, &MontSingle);
+    unit = (u256d){{1}};
+    mont_mul(&unit, &unit, &unit, &MontSingle);
+    if (!u256_op(&product, &unit, U256_EQ))
+        return InverseComputed;
+    for (size_t i = 0; i < mLen; i++)
+        acc[i] = hint.w[i];
+    return InverseDone;
+}
+
 zkvm_status zkvm_modexp(const uint8_t *base, size_t base_len, const uint8_t *exp, size_t exp_len,
                         const uint8_t *modulus, size_t mod_len, uint8_t *output)
 {
@@ -347,7 +450,15 @@ zkvm_status zkvm_modexp(const uint8_t *base, size_t base_len, const uint8_t *exp
 
     if (mLen <= 8 * MaxDigits && (ModLimbs[0] & 1) && !(mLen == 1 && ModLimbs[0] == 1))
     {
-        modexp_mont(Acc, Base, exp, exp_len, mLen);
+        int inverse = inverse_hinted(Acc, Base, exp, exp_len, mLen);
+        if (inverse != InverseDone)
+            modexp_mont(Acc, Base, exp, exp_len, mLen);
+        if (inverse == InverseComputed)
+        {
+            static u256d computed;
+            load_digits(&computed, Acc, mLen, 1);
+            field_hint_emit(&computed);
+        }
     }
     else
     {
