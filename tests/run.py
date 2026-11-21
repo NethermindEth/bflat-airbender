@@ -222,6 +222,11 @@ for ml in (128, 256, 512):
     b, e, m = rng.randbytes(ml), rng.randbytes(8), rng.randbytes(ml)
     exp = pow(int.from_bytes(b, "big"), int.from_bytes(e, "big"), int.from_bytes(m, "big")).to_bytes(ml, "big").hex()
     cases.append((f"modexp {b.hex()} {e.hex()} {m.hex()}", exp))
+# Equal high limbs cap the quotient digit in D3. The two low limbs make rhat carry and fit, respectively.
+for m in (0x80000000ffffffff, 0x8000000000000002):
+    b = (m - 1) << 32
+    cases.append((f"modexp {b:024x} 01 {m:016x}", f"{b % m:016x}"))
+
 # Odd moduli of up to 1024 bits take the Montgomery path: every length, exponents with leading zeros and of
 # one bit, bases above the modulus.
 for mbytes in list(range(1, 33)) + [32, 32, 33, 48, 63, 64, 64, 65, 96, 127, 128, 128]:

@@ -6,7 +6,7 @@
  * buffer static: the runtime has no allocator to lend. Larger operands fail.
  */
 
-#include "u256.h"
+#include "mont.h"
 #include "zkvm.h"
 
 enum
@@ -34,6 +34,39 @@ static size_t load(uint32_t *r, size_t cap, const uint8_t *in, size_t len)
     while (n > 0 && r[n - 1] == 0)
         n--;
     return n;
+}
+
+/* high:low / divisor, for a divisor with its top bit set and above high; the remainder in *remainder.
+   Hacker's Delight divlu: two 32-bit divisions by the divisor's top half, each corrected at most twice. */
+static uint32_t divide_normalized(uint32_t high, uint32_t low, uint32_t divisor, uint32_t *remainder)
+{
+    const uint32_t base = 1u << 16;
+    uint32_t vn1 = divisor >> 16, vn0 = divisor & 0xFFFF;
+    uint32_t un1 = low >> 16, un0 = low & 0xFFFF;
+
+    uint32_t q1 = high / vn1;
+    uint32_t rhat = high - q1 * vn1;
+    while (q1 >= base || q1 * vn0 > ((rhat << 16) | un1))
+    {
+        q1--;
+        rhat += vn1;
+        if (rhat >= base)
+            break;
+    }
+
+    uint32_t un21 = (high << 16) + un1 - q1 * divisor;
+    uint32_t q0 = un21 / vn1;
+    rhat = un21 - q0 * vn1;
+    while (q0 >= base || q0 * vn0 > ((rhat << 16) | un0))
+    {
+        q0--;
+        rhat += vn1;
+        if (rhat >= base)
+            break;
+    }
+
+    *remainder = (un21 << 16) + un0 - q0 * divisor;
+    return (q1 << 16) | q0;
 }
 
 /* r = num mod m, num has numLen limbs and is destroyed; m has mLen > 0 limbs, top limb non-zero. */
@@ -65,16 +98,25 @@ static void reduce(uint32_t *r, uint32_t *num, size_t numLen, const uint32_t *m,
 
     for (size_t j = numLen - mLen + 1; j-- > 0;)
     {
-        /* D3: estimate the quotient digit from the top two limbs. */
-        uint64_t top = ((uint64_t)num[j + mLen] << 32) | num[j + mLen - 1];
-        uint64_t qhat = top / NormMod[mLen - 1];
-        uint64_t rhat = top % NormMod[mLen - 1];
-        while (qhat >> 32 || qhat * NormMod[mLen - 2] > ((rhat << 32) | num[j + mLen - 2]))
+        /* D3: estimate the quotient digit from the top two limbs. The top limb is at most the divisor's, so the
+           estimate fits a limb once capped, and comes from two 32-bit divisions rather than a 64-bit one. */
+        uint32_t qhat;
+        uint64_t rhat;
+        if (num[j + mLen] >= NormMod[mLen - 1])
+        {
+            qhat = UINT32_MAX;
+            rhat = (uint64_t)num[j + mLen - 1] + NormMod[mLen - 1];
+        }
+        else
+        {
+            uint32_t r;
+            qhat = divide_normalized(num[j + mLen], num[j + mLen - 1], NormMod[mLen - 1], &r);
+            rhat = r;
+        }
+        while (!(rhat >> 32) && (uint64_t)qhat * NormMod[mLen - 2] > ((rhat << 32) | num[j + mLen - 2]))
         {
             qhat--;
             rhat += NormMod[mLen - 1];
-            if (rhat >> 32)
-                break;
         }
 
         /* D4: multiply and subtract. */
@@ -82,7 +124,7 @@ static void reduce(uint32_t *r, uint32_t *num, size_t numLen, const uint32_t *m,
         uint64_t carry = 0;
         for (size_t i = 0; i < mLen; i++)
         {
-            uint64_t p = qhat * NormMod[i] + carry;
+            uint64_t p = (uint64_t)qhat * NormMod[i] + carry;
             carry = p >> 32;
             int64_t t = (int64_t)num[i + j] - (int64_t)(uint32_t)p + borrow;
             num[i + j] = (uint32_t)t;
@@ -138,6 +180,7 @@ enum
     MaxDigits = 4
 };
 
+static mont_ctx MontSingle;
 static u256d MontN[MaxDigits], MontNPrime, MontZero2, MontX, MontM2, MontT[2 * MaxDigits + 1], MontD[MaxDigits + 1];
 static u256d MontTable[16][MaxDigits], MontValue[MaxDigits], MontR2[MaxDigits], MontOne[MaxDigits];
 
@@ -149,31 +192,8 @@ static void accumulate_digit(int d, const u256d *v)
         carry = u256_op(&MontT[++d], &MontZero2, U256_ADD | U256_CARRY);
 }
 
-/* One 256-bit digit: r = a b / 2^256 mod N. The low half of a b + m N is zero by the choice of m, so only its
- * carry is needed, and that is 1 unless the low half of a b is zero. */
-static void mont_mul_1(u256d *r, const u256d *a, const u256d *b)
+static void mont_mul_multi(u256d *r, const u256d *a, const u256d *b, int k)
 {
-    u256_op(&MontX, a, U256_MEMCOPY);
-    u256_op(&MontX, b, U256_MUL_LOW);
-    u256_op(&MontT[0], a, U256_MEMCOPY);
-    u256_op(&MontT[0], b, U256_MUL_HIGH);
-    u256_op(&MontM2, &MontX, U256_MEMCOPY);
-    u256_op(&MontM2, &MontNPrime, U256_MUL_LOW);
-    u256_op(&MontM2, &MontN[0], U256_MUL_HIGH);
-    uint32_t low_zero = u256_op(&MontX, &MontZero2, U256_EQ);
-    uint32_t carry = u256_op(&MontT[0], &MontM2, U256_ADD | (low_zero ? 0 : U256_CARRY));
-    u256_op(&MontD[0], &MontT[0], U256_MEMCOPY);
-    uint32_t borrow = u256_op(&MontD[0], &MontN[0], U256_SUB);
-    u256_op(r, (carry || !borrow) ? &MontD[0] : &MontT[0], U256_MEMCOPY);
-}
-/* r = a b / R mod N, for a, b < N; r may alias a or b. */
-static void mont_mul_k(u256d *r, const u256d *a, const u256d *b, int k)
-{
-    if (k == 1)
-    {
-        mont_mul_1(r, a, b);
-        return;
-    }
     for (int d = 0; d <= 2 * k; d++)
         u256_op(&MontT[d], &MontZero2, U256_MEMCOPY);
     for (int i = 0; i < k; i++)
@@ -212,6 +232,15 @@ static void mont_mul_k(u256d *r, const u256d *a, const u256d *b, int k)
         u256_op(&r[d], &src[d], U256_MEMCOPY);
 }
 
+/* Inline so mont_mul can resolve operand aliasing at each square or multiply. */
+MONT_INLINE void mont_mul_k(u256d *r, const u256d *a, const u256d *b, int k)
+{
+    if (k == 1)
+        mont_mul(r, a, b, &MontSingle);
+    else
+        mont_mul_multi(r, a, b, k);
+}
+
 static void load_digits(u256d *r, const uint32_t *limbs, size_t len, int k)
 {
     for (int d = 0; d < k; d++)
@@ -222,37 +251,8 @@ static void load_digits(u256d *r, const uint32_t *limbs, size_t len, int k)
         }
 }
 
-static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp, size_t exp_len, size_t mLen)
+MONT_INLINE void mont_pow_windows(const uint8_t *exp, size_t exp_len, int k)
 {
-    int k = (int)((mLen + 7) / 8);
-    load_digits(MontN, ModLimbs, mLen, k);
-
-    /* -N^-1 mod 2^256 by Newton on the low digit: it is its own inverse mod 8, and each step doubles the bits. */
-    static u256d x, t, two;
-    x = MontN[0];
-    for (int step = 0; step < 7; step++)
-    {
-        t = MontN[0];
-        u256_op(&t, &x, U256_MUL_LOW);
-        two = (u256d){{2}};
-        u256_op(&two, &t, U256_SUB);
-        u256_op(&x, &two, U256_MUL_LOW);
-    }
-    MontNPrime = (u256d){{0}};
-    u256_op(&MontNPrime, &x, U256_SUB);
-
-    /* R and R^2 mod N. */
-    size_t rLimbs = (size_t)(8 * k);
-    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
-    Product[rLimbs] = 1;
-    reduce(Acc, Product, rLimbs + 1, ModLimbs, mLen);
-    load_digits(MontOne, Acc, mLen, k);
-    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
-    Product[2 * rLimbs] = 1;
-    reduce(Acc, Product, 2 * rLimbs + 1, ModLimbs, mLen);
-    load_digits(MontR2, Acc, mLen, k);
-
-    load_digits(MontValue, base, mLen, k);
     for (int d = 0; d < k; d++)
         MontTable[0][d] = MontOne[d];
     mont_mul_k(MontTable[1], MontValue, MontR2, k);
@@ -285,6 +285,48 @@ static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp,
     for (int d = 0; d < k; d++)
         one[d] = (u256d){{d == 0 ? 1u : 0u}};
     mont_mul_k(MontValue, MontValue, one, k);
+}
+
+static void modexp_mont(uint32_t *acc, const uint32_t *base, const uint8_t *exp, size_t exp_len, size_t mLen)
+{
+    int k = (int)((mLen + 7) / 8);
+    u256d *n = k == 1 ? &MontSingle.n : MontN;
+    load_digits(n, ModLimbs, mLen, k);
+
+    /* N^-1 mod 2^256 by Newton on the low digit: it is its own inverse mod 8, and each step doubles the bits. */
+    static u256d t, two;
+    MontSingle.ninv = n[0];
+    for (int step = 0; step < 7; step++)
+    {
+        t = n[0];
+        u256_op(&t, &MontSingle.ninv, U256_MUL_LOW);
+        two = (u256d){{2}};
+        u256_op(&two, &t, U256_SUB);
+        u256_op(&MontSingle.ninv, &two, U256_MUL_LOW);
+    }
+    if (k > 1)
+    {
+        MontNPrime = (u256d){{0}};
+        u256_op(&MontNPrime, &MontSingle.ninv, U256_SUB);
+    }
+
+    /* R and R^2 mod N. */
+    size_t rLimbs = (size_t)(8 * k);
+    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
+    Product[rLimbs] = 1;
+    reduce(Acc, Product, rLimbs + 1, ModLimbs, mLen);
+    load_digits(MontOne, Acc, mLen, k);
+    memset(Product, 0, (2 * rLimbs + 1) * sizeof(uint32_t));
+    Product[2 * rLimbs] = 1;
+    reduce(Acc, Product, 2 * rLimbs + 1, ModLimbs, mLen);
+    load_digits(MontR2, Acc, mLen, k);
+
+    load_digits(MontValue, base, mLen, k);
+    /* Specialize the window loop once so each product uses its known digit path. */
+    if (k == 1)
+        mont_pow_windows(exp, exp_len, 1);
+    else
+        mont_pow_windows(exp, exp_len, k);
     for (size_t i = 0; i < mLen; i++)
         acc[i] = MontValue[i / 8].w[i % 8];
 }
